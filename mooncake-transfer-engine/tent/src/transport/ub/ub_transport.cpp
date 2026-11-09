@@ -21,6 +21,7 @@
 #include "tent/common/utils/string_builder.h"
 #include "tent/runtime/segment.h"
 #include "tent/thirdparty/nlohmann/json.h"
+#include "tent/transport/ub/bootstrap.h"
 #include "tent/transport/ub/buffers.h"
 #include "tent/transport/ub/context.h"
 #include "tent/transport/ub/device_selection.h"
@@ -69,6 +70,9 @@ std::string encodeDeviceMetadata(Topology::NicID topology_id,
                           {"eid_index", device.eid_index},
                           {"eid", device.eid},
                           {"active", device.active},
+                          {"device_kind", ub::deviceKindName(device.kind)},
+                          {"device_kind_source",
+                           ub::deviceKindSourceName(device.kind_source)},
                           {"capabilities",
                            {{"max_jfc", caps.max_jfc},
                             {"max_jfc_depth", caps.max_jfc_depth},
@@ -81,7 +85,10 @@ std::string encodeDeviceMetadata(Topology::NicID topology_id,
                             {"max_read_size", caps.max_read_size},
                             {"max_write_size", caps.max_write_size},
                             {"feature_flags", caps.feature_flags},
-                            {"transport_modes", caps.transport_modes}}}}
+                            {"transport_modes", caps.transport_modes},
+                            {"rm_tp_cap", caps.rm_tp_cap},
+                            {"priority_tp_type_masks",
+                             caps.priority_tp_type_masks}}}}
         .dump();
 }
 
@@ -127,6 +134,19 @@ struct UbTransport::Impl {
                 "UB notifications are not supported by protocol version "
                 "1" LOC_MARK);
         }
+        ub::UbRuntimeMode runtime_mode = ub::UbRuntimeMode::kRcLegacy;
+        CHECK_STATUS(ub::resolveUbRuntimeMode(parsed, runtime_mode));
+        LOG(INFO) << "UB runtime selection: mode="
+                  << ub::ubRuntimeModeName(runtime_mode)
+                  << " profile="
+                  << ub::ubRuntimeProfileName(parsed.runtime_profile)
+                  << " trans_mode="
+                  << ub::ubTransportModeName(parsed.trans_mode)
+                  << " jetty_pool="
+                  << (parsed.jetty_pool.enable ? "on" : "off")
+                  << " probe=" << (parsed.probe.enabled ? "on" : "off")
+                  << " force_disable="
+                  << (parsed.jetty_pool.force_disable ? "true" : "false");
 
         shutting_down.store(false, std::memory_order_release);
         local_segment_name = segment_name;
@@ -142,12 +162,18 @@ struct UbTransport::Impl {
         std::vector<ub::DeviceInfo> discovered;
         status = adapter->discoverDevices(discovered);
         if (!status.ok()) return failInstall(status);
+        status = ub::resolveDeviceKindIdentities(params.device_identities,
+                                                 discovered);
+        if (!status.ok()) return failInstall(status);
 
         const bool explicit_filter = !params.device_filter.empty();
         const auto preferred_devices =
-            ub::preferBondingDevicesIfPresent(discovered, explicit_filter);
+            params.physical_only
+                ? ub::physicalDevices(discovered)
+                : ub::preferBondingDevicesIfPresent(discovered,
+                                                    explicit_filter);
         const bool prefer_bonding =
-            !explicit_filter &&
+            !params.physical_only && !explicit_filter &&
             std::any_of(discovered.begin(), discovered.end(),
                         [](const ub::DeviceInfo& device) {
                             return ub::isBondingDevice(device);
@@ -218,7 +244,10 @@ struct UbTransport::Impl {
 
         {
             std::ostringstream selection_log;
-            if (explicit_filter) {
+            if (params.physical_only) {
+                selection_log << "UB device selection: mode=physical-only";
+                if (explicit_filter) selection_log << "+explicit-filter";
+            } else if (explicit_filter) {
                 selection_log << "UB device selection: mode=explicit-filter";
             } else if (prefer_bonding) {
                 selection_log
@@ -543,6 +572,16 @@ struct UbTransport::Impl {
     int onBootstrap(const UbBootstrapDesc& request, UbBootstrapDesc& response) {
         if (shutting_down.load(std::memory_order_acquire) || !endpoints) {
             response.reply_msg = "UB transport is shutting down";
+            return -1;
+        }
+        // RC remains on v1. A valid RM v2 request is rejected here because the
+        // RM runtime is not implemented yet; crucially, this precedes endpoint
+        // eviction, Jetty creation and native import/bind side effects.
+        auto gate_status =
+            ub::gateUbBootstrapForMode(ub::UbBootstrapMode::RC, request);
+        if (!gate_status.ok()) {
+            response = request;
+            response.reply_msg = gate_status.ToString();
             return -1;
         }
         const std::string local_name =

@@ -44,6 +44,17 @@ namespace tent {
 namespace ub {
 namespace {
 
+#if defined(TENT_HAS_REAL_URMA) && TENT_HAS_REAL_URMA
+static_assert(kUrmaTransportModeRm == URMA_TM_RM);
+static_assert(kUrmaTransportModeRc == URMA_TM_RC);
+static_assert(kUrmaTransportModeUm == URMA_TM_UM);
+static_assert(kUrmaMaxPriority == URMA_MAX_PRIORITY);
+static_assert(kUrmaPriorityCount == URMA_MAX_PRIORITY_CNT);
+static_assert(kUrmaTargetTypeJetty == URMA_JETTY);
+static_assert(kUrmaTpTypeRtp == URMA_RTP);
+static_assert(kUrmaTpTypeRtpMask == (1U << URMA_RTP));
+#endif
+
 constexpr char kUnavailableMessage[] =
     "native TENT UB is unavailable because this build has no liburma";
 
@@ -271,6 +282,11 @@ DeviceCapabilities convertCapabilities(const urma_device_attr_t& attr) {
     result.max_write_size = attr.dev_cap.max_write_size;
     result.feature_flags = attr.dev_cap.feature.value;
     result.transport_modes = attr.dev_cap.trans_mode;
+    result.rm_tp_cap = attr.dev_cap.rm_tp_cap.value;
+    for (size_t i = 0; i < kUrmaPriorityCount; ++i) {
+        result.priority_tp_type_masks[i] =
+            attr.dev_cap.priority_info[i].tp_type.value;
+    }
     return result;
 }
 
@@ -668,13 +684,17 @@ class RealJetty final : public Jetty {
     ~RealJetty() override { cleanup(); }
 
     Status initialize(const JettyOptions& options) {
+        if (options.priority > kUrmaMaxPriority) {
+            return Status::InvalidArgument(
+                "URMA JFS priority must be in [0, 15]");
+        }
         urma_jetty_cfg_t config{};
         config.flag.bs.share_jfr = 1;
         config.jfs_cfg.depth = options.depth;
         config.jfs_cfg.trans_mode = URMA_TM_RC;
-        config.jfs_cfg.priority = context_->isBondingDevice()
-                                      ? context_->ctpPriority()
-                                      : options.priority;
+        config.jfs_cfg.priority = static_cast<uint8_t>(
+            context_->isBondingDevice() ? context_->ctpPriority()
+                                        : options.priority);
         if (context_->isBondingDevice()) {
             config.jfs_cfg.flag.bs.multi_path = 1;
         }
@@ -1095,6 +1115,11 @@ class RealUrmaAdapter final : public UrmaAdapter {
             isAllZero(requested_eid)) {
             return Status::InvalidArgument("invalid or null URMA EID");
         }
+        if (requested.kind_source != DeviceKindSource::NONE &&
+            requested.kind == DeviceKind::UNKNOWN) {
+            return Status::InvalidArgument(
+                "trusted URMA device identity has an unknown kind");
+        }
 
         int device_count = 0;
         DeviceList devices(urma_get_device_list(&device_count));
@@ -1107,6 +1132,12 @@ class RealUrmaAdapter final : public UrmaAdapter {
             if (native_device == nullptr ||
                 boundedString(native_device->name, URMA_MAX_NAME) !=
                     requested.native_device_name) {
+                continue;
+            }
+            const std::string current_path =
+                boundedString(native_device->path, URMA_MAX_PATH);
+            if (requested.kind_source != DeviceKindSource::NONE &&
+                current_path != requested.native_device_path) {
                 continue;
             }
 
@@ -1134,6 +1165,19 @@ class RealUrmaAdapter final : public UrmaAdapter {
             const int query_rc = urma_query_device(native_device, &attributes);
             if (query_rc != URMA_SUCCESS) {
                 return nativeError("urma_query_device", query_rc);
+            }
+            const auto current_capabilities = convertCapabilities(attributes);
+            if (requested.kind_source != DeviceKindSource::NONE) {
+                if (!deviceIsActive(attributes)) {
+                    return Status::DeviceNotFound(
+                        "trusted URMA device identity is inactive");
+                }
+                if (current_capabilities.transport_modes !=
+                    requested.capabilities.transport_modes) {
+                    return Status::InvalidArgument(
+                        "URMA transport_modes changed after trusted device "
+                        "discovery");
+                }
             }
             urma_context_t* native_context =
                 urma_create_context(native_device, requested.eid_index);
@@ -1183,10 +1227,9 @@ class RealUrmaAdapter final : public UrmaAdapter {
             }
 
             DeviceInfo current = requested;
-            current.native_device_path =
-                boundedString(native_device->path, URMA_MAX_PATH);
+            current.native_device_path = current_path;
             current.active = deviceIsActive(attributes);
-            current.capabilities = convertCapabilities(attributes);
+            current.capabilities = current_capabilities;
             if (current.topology_name.empty()) {
                 current.topology_name = "ub:" + current.native_device_name +
                                         ":eid" +

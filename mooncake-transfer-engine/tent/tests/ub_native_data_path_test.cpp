@@ -10,6 +10,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
@@ -157,7 +158,10 @@ class FakeJetty final : public Jetty {
 
 class FakeUrmaAdapter final : public UrmaAdapter {
    public:
-    explicit FakeUrmaAdapter(DeviceInfo device) : device_(std::move(device)) {}
+    explicit FakeUrmaAdapter(DeviceInfo device)
+        : FakeUrmaAdapter(std::vector<DeviceInfo>{std::move(device)}) {}
+    explicit FakeUrmaAdapter(std::vector<DeviceInfo> devices)
+        : devices_(std::move(devices)) {}
 
     bool available() const noexcept override { return true; }
     uint32_t nativeApiVersion() const noexcept override { return 1; }
@@ -175,15 +179,19 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     }
     Status discoverDevices(std::vector<DeviceInfo>& devices) override {
         if (!initialized_) return Status::InvalidArgument("not initialized");
-        devices = {device_};
+        devices = devices_;
         return Status::OK();
     }
     Status openContext(const DeviceInfo& device, ContextPtr& context) override {
-        if (!initialized_ || device.topology_name != device_.topology_name) {
-            return Status::DeviceNotFound("fake device missing");
+        open_context_calls_.fetch_add(1, std::memory_order_relaxed);
+        if (!initialized_) return Status::InvalidArgument("not initialized");
+        for (const auto& candidate : devices_) {
+            if (candidate.topology_name == device.topology_name) {
+                context = std::make_shared<FakeContext>(device);
+                return Status::OK();
+            }
         }
-        context = std::make_shared<FakeContext>(device);
-        return Status::OK();
+        return Status::DeviceNotFound("fake device missing");
     }
     Status closeContext(ContextPtr& context) override {
         if (auto fake = std::dynamic_pointer_cast<FakeContext>(context)) {
@@ -240,6 +248,7 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     }
     Status createJetty(const ContextPtr&, const JfcPtr& jfc,
                        const JettyOptions&, JettyPtr& jetty) override {
+        create_jetty_calls_.fetch_add(1, std::memory_order_relaxed);
         auto fake_jfc = std::dynamic_pointer_cast<FakeJfc>(jfc);
         if (!fake_jfc) return Status::InvalidArgument("bad JFC");
         jetty = std::make_shared<FakeJetty>(next_jetty_id_++, fake_jfc);
@@ -253,6 +262,7 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         return Status::OK();
     }
     Status bindJetty(const JettyPtr& jetty, const RemoteJettyInfo&) override {
+        bind_jetty_calls_.fetch_add(1, std::memory_order_relaxed);
         auto fake = std::dynamic_pointer_cast<FakeJetty>(jetty);
         if (!fake || !fake->valid())
             return Status::InvalidArgument("bad Jetty");
@@ -309,6 +319,9 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         if (!fake || !fake->valid() || !fake->bound()) {
             return Status::InvalidArgument("unbound Jetty");
         }
+        if (fail_next_post_.exchange(false, std::memory_order_acq_rel)) {
+            return Status::RdmaError("injected post rejection");
+        }
         for (const auto& request : requests) {
             if (!request.local_segment || !request.remote_segment ||
                 request.token == 0 || request.length == 0) {
@@ -358,6 +371,11 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     void failNextCompletion(CompletionCategory category) {
         next_completion_.store(category, std::memory_order_release);
     }
+    // Reject the next post before accepting any WR: posted_count stays zero,
+    // which exercises the synchronous rollback path.
+    void failNextPostWithoutAccept() {
+        fail_next_post_.store(true, std::memory_order_release);
+    }
     void holdNextCompletion() {
         hold_next_completion_.store(true, std::memory_order_release);
     }
@@ -382,6 +400,15 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     uint64_t quiesceCalls() const {
         return quiesce_calls_.load(std::memory_order_relaxed);
     }
+    uint64_t openContextCalls() const {
+        return open_context_calls_.load(std::memory_order_relaxed);
+    }
+    uint64_t createJettyCalls() const {
+        return create_jetty_calls_.load(std::memory_order_relaxed);
+    }
+    uint64_t bindJettyCalls() const {
+        return bind_jetty_calls_.load(std::memory_order_relaxed);
+    }
     uint32_t lastRegisteredAccess() const {
         return last_registered_access_.load(std::memory_order_acquire);
     }
@@ -392,12 +419,13 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         WorkRequest request;
     };
 
-    DeviceInfo device_;
+    std::vector<DeviceInfo> devices_;
     bool initialized_{false};
     uint32_t next_jetty_id_{1};
     std::atomic<CompletionCategory> next_completion_{
         CompletionCategory::SUCCESS};
     std::atomic<bool> hold_next_completion_{false};
+    std::atomic<bool> fail_next_post_{false};
     std::atomic<bool> drop_next_quiesced_completion_{false};
     std::atomic<bool> fail_next_quiesce_{false};
     std::atomic<bool> quiesce_drops_completions_{false};
@@ -406,6 +434,9 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     mutable std::mutex pending_mutex_;
     std::vector<Pending> pending_;
     std::atomic<uint64_t> quiesce_calls_{0};
+    std::atomic<uint64_t> open_context_calls_{0};
+    std::atomic<uint64_t> create_jetty_calls_{0};
+    std::atomic<uint64_t> bind_jetty_calls_{0};
     std::atomic<uint32_t> last_registered_access_{0};
 };
 
@@ -451,6 +482,267 @@ std::shared_ptr<Topology> fakeTopology(bool discovery_active = true) {
     topology->mem_list_.push_back(std::move(memory));
     return topology;
 }
+
+DeviceInfo fakeSecondaryDevice() {
+    DeviceInfo info;
+    info.topology_name = "ub:fake1:eid0";
+    info.native_device_name = "fake1";
+    info.native_device_path = "/fake/fake1";
+    info.eid_index = 0;
+    info.eid = "0002:0000:0000:0000:0000:0000:0000:0000";
+    info.active = true;
+    info.capabilities.max_jfc = 4;
+    info.capabilities.max_jetty = 64;
+    return info;
+}
+
+UbBootstrapDesc makeRmBootstrapV2Request() {
+    UbBootstrapDesc desc;
+    desc.protocol_version = 2;
+    desc.segment_name = "fake-segment";
+    desc.local_nic_path = "fake-segment/ub:fake0:eid0";
+    desc.peer_nic_path = "fake-segment/ub:fake0:eid0";
+    desc.local_device_name = "fake0";
+    desc.local_device_id = 0;
+    desc.local_eid_index = 0;
+    desc.local_eid = fakeDevice().eid;
+    desc.endpoint_generation = 1;
+    desc.segment_generation = 1;
+
+    UbRmTargetDescriptor target;
+    target.target_identity = "P0";
+    target.eid = desc.local_eid;
+    target.uasid = 0;
+    target.id = 1;
+    target.target_epoch = 1;
+    target.profile.trans_mode = kUrmaTransportModeRm;
+    target.profile.target_type = kUrmaTargetTypeJetty;
+    target.profile.tp_type = kUrmaTpTypeRtp;
+
+    UbRmBootstrapDesc rm;
+    rm.transport_mode = "RM";
+    rm.device_kind = "PHYSICAL";
+    rm.physical_device_identity = "/fake/fake0#0001";
+    rm.node_incarnation = 1;
+    rm.context_incarnation = 1;
+    rm.topology_epoch = 1;
+    rm.transport_modes = 3;
+    rm.provider_capabilities = {"read", "write", "rm"};
+    rm.targets = {target};
+    rm.probe_target_map = {{"P0", {"P0"}}};
+    desc.rm = std::move(rm);
+    return desc;
+}
+
+void setPhysicalOnlyIdentity(Config& config, const DeviceInfo& device) {
+    config.set("transports/ub/physical_only", true);
+    config.set("transports/ub/device_identities",
+               nlohmann::json::array({{{"native_device_name",
+                                        device.native_device_name},
+                                       {"native_device_path",
+                                        device.native_device_path},
+                                       {"eid_index", device.eid_index},
+                                       {"eid", device.eid},
+                                       {"kind", "physical"},
+                                       {"transport_modes",
+                                        device.capabilities.transport_modes}}}));
+}
+
+// Two UB NICs (device ids 0 and 1) both reachable from the wildcard memory
+// location, so a buffer registered on both contexts advertises two remote
+// devices and one task's slices can split across two endpoints.
+std::shared_ptr<Topology> fakeTwoDeviceTopology() {
+    auto topology = std::make_shared<Topology>();
+    Topology::NicEntry nic0{.name = "ub:fake0:eid0",
+                            .pci_bus_id = "0000:00:00.0",
+                            .type = Topology::NIC_UB,
+                            .numa_node = 0};
+    Topology::NicEntry nic1{.name = "ub:fake1:eid0",
+                            .pci_bus_id = "0000:00:01.0",
+                            .type = Topology::NIC_UB,
+                            .numa_node = 0};
+    encodeTopologyDeviceAttributes(fakeDevice(), 0, nic0.device_attrs);
+    encodeTopologyDeviceAttributes(fakeSecondaryDevice(), 1, nic1.device_attrs);
+    topology->nic_list_.push_back(std::move(nic0));
+    topology->nic_list_.push_back(std::move(nic1));
+    Topology::MemEntry memory;
+    memory.name = kWildcardLocation;
+    memory.type = Topology::MEM_HOST;
+    memory.numa_node = -1;
+    memory.device_list[0].push_back(0);
+    memory.device_list[0].push_back(1);
+    topology->mem_list_.push_back(std::move(memory));
+    return topology;
+}
+
+// Exercises one worker lane with a single 16-byte WR, so every admitted slice
+// maps to exactly one addInflight/removeInflight pair. The per-slice retry
+// budget is supplied by the caller to pin terminal outcomes.
+class SingleSliceHarness {
+   public:
+    static constexpr size_t kSliceBytes = 16;
+
+    ~SingleSliceHarness() {
+        if (workers) (void)workers->stop();
+        if (endpoints) (void)endpoints->clear();
+        if (buffers) (void)buffers->clear();
+        if (context) (void)context->shutdown();
+        if (adapter) (void)adapter->shutdown();
+    }
+
+    bool start(uint32_t slice_timeout_ms = 20) {
+        adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+        if (!adapter->initialize().ok()) return false;
+        context = std::make_shared<UbContext>(0, fakeDevice(), adapter);
+        if (!context->initialize(1, JfcOptions{}).ok()) return false;
+        contexts = {context};
+        topology = fakeTopology();
+        buffers = std::make_unique<UbBufferManager>(adapter, contexts);
+
+        source_desc.addr = reinterpret_cast<uint64_t>(source.data());
+        source_desc.length = source.size();
+        source_desc.location = kWildcardLocation;
+        target_desc.addr = reinterpret_cast<uint64_t>(target.data());
+        target_desc.length = target.size();
+        target_desc.location = kWildcardLocation;
+        MemoryOptions options;
+        options.perm = kGlobalReadWrite;
+        if (!buffers->addBuffer(source_desc, options).ok()) return false;
+        if (!buffers->addBuffer(target_desc, options).ok()) return false;
+
+        manager =
+            std::make_unique<SegmentManager>(std::make_unique<NullRegistry>());
+        if (!manager
+                 ->updateLocal([&](SegmentDesc& segment) {
+                     segment.name = "local";
+                     segment.type = SegmentType::Memory;
+                     segment.detail = MemorySegmentDesc{};
+                     auto& memory = std::get<MemorySegmentDesc>(segment.detail);
+                     memory.topology = *topology;
+                     memory.buffers = {source_desc, target_desc};
+                     return Status::OK();
+                 })
+                 .ok()) {
+            return false;
+        }
+
+        endpoints = std::make_unique<EndpointStore>(adapter, 16, 1);
+        params.worker_count = 1;
+        params.poller_count = 1;
+        params.slice_size = kSliceBytes;
+        params.max_retries = 1;
+        params.slice_timeout_ms = slice_timeout_ms;
+
+        EndpointResolver resolver =
+            [this](const EndpointResolveRequest& request,
+                   std::shared_ptr<UbEndpoint>& resolved) {
+            UbEndpointKey key{request.local_context->topologyId(),
+                              request.remote_segment_id,
+                              request.remote_topology_id,
+                              "local@ub:fake0:eid0"};
+            auto status =
+                endpoints->getOrCreate(key, request.local_context, resolved);
+            if (!status.ok()) return status;
+            endpoint = resolved;
+            if (resolved->ready()) return status;
+            UbBootstrapDesc peer;
+            peer.local_eid = fakeDevice().eid;
+            peer.endpoint_generation = 100;
+            peer.jetty_ids = {777};
+            return resolved->bind(peer);
+        };
+        workers = std::make_unique<UbWorkers>(
+            adapter, contexts, topology, manager.get(), buffers.get(), &rails,
+            &quota, params, std::move(resolver),
+            [this](const std::shared_ptr<UbEndpoint>& retired) {
+                (void)endpoints->retire(retired);
+            });
+        return workers->start().ok();
+    }
+
+    UbTask::Ptr submit(uint32_t slice_max_retries) {
+        Request request{};
+        request.opcode = Request::WRITE;
+        request.source = source.data();
+        request.target_id = LOCAL_SEGMENT_ID;
+        request.target_offset = reinterpret_cast<uint64_t>(target.data());
+        request.length = kSliceBytes;
+        auto task = UbTask::create(request);
+        if (!task->addSlice(UbSliceSpec{
+                source.data(), reinterpret_cast<uint64_t>(target.data()),
+                kSliceBytes, 0, slice_max_retries})) {
+            return nullptr;
+        }
+        if (!task->seal()) return nullptr;
+        if (!workers->submit(task).ok()) return nullptr;
+        return task;
+    }
+
+    bool waitForPending(size_t expected,
+                        std::chrono::milliseconds timeout) const {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (adapter->pendingCount() != expected &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return adapter->pendingCount() == expected;
+    }
+
+    static bool waitForTerminal(const UbTask::Ptr& task,
+                                std::chrono::milliseconds timeout) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (task->transferStatus().s == PENDING &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return task->transferStatus().s != PENDING;
+    }
+
+    // Snapshot of every counter a P0-3 assertion can depend on. Attaching it to
+    // assertions makes a CI failure print the whole state instead of a single
+    // delta that says nothing about which side of the pair leaked.
+    std::string diagnostics() const {
+        std::ostringstream out;
+        out << "workers_inflight=" << (workers ? workers->inflightCount() : 0)
+            << " context_state="
+            << (context ? static_cast<int>(context->state()) : -1)
+            << " context_wrs=" << (context ? context->outstandingWrs() : 0)
+            << " context_bytes=" << (context ? context->inflightBytes() : 0)
+            << " quota=" << quota.activeReservationCount()
+            << " endpoint_wrs=" << (endpoint ? endpoint->outstandingWrs() : 0)
+            << " endpoint_bytes="
+            << (endpoint ? endpoint->outstandingBytes() : 0)
+            << " adapter_pending=" << (adapter ? adapter->pendingCount() : 0)
+            << " quiesce_calls=" << (adapter ? adapter->quiesceCalls() : 0);
+        return out.str();
+    }
+
+    static std::string describeTask(const UbTask::Ptr& task) {
+        if (!task) return "task=null";
+        const auto status = task->transferStatus();
+        std::ostringstream out;
+        out << "task_status=" << static_cast<int>(status.s)
+            << " task_bytes=" << status.transferred_bytes;
+        return out.str();
+    }
+
+    std::shared_ptr<FakeUrmaAdapter> adapter;
+    std::shared_ptr<UbContext> context;
+    std::vector<UbContextPtr> contexts;
+    std::shared_ptr<Topology> topology;
+    std::unique_ptr<UbBufferManager> buffers;
+    std::unique_ptr<SegmentManager> manager;
+    std::unique_ptr<EndpointStore> endpoints;
+    RailMonitor rails;
+    QuotaManager quota;
+    UbParams params;
+    std::shared_ptr<UbEndpoint> endpoint;
+    std::unique_ptr<UbWorkers> workers;
+    std::array<char, kSliceBytes> source{};
+    std::array<char, kSliceBytes> target{};
+    BufferDesc source_desc{};
+    BufferDesc target_desc{};
+};
 
 TEST(UbNativeDataPathTest, LocalBuffersRequestProviderLocalOnlyAccess) {
     auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
@@ -741,6 +1033,122 @@ TEST(UbNativeDataPathTest,
     EXPECT_TRUE(adapter->shutdown().ok());
 }
 
+TEST(UbNativeDataPathTest, SingleWrRejectedPostRollsBackInflightExactlyOnce) {
+    SingleSliceHarness harness;
+    ASSERT_TRUE(harness.start(/*slice_timeout_ms=*/5000));
+
+    // Not one byte of the single WR is accepted, so the worker must unwind the
+    // inflight pair it recorded before crossing the adapter boundary.
+    harness.adapter->failNextPostWithoutAccept();
+    auto task = harness.submit(0);
+    ASSERT_NE(task, nullptr) << "failed to submit the single-WR task; "
+                             << harness.diagnostics();
+    ASSERT_TRUE(SingleSliceHarness::waitForTerminal(task,
+                                                    std::chrono::seconds(2)))
+        << "rejected post never reached a terminal state; "
+        << SingleSliceHarness::describeTask(task) << " "
+        << harness.diagnostics();
+    const auto snapshot = [&] {
+        return SingleSliceHarness::describeTask(task) + " " +
+               harness.diagnostics();
+    };
+    EXPECT_EQ(task->transferStatus().s, FAILED) << snapshot();
+    EXPECT_EQ(task->transferStatus().transferred_bytes, 0U) << snapshot();
+
+    EXPECT_EQ(harness.workers->inflightCount(), 0U) << snapshot();
+    EXPECT_EQ(harness.context->outstandingWrs(), 0U) << snapshot();
+    EXPECT_EQ(harness.context->inflightBytes(), 0U) << snapshot();
+    EXPECT_EQ(harness.quota.activeReservationCount(), 0U) << snapshot();
+    ASSERT_NE(harness.endpoint, nullptr) << snapshot();
+    EXPECT_EQ(harness.endpoint->outstandingWrs(), 0U) << snapshot();
+    EXPECT_EQ(harness.endpoint->outstandingBytes(), 0U) << snapshot();
+}
+
+TEST(UbNativeDataPathTest, SingleWrFlushCompletionReleasesInflightOnce) {
+    SingleSliceHarness harness;
+    // A long timeout keeps the scan from fencing the WR before stop() does.
+    ASSERT_TRUE(harness.start(/*slice_timeout_ms=*/5000));
+
+    harness.adapter->holdNextCompletion();
+    auto task = harness.submit(0);
+    ASSERT_NE(task, nullptr) << "failed to submit the single-WR task; "
+                             << harness.diagnostics();
+    ASSERT_TRUE(harness.waitForPending(1, std::chrono::seconds(2)))
+        << "held WR was never observed at the adapter; "
+        << SingleSliceHarness::describeTask(task) << " "
+        << harness.diagnostics();
+    const auto snapshot = [&] {
+        return SingleSliceHarness::describeTask(task) + " " +
+               harness.diagnostics();
+    };
+    EXPECT_EQ(harness.workers->inflightCount(), 1U) << snapshot();
+    EXPECT_EQ(harness.context->outstandingWrs(), 1U) << snapshot();
+    EXPECT_EQ(harness.context->inflightBytes(),
+              SingleSliceHarness::kSliceBytes)
+        << snapshot();
+
+    // stop() fences the endpoint. The flush completion surfaces the held WR
+    // exactly once, so shutdown must observe the matching removeInflight.
+    ASSERT_TRUE(harness.workers->stop().ok())
+        << "stop failed after the flush fence; " << snapshot();
+    EXPECT_EQ(harness.workers->inflightCount(), 0U) << snapshot();
+    EXPECT_EQ(harness.context->outstandingWrs(), 0U) << snapshot();
+    EXPECT_EQ(harness.context->inflightBytes(), 0U) << snapshot();
+    EXPECT_EQ(harness.quota.activeReservationCount(), 0U) << snapshot();
+    EXPECT_EQ(task->transferStatus().s, CANCELED) << snapshot();
+
+    // A second stop must not double-release the already drained pair.
+    EXPECT_TRUE(harness.workers->stop().ok())
+        << "second stop failed; " << snapshot();
+    EXPECT_EQ(harness.context->outstandingWrs(), 0U) << snapshot();
+    EXPECT_EQ(harness.context->inflightBytes(), 0U) << snapshot();
+}
+
+TEST(UbNativeDataPathTest, SingleWrTimeoutFenceReclaimsInflightOnce) {
+    SingleSliceHarness harness;
+    ASSERT_TRUE(harness.start(/*slice_timeout_ms=*/10));
+    for (size_t i = 0; i < harness.source.size(); ++i) {
+        harness.source[i] = static_cast<char>(i + 1);
+    }
+
+    // The provider drops the WR and the flush cannot return it. The successful
+    // fence is the only proof that the old DMA is gone, so the timed-out token
+    // must be reclaimed before the retry is posted.
+    harness.adapter->holdNextCompletion();
+    harness.adapter->dropQuiesceCompletions();
+    auto task = harness.submit(1);
+    ASSERT_NE(task, nullptr) << "failed to submit the single-WR task; "
+                             << harness.diagnostics();
+    ASSERT_TRUE(SingleSliceHarness::waitForTerminal(task,
+                                                    std::chrono::seconds(2)))
+        << "timeout retry never reached a terminal state; "
+        << SingleSliceHarness::describeTask(task) << " "
+        << harness.diagnostics();
+    const auto snapshot = [&] {
+        return SingleSliceHarness::describeTask(task) + " " +
+               harness.diagnostics();
+    };
+    EXPECT_EQ(task->transferStatus().s, COMPLETED) << snapshot();
+    EXPECT_EQ(task->transferStatus().transferred_bytes,
+              SingleSliceHarness::kSliceBytes)
+        << snapshot();
+    EXPECT_EQ(harness.source, harness.target)
+        << "payload mismatch after timeout retry; " << snapshot();
+    const auto timeout_stats =
+        harness.rails.stats(UbPostPath{0, LOCAL_SEGMENT_ID, 0, 1});
+    EXPECT_GE(timeout_stats.timeouts, 1U)
+        << "timeout was never recorded on the rail; rail_timeouts="
+        << timeout_stats.timeouts << " rail_pauses=" << timeout_stats.pauses
+        << " " << snapshot();
+    EXPECT_GE(harness.adapter->quiesceCalls(), 1U)
+        << "provider-lost WR was never fenced; " << snapshot();
+
+    EXPECT_EQ(harness.workers->inflightCount(), 0U) << snapshot();
+    EXPECT_EQ(harness.context->outstandingWrs(), 0U) << snapshot();
+    EXPECT_EQ(harness.context->inflightBytes(), 0U) << snapshot();
+    EXPECT_EQ(harness.quota.activeReservationCount(), 0U) << snapshot();
+}
+
 TEST(UbNativeDataPathTest, EndpointStoreNeverReusesRetiredGeneration) {
     auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
     ASSERT_TRUE(adapter->initialize().ok());
@@ -806,6 +1214,76 @@ TEST(UbNativeDataPathTest,
     EXPECT_TRUE(adapter->shutdown().ok());
 }
 
+TEST(UbNativeDataPathTest,
+     UbTransportRejectsPooledRmBeforeNativeAllocation) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    auto topology = fakeTopology();
+    auto control = std::make_shared<ControlService>("p2p", "", nullptr);
+    uint16_t port = 0;
+    ASSERT_TRUE(control->start(port).ok());
+    const std::string segment_name =
+        "127.0.0.1:" + std::to_string(static_cast<unsigned>(port));
+
+    auto config = std::make_shared<Config>();
+    config->set("transports/ub/enable", true);
+    config->set("transports/ub/runtime_profile", "rm_pool");
+    config->set("transports/ub/trans_mode", "rm");
+    config->set("transports/ub/jetty_pool/enable", true);
+    config->set("transports/ub/probe/enabled", true);
+
+    UbTransport transport(adapter);
+    std::string mutable_segment_name = segment_name;
+    const auto status =
+        transport.install(mutable_segment_name, control, topology, config);
+    EXPECT_TRUE(status.IsNotImplemented()) << status.ToString();
+    EXPECT_EQ(adapter->openContextCalls(), 0U)
+        << "pooled RM gate ran after opening a native context";
+    EXPECT_EQ(adapter->createJettyCalls(), 0U)
+        << "pooled RM gate ran after creating a native Jetty";
+}
+
+TEST(UbNativeDataPathTest, UbTransportInstallsTrustedPhysicalDevice) {
+    auto device = fakeDevice();
+    device.capabilities.transport_modes = 6;
+    auto unmapped = fakeSecondaryDevice();
+    unmapped.capabilities.transport_modes = 6;
+    auto adapter = std::make_shared<FakeUrmaAdapter>(
+        std::vector<DeviceInfo>{device, unmapped});
+    auto topology = fakeTwoDeviceTopology();
+    auto control = std::make_shared<ControlService>("p2p", "", nullptr);
+    uint16_t port = 0;
+    ASSERT_TRUE(control->start(port).ok());
+    const std::string segment_name =
+        "127.0.0.1:" + std::to_string(static_cast<unsigned>(port));
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        segment.name = segment_name;
+                        segment.rpc_server_addr = segment_name;
+                        segment.machine_id = "fake-machine";
+                        segment.type = SegmentType::Memory;
+                        segment.detail = MemorySegmentDesc{};
+                        std::get<MemorySegmentDesc>(segment.detail).topology =
+                            *topology;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    auto config = std::make_shared<Config>();
+    config->set("transports/ub/enable", true);
+    config->set("transports/ub/worker_count", 1);
+    config->set("transports/ub/poller_count", 1);
+    config->set("transports/ub/jfc_per_context", 1);
+    setPhysicalOnlyIdentity(*config, device);
+
+    UbTransport transport(adapter);
+    std::string mutable_segment_name = segment_name;
+    ASSERT_TRUE(
+        transport.install(mutable_segment_name, control, topology, config)
+            .ok());
+    EXPECT_EQ(adapter->openContextCalls(), 1U);
+    EXPECT_TRUE(transport.uninstall().ok());
+}
+
 TEST(UbNativeDataPathTest, UbTransportRunsSelfReadWriteOverNativeControlPlane) {
     auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
     // A serialized discovery snapshot is informational. Current local
@@ -851,6 +1329,20 @@ TEST(UbNativeDataPathTest, UbTransportRunsSelfReadWriteOverNativeControlPlane) {
     EXPECT_TRUE(transport.supportsCancellation());
     EXPECT_FALSE(transport.supportNotification());
     EXPECT_TRUE(transport.capabilities().dram_to_dram);
+
+    // A structurally valid RM v2 request is accepted by the wire codec but
+    // rejected before endpoint/Jetty allocation because this runtime is RC.
+    const auto create_before_v2 = adapter->createJettyCalls();
+    const auto bind_before_v2 = adapter->bindJettyCalls();
+    UbBootstrapDesc v2_response;
+    ASSERT_TRUE(ControlClient::bootstrapUb(segment_name,
+                                           makeRmBootstrapV2Request(),
+                                           v2_response)
+                    .ok());
+    EXPECT_EQ(v2_response.protocol_version, 2U);
+    EXPECT_NE(v2_response.reply_msg.find("RM bootstrap v2"), std::string::npos);
+    EXPECT_EQ(adapter->createJettyCalls(), create_before_v2);
+    EXPECT_EQ(adapter->bindJettyCalls(), bind_before_v2);
 
     std::array<char, 64> source{};
     std::array<char, 64> target{};

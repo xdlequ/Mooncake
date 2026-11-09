@@ -551,7 +551,8 @@ add_test(NAME tent_strict_local_numa_test COMMAND tent_strict_local_numa_test)
 
 if(USE_UB)
   add_executable(
-    tent_ub_core_test ub_core_test.cpp ../src/transport/ub/quota.cpp
+    tent_ub_core_test ub_core_test.cpp ../src/transport/ub/bootstrap.cpp
+                      ../src/transport/ub/quota.cpp
                       ../src/transport/ub/rail_monitor.cpp)
   target_link_libraries(tent_ub_core_test PRIVATE tent_common gtest gtest_main)
   target_include_directories(tent_ub_core_test

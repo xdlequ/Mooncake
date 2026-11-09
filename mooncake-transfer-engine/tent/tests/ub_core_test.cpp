@@ -20,6 +20,7 @@
 #include <thread>
 #include <vector>
 
+#include "tent/transport/ub/bootstrap.h"
 #include "tent/transport/ub/device_selection.h"
 #include "tent/transport/ub/quota.h"
 #include "tent/transport/ub/params.h"
@@ -44,6 +45,320 @@ TEST(UbParamsTest, ParsesStrictValuesAndAllowsRetryDisable) {
 
     config.set("transports/ub/worker_count", -1);
     EXPECT_TRUE(UbParams::FromConfig(config, params).IsInvalidArgument());
+}
+
+TEST(UbParamsTest, RuntimeDefaultsSelectRcLegacyWithPoolAndProbeOff) {
+    Config config;
+    UbParams params;
+    ASSERT_TRUE(UbParams::FromConfig(config, params).ok());
+    EXPECT_EQ(params.runtime_profile, UbRuntimeProfile::kRcLegacy);
+    EXPECT_EQ(params.trans_mode, UbTransportMode::kRc);
+    EXPECT_FALSE(params.jetty_pool.enable);
+    EXPECT_FALSE(params.jetty_pool.force_disable);
+    EXPECT_FALSE(params.probe.enabled);
+    EXPECT_TRUE(params.probe.stop_on_recovery);
+
+    UbRuntimeMode mode = UbRuntimeMode::kPooledRm;
+    ASSERT_TRUE(resolveUbRuntimeMode(params, mode).ok());
+    EXPECT_EQ(mode, UbRuntimeMode::kRcLegacy);
+}
+
+TEST(UbParamsTest, ParsesDormantPoolAndProbeKeysWithoutStartingResources) {
+    Config config;
+    config.set("transports/ub/runtime_profile", "RM_POOL");
+    config.set("transports/ub/trans_mode", "rm");
+    config.set("transports/ub/jetty_pool/enable", true);
+    config.set("transports/ub/jetty_pool/force_disable", true);
+    config.set("transports/ub/probe/enabled", true);
+    config.set("transports/ub/probe/interval", 100);
+    config.set("transports/ub/probe/timeout", 200);
+    config.set("transports/ub/probe/backoff_max", 300);
+    config.set("transports/ub/probe/peer_budget", 2);
+    config.set("transports/ub/probe/recover_success_threshold", 2);
+    config.set("transports/ub/probe/failure_threshold", 4);
+    config.set("transports/ub/probe/stop_on_recovery", true);
+
+    UbParams params;
+    ASSERT_TRUE(UbParams::FromConfig(config, params).ok());
+    EXPECT_EQ(params.runtime_profile, UbRuntimeProfile::kRmPool);
+    EXPECT_EQ(params.trans_mode, UbTransportMode::kRm);
+    EXPECT_TRUE(params.jetty_pool.enable);
+    EXPECT_TRUE(params.jetty_pool.force_disable);
+    EXPECT_TRUE(params.probe.enabled);
+    EXPECT_EQ(params.probe.interval, 100U);
+    EXPECT_EQ(params.probe.timeout, 200U);
+    EXPECT_EQ(params.probe.backoff_max, 300U);
+    EXPECT_EQ(params.probe.peer_budget, 2U);
+    EXPECT_EQ(params.probe.recover_success_threshold, 2U);
+    EXPECT_EQ(params.probe.failure_threshold, 4U);
+
+    // The schema is accepted, but the pooled data plane does not exist yet.
+    // Selection must fail instead of silently running RC under a pool label.
+    UbRuntimeMode mode = UbRuntimeMode::kRcLegacy;
+    EXPECT_TRUE(resolveUbRuntimeMode(params, mode).IsNotImplemented());
+}
+
+TEST(UbParamsTest, RuntimeMatrixRejectsInconsistentOrUnsupportedModes) {
+    auto evaluate = [](UbRuntimeProfile profile, UbTransportMode mode,
+                       bool pool, bool probe) {
+        UbParams params;
+        params.runtime_profile = profile;
+        params.trans_mode = mode;
+        params.jetty_pool.enable = pool;
+        params.probe.enabled = probe;
+        UbRuntimeMode resolved = UbRuntimeMode::kRcLegacy;
+        return resolveUbRuntimeMode(params, resolved);
+    };
+
+    EXPECT_TRUE(evaluate(UbRuntimeProfile::kRcLegacy, UbTransportMode::kRm,
+                         false, false)
+                    .IsInvalidArgument());
+    EXPECT_TRUE(evaluate(UbRuntimeProfile::kRcLegacy, UbTransportMode::kRc,
+                         true, false)
+                    .IsInvalidArgument());
+    EXPECT_TRUE(evaluate(UbRuntimeProfile::kRcLegacy, UbTransportMode::kRc,
+                         false, true)
+                    .IsInvalidArgument());
+
+    EXPECT_TRUE(evaluate(UbRuntimeProfile::kRmLegacy, UbTransportMode::kRc,
+                         false, false)
+                    .IsInvalidArgument());
+    EXPECT_TRUE(evaluate(UbRuntimeProfile::kRmLegacy, UbTransportMode::kRm,
+                         false, false)
+                    .IsNotImplemented());
+    EXPECT_TRUE(evaluate(UbRuntimeProfile::kRmLegacy, UbTransportMode::kRm,
+                         true, false)
+                    .IsInvalidArgument());
+    EXPECT_TRUE(evaluate(UbRuntimeProfile::kRmLegacy, UbTransportMode::kRm,
+                         false, true)
+                    .IsInvalidArgument());
+
+    EXPECT_TRUE(evaluate(UbRuntimeProfile::kRmPool, UbTransportMode::kRm,
+                         false, true)
+                    .IsInvalidArgument());
+    EXPECT_TRUE(evaluate(UbRuntimeProfile::kRmPool, UbTransportMode::kRm,
+                         true, false)
+                    .IsInvalidArgument());
+    EXPECT_TRUE(evaluate(UbRuntimeProfile::kRmPool, UbTransportMode::kRm,
+                         true, true)
+                    .IsNotImplemented());
+}
+
+TEST(UbParamsTest, RejectsUnknownRuntimeKeysAndNonFixedProbeRecovery) {
+    Config config;
+    UbParams params;
+
+    config.set("transports/ub/runtime_profile", "rm");
+    EXPECT_TRUE(UbParams::FromConfig(config, params).IsInvalidArgument());
+
+    config.set("transports/ub/runtime_profile", "rm_pool");
+    config.set("transports/ub/trans_mode", "uc");
+    EXPECT_TRUE(UbParams::FromConfig(config, params).IsInvalidArgument());
+
+    config.set("transports/ub/trans_mode", "rm");
+    config.set("transports/ub/probe/stop_on_recovery", false);
+    EXPECT_TRUE(UbParams::FromConfig(config, params).IsInvalidArgument());
+}
+
+UbBootstrapDesc makeValidRmBootstrap() {
+    UbBootstrapDesc desc;
+    desc.protocol_version = 2;
+    desc.segment_name = "segment-a";
+    desc.local_nic_path = "segment-a/ub:udma0:eid0";
+    desc.peer_nic_path = "segment-b/ub:udma1:eid0";
+    desc.local_device_name = "udma0";
+    desc.local_device_id = 0;
+    desc.local_eid_index = 0;
+    desc.local_eid = "0001:0000:0000:0000:0000:0000:0000:0000";
+    desc.endpoint_generation = 6;
+    desc.segment_generation = 5;
+
+    UbRmTargetDescriptor target;
+    target.target_identity = "P0";
+    target.eid = desc.local_eid;
+    target.uasid = 0;
+    target.id = 10;
+    target.target_epoch = 4;
+    target.profile.trans_mode = kUrmaTransportModeRm;
+    target.profile.target_type = kUrmaTargetTypeJetty;
+    target.profile.tp_type = kUrmaTpTypeRtp;
+
+    UbRmBootstrapDesc rm;
+    rm.transport_mode = "RM";
+    rm.device_kind = "PHYSICAL";
+    rm.physical_device_identity = "/dev/uburma/udma0#0001";
+    rm.node_incarnation = 1;
+    rm.context_incarnation = 2;
+    rm.topology_epoch = 3;
+    rm.transport_modes = 3;
+    rm.provider_capabilities = {"read", "write", "rm"};
+    rm.targets = {target};
+    rm.probe_target_map = {{"local-P0", {"P0"}}};
+    desc.rm = std::move(rm);
+    return desc;
+}
+
+TEST(UbBootstrapTest, GatesVersionAndModeWithoutClaimingRmRuntimeSupport) {
+    UbBootstrapDesc legacy;
+    legacy.protocol_version = 1;
+    EXPECT_TRUE(
+        gateUbBootstrapForMode(UbBootstrapMode::RC, legacy).ok());
+    EXPECT_TRUE(
+        gateUbBootstrapForMode(UbBootstrapMode::RM, legacy)
+            .IsInvalidArgument());
+
+    const auto rm = makeValidRmBootstrap();
+    EXPECT_TRUE(validateUbBootstrap(rm).ok());
+    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::RM, rm).ok());
+    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::RC, rm)
+                    .IsNotImplemented());
+    auto response_envelope = rm;
+    response_envelope.reply_msg = "response is not a request";
+    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::RM, response_envelope)
+                    .IsInvalidArgument());
+}
+
+TEST(UbBootstrapTest, ValidatesRmIdentityProfilesAndProbeReferences) {
+    auto desc = makeValidRmBootstrap();
+    desc.rm->targets[0].uasid = 0;
+    EXPECT_TRUE(validateUbBootstrap(desc).ok());
+    desc.rm->targets[0].uasid = 17;
+    EXPECT_TRUE(validateUbBootstrap(desc).ok());
+
+    UbBootstrapDesc error_envelope;
+    error_envelope.protocol_version = 2;
+    error_envelope.reply_msg = "error-only envelope is not a valid request";
+    EXPECT_TRUE(validateUbBootstrap(error_envelope).IsInvalidArgument());
+
+    desc = makeValidRmBootstrap();
+    desc.rm->transport_mode = "RC";
+    EXPECT_TRUE(validateUbBootstrap(desc).IsInvalidArgument());
+    desc = makeValidRmBootstrap();
+    desc.rm->device_kind = "UNKNOWN";
+    EXPECT_TRUE(validateUbBootstrap(desc).IsInvalidArgument());
+    desc = makeValidRmBootstrap();
+    desc.rm->transport_modes = 6;  // RC|UM, deliberately without RM.
+    EXPECT_TRUE(validateUbBootstrap(desc).IsInvalidArgument());
+    desc = makeValidRmBootstrap();
+    desc.local_eid = "not-an-eid";
+    EXPECT_TRUE(validateUbBootstrap(desc).IsInvalidArgument());
+    desc = makeValidRmBootstrap();
+    desc.rm->node_incarnation = 0;
+    EXPECT_TRUE(validateUbBootstrap(desc).IsInvalidArgument());
+    desc = makeValidRmBootstrap();
+    desc.rm->provider_capabilities = {"read"};
+    EXPECT_TRUE(validateUbBootstrap(desc).IsInvalidArgument());
+    desc = makeValidRmBootstrap();
+    desc.rm->transport_modes = 0;
+    EXPECT_TRUE(validateUbBootstrap(desc).IsInvalidArgument());
+    desc = makeValidRmBootstrap();
+    desc.rm->transport_modes = 8;
+    EXPECT_TRUE(validateUbBootstrap(desc).IsInvalidArgument());
+    desc = makeValidRmBootstrap();
+    desc.rm->transport_modes = 0x8000;
+    EXPECT_TRUE(validateUbBootstrap(desc).IsInvalidArgument());
+    desc = makeValidRmBootstrap();
+    desc.rm->targets[0].profile.trans_mode = kUrmaTransportModeRc;
+    EXPECT_TRUE(validateUbBootstrap(desc).IsInvalidArgument());
+    desc = makeValidRmBootstrap();
+    desc.rm->targets[0].profile.trans_mode = 3;
+    EXPECT_TRUE(validateUbBootstrap(desc).IsInvalidArgument());
+    desc = makeValidRmBootstrap();
+    desc.rm->targets[0].profile.target_type = 0;  // URMA_JFR is out of scope.
+    EXPECT_TRUE(validateUbBootstrap(desc).IsInvalidArgument());
+    desc = makeValidRmBootstrap();
+    desc.rm->targets[0].profile.tp_type = 1;  // CTP is outside the first RM/RTP profile.
+    EXPECT_TRUE(validateUbBootstrap(desc).IsInvalidArgument());
+    desc = makeValidRmBootstrap();
+    desc.rm->targets[0].id = 0;
+    EXPECT_TRUE(validateUbBootstrap(desc).IsInvalidArgument());
+    desc = makeValidRmBootstrap();
+    desc.rm->targets.push_back(desc.rm->targets[0]);
+    EXPECT_TRUE(validateUbBootstrap(desc).IsInvalidArgument());
+    desc = makeValidRmBootstrap();
+    desc.rm->probe_target_map["local-P0"] = {"missing-target"};
+    EXPECT_TRUE(validateUbBootstrap(desc).IsInvalidArgument());
+}
+
+TEST(UbBootstrapTest, CrossChecksPeerIdentityAgainstTrustedMetadata) {
+    const auto desc = makeValidRmBootstrap();
+    UbExpectedPeerIdentity expected;
+    expected.segment_name = desc.segment_name;
+    expected.local_nic_path = desc.local_nic_path;
+    expected.physical_device_identity = desc.rm->physical_device_identity;
+    expected.native_device_name = desc.local_device_name;
+    expected.device_id = desc.local_device_id;
+    expected.eid_index = desc.local_eid_index;
+    expected.eid = desc.local_eid;
+    expected.transport_modes = desc.rm->transport_modes;
+    EXPECT_TRUE(validateUbBootstrapV2PeerIdentity(desc, expected).ok());
+    auto response_envelope = desc;
+    response_envelope.reply_msg = "response is not a request";
+    EXPECT_TRUE(validateUbBootstrapV2PeerIdentity(response_envelope, expected)
+                    .IsInvalidArgument());
+    auto disguised_v1 = desc;
+    disguised_v1.protocol_version = 1;
+    EXPECT_TRUE(validateUbBootstrapV2PeerIdentity(disguised_v1, expected)
+                    .IsInvalidArgument());
+
+    auto mismatched = expected;
+    mismatched.transport_modes ^= 1;
+    EXPECT_TRUE(validateUbBootstrapV2PeerIdentity(desc, mismatched)
+                    .IsInvalidArgument());
+    mismatched = expected;
+    mismatched.eid = "0002:0000:0000:0000:0000:0000:0000:0000";
+    EXPECT_TRUE(validateUbBootstrapV2PeerIdentity(desc, mismatched)
+                    .IsInvalidArgument());
+}
+
+TEST(UbBootstrapTest, ComparesGenerationsWithoutOverwritingNewerSnapshots) {
+    const auto current = makeValidRmBootstrap();
+    auto candidate = current;
+    UbBootstrapGenerationComparison comparison;
+    ASSERT_TRUE(compareUbBootstrapV2(candidate, current, comparison).ok());
+    EXPECT_EQ(comparison, UbBootstrapGenerationComparison::kDuplicate);
+
+    candidate.reply_msg = "duplicate responses may differ only in diagnostics";
+    ASSERT_TRUE(compareUbBootstrapV2(candidate, current, comparison).ok());
+    EXPECT_EQ(comparison, UbBootstrapGenerationComparison::kDuplicate);
+
+    candidate = current;
+    candidate.rm->node_incarnation--;
+    ASSERT_TRUE(compareUbBootstrapV2(candidate, current, comparison).ok());
+    EXPECT_EQ(comparison, UbBootstrapGenerationComparison::kStale);
+
+    candidate = current;
+    candidate.rm->context_incarnation++;
+    ASSERT_TRUE(compareUbBootstrapV2(candidate, current, comparison).ok());
+    EXPECT_EQ(comparison, UbBootstrapGenerationComparison::kNewer);
+
+    candidate = current;
+    candidate.rm->targets[0].target_epoch--;
+    ASSERT_TRUE(compareUbBootstrapV2(candidate, current, comparison).ok());
+    EXPECT_EQ(comparison, UbBootstrapGenerationComparison::kStale);
+
+    candidate = current;
+    candidate.rm->targets[0].target_epoch++;
+    ASSERT_TRUE(compareUbBootstrapV2(candidate, current, comparison).ok());
+    EXPECT_EQ(comparison, UbBootstrapGenerationComparison::kNewer);
+
+    candidate = current;
+    candidate.rm->targets[0].target_epoch--;
+    candidate.endpoint_generation++;
+    ASSERT_TRUE(compareUbBootstrapV2(candidate, current, comparison).ok());
+    EXPECT_EQ(comparison, UbBootstrapGenerationComparison::kConflict);
+
+    candidate = current;
+    candidate.rm->targets[0].eid =
+        "0002:0000:0000:0000:0000:0000:0000:0000";
+    ASSERT_TRUE(compareUbBootstrapV2(candidate, current, comparison).ok());
+    EXPECT_EQ(comparison, UbBootstrapGenerationComparison::kConflict);
+
+    candidate = current;
+    candidate.rm->targets[0].target_identity = "different-target";
+    candidate.rm->probe_target_map["local-P0"] = {"different-target"};
+    ASSERT_TRUE(compareUbBootstrapV2(candidate, current, comparison).ok());
+    EXPECT_EQ(comparison, UbBootstrapGenerationComparison::kConflict);
 }
 
 Request makeRequest(size_t length) {
@@ -394,14 +709,75 @@ TEST(UbRailMonitorTest, OutOfOrderExpiredErrorDoesNotTriggerPause) {
     EXPECT_EQ(stats.recoveries, 0U);
 }
 
+TEST(UbLocalSendProfileTest, DerivesRmRtpProfileFromTrustedCapabilities) {
+    DeviceInfo device;
+    device.capabilities.transport_modes =
+        kUrmaTransportModeRm | kUrmaTransportModeRc;
+    device.capabilities.rm_tp_cap = kUrmaTpTypeRtpMask;
+    device.capabilities.priority_tp_type_masks[3] =
+        kUrmaTpTypeRtpMask | (1U << 1);
+
+    LocalSendProfile profile;
+    ASSERT_TRUE(buildLocalSendProfile(device, 3, profile).ok());
+    EXPECT_EQ(profile.trans_mode, kUrmaTransportModeRm);
+    EXPECT_EQ(profile.priority, 3);
+    EXPECT_EQ(profile.bind_tp_type_mask,
+              device.capabilities.priority_tp_type_masks[3]);
+    EXPECT_EQ(profile.local_capabilities.rm_tp_cap,
+              device.capabilities.rm_tp_cap);
+    device.capabilities.priority_tp_type_masks[0] = kUrmaTpTypeRtpMask;
+    device.capabilities.priority_tp_type_masks[15] = kUrmaTpTypeRtpMask;
+    EXPECT_TRUE(buildLocalSendProfile(device, 0, profile).ok());
+    EXPECT_TRUE(buildLocalSendProfile(device, 15, profile).ok());
+}
+
+TEST(UbLocalSendProfileTest, RejectsInvalidPriorityAndRmRtpCapabilities) {
+    DeviceInfo device;
+    device.capabilities.transport_modes = kUrmaTransportModeRm;
+    device.capabilities.rm_tp_cap = kUrmaTpTypeRtpMask;
+    device.capabilities.priority_tp_type_masks[3] = kUrmaTpTypeRtpMask;
+
+    LocalSendProfile profile;
+    EXPECT_TRUE(buildLocalSendProfile(device, -1, profile).IsInvalidArgument());
+    EXPECT_TRUE(buildLocalSendProfile(device, 16, profile).IsInvalidArgument());
+    EXPECT_TRUE(buildLocalSendProfile(device, 256, profile).IsInvalidArgument());
+
+    auto invalid = device;
+    invalid.capabilities.transport_modes = 8;
+    EXPECT_TRUE(buildLocalSendProfile(invalid, 3, profile).IsInvalidArgument());
+    invalid = device;
+    invalid.capabilities.transport_modes = kUrmaTransportModeRc;
+    EXPECT_TRUE(buildLocalSendProfile(invalid, 3, profile).IsInvalidArgument());
+    invalid = device;
+    invalid.capabilities.rm_tp_cap = 0;
+    EXPECT_TRUE(buildLocalSendProfile(invalid, 3, profile).IsInvalidArgument());
+    invalid = device;
+    invalid.capabilities.priority_tp_type_masks[3] = 1U << 1;
+    EXPECT_TRUE(buildLocalSendProfile(invalid, 3, profile).IsInvalidArgument());
+}
+
 DeviceInfo makeDevice(std::string native_name, std::string topology_name = "") {
     DeviceInfo info;
     info.native_device_name = std::move(native_name);
     info.topology_name = topology_name.empty()
                              ? ("ub:" + info.native_device_name + ":eid0")
                              : std::move(topology_name);
+    info.native_device_path = "/fake/" + info.native_device_name;
+    info.eid = "0001:0000:0000:0000:0000:0000:0000:0000";
     info.active = true;
+    info.capabilities.transport_modes = 2;
     return info;
+}
+
+DeviceIdentity makeIdentity(const DeviceInfo& device, DeviceKind kind) {
+    DeviceIdentity identity;
+    identity.native_device_name = device.native_device_name;
+    identity.native_device_path = device.native_device_path;
+    identity.eid_index = device.eid_index;
+    identity.eid = device.eid;
+    identity.kind = kind;
+    identity.transport_modes = device.capabilities.transport_modes;
+    return identity;
 }
 
 TEST(UbDeviceSelectionTest, DetectsBondingNamesCaseInsensitively) {
@@ -451,6 +827,85 @@ TEST(UbDeviceSelectionTest, EmptyInputStaysEmpty) {
     const auto selected =
         preferBondingDevicesIfPresent({}, /*explicit_filter=*/false);
     EXPECT_TRUE(selected.empty());
+}
+
+TEST(UbDeviceSelectionTest, PhysicalOnlyRejectsUnmappedNames) {
+    std::vector<DeviceInfo> devices = {makeDevice("bonding_dev_0"),
+                                       makeDevice("udmac0d0e1")};
+    ASSERT_TRUE(resolveDeviceKindIdentities({}, devices).ok());
+    for (const auto& device : devices) {
+        EXPECT_EQ(device.kind, DeviceKind::UNKNOWN);
+        EXPECT_EQ(device.kind_source, DeviceKindSource::NONE);
+    }
+    EXPECT_TRUE(physicalDevices(devices).empty());
+}
+
+TEST(UbDeviceSelectionTest, TrustedKindOverridesLegacyNameHeuristic) {
+    std::vector<DeviceInfo> devices = {makeDevice("bonding_dev_0"),
+                                       makeDevice("udmac0d0e1")};
+    const std::vector<DeviceIdentity> identities = {
+        makeIdentity(devices[0], DeviceKind::PHYSICAL),
+        makeIdentity(devices[1], DeviceKind::BONDING)};
+    ASSERT_TRUE(resolveDeviceKindIdentities(identities, devices).ok());
+
+    const auto selected = physicalDevices(devices);
+    ASSERT_EQ(selected.size(), 1U);
+    EXPECT_EQ(selected[0].native_device_name, "bonding_dev_0");
+    EXPECT_FALSE(isBondingDevice(selected[0]));
+    EXPECT_TRUE(isBondingDevice(devices[1]));
+    EXPECT_EQ(devices[0].kind_source, DeviceKindSource::EXPLICIT_CONFIG);
+}
+
+TEST(UbDeviceSelectionTest, TrustedIdentityRejectsStalePathAndCapabilities) {
+    auto device = makeDevice("udmac0d0e1");
+    auto identity = makeIdentity(device, DeviceKind::PHYSICAL);
+    identity.native_device_path = "/stale/path";
+    std::vector<DeviceInfo> devices = {device};
+    EXPECT_TRUE(resolveDeviceKindIdentities({identity}, devices)
+                    .IsDeviceNotFound());
+    EXPECT_EQ(devices[0].kind, DeviceKind::UNKNOWN);
+
+    identity = makeIdentity(device, DeviceKind::PHYSICAL);
+    identity.transport_modes ^= 1;
+    EXPECT_TRUE(resolveDeviceKindIdentities({identity}, devices)
+                    .IsInvalidArgument());
+
+    identity = makeIdentity(device, DeviceKind::PHYSICAL);
+    identity.transport_modes = 8;
+    EXPECT_TRUE(resolveDeviceKindIdentities({identity}, devices)
+                    .IsInvalidArgument());
+
+    identity = makeIdentity(device, DeviceKind::PHYSICAL);
+    auto duplicate = identity;
+    duplicate.kind = DeviceKind::BONDING;
+    EXPECT_TRUE(resolveDeviceKindIdentities({identity, duplicate}, devices)
+                    .IsInvalidArgument());
+}
+
+TEST(UbParamsTest, ParsesTrustedDeviceIdentitiesAndRequiresThemForPhysicalOnly) {
+    const auto device = makeDevice("udmac0d0e1");
+    const auto identity = makeIdentity(device, DeviceKind::PHYSICAL);
+    Config config;
+    config.set("transports/ub/physical_only", true);
+    config.set("transports/ub/device_identities",
+               nlohmann::json::array({{{"native_device_name",
+                                        identity.native_device_name},
+                                       {"native_device_path",
+                                        identity.native_device_path},
+                                       {"eid_index", identity.eid_index},
+                                       {"eid", identity.eid},
+                                       {"kind", "physical"},
+                                       {"transport_modes",
+                                        identity.transport_modes}}}));
+
+    UbParams params;
+    ASSERT_TRUE(UbParams::FromConfig(config, params).ok());
+    EXPECT_TRUE(params.physical_only);
+    ASSERT_EQ(params.device_identities.size(), 1U);
+    EXPECT_EQ(params.device_identities[0].kind, DeviceKind::PHYSICAL);
+
+    config.set("transports/ub/device_identities", nlohmann::json::array());
+    EXPECT_TRUE(UbParams::FromConfig(config, params).IsInvalidArgument());
 }
 
 TEST(UbRailMonitorTest, EndpointRebuildTelemetryDeduplicatesGeneration) {

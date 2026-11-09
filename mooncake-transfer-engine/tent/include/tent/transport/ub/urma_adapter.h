@@ -15,10 +15,12 @@
 #ifndef TENT_TRANSPORT_UB_URMA_ADAPTER_H_
 #define TENT_TRANSPORT_UB_URMA_ADAPTER_H_
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "tent/common/status.h"
@@ -26,6 +28,64 @@
 namespace mooncake {
 namespace tent {
 namespace ub {
+
+// URMA does not expose a provider-independent device-kind attribute. Discovery
+// therefore starts at UNKNOWN; only validated configuration or metadata may
+// attach a different kind through DeviceKindSource.
+enum class DeviceKind : uint8_t {
+    UNKNOWN = 0,
+    PHYSICAL,
+    BONDING,
+    VIRTUAL,
+    AGGREGATE,
+};
+
+enum class DeviceKindSource : uint8_t {
+    NONE = 0,
+    EXPLICIT_CONFIG,
+    VALIDATED_METADATA,
+};
+
+inline std::string_view deviceKindName(DeviceKind kind) {
+    switch (kind) {
+        case DeviceKind::PHYSICAL:
+            return "physical";
+        case DeviceKind::BONDING:
+            return "bonding";
+        case DeviceKind::VIRTUAL:
+            return "virtual";
+        case DeviceKind::AGGREGATE:
+            return "aggregate";
+        case DeviceKind::UNKNOWN:
+            return "unknown";
+    }
+    return "unknown";
+}
+
+inline std::string_view deviceKindSourceName(DeviceKindSource source) {
+    switch (source) {
+        case DeviceKindSource::EXPLICIT_CONFIG:
+            return "explicit_config";
+        case DeviceKindSource::VALIDATED_METADATA:
+            return "validated_metadata";
+        case DeviceKindSource::NONE:
+            return "none";
+    }
+    return "none";
+}
+
+// Adapter-neutral constants mirroring the public UMDK ABI. Native builds
+// static_assert these values against the UMDK headers.
+inline constexpr uint16_t kUrmaTransportModeRm = 0x1;
+inline constexpr uint16_t kUrmaTransportModeRc = 0x1 << 1;
+inline constexpr uint16_t kUrmaTransportModeUm = 0x1 << 2;
+inline constexpr uint16_t kUrmaTransportModeMask =
+    kUrmaTransportModeRm | kUrmaTransportModeRc | kUrmaTransportModeUm;
+inline constexpr uint8_t kUrmaMaxPriority = 15;
+inline constexpr size_t kUrmaPriorityCount = 16;
+inline constexpr uint8_t kUrmaTargetTypeJetty = 1;
+inline constexpr uint8_t kUrmaTpTypeRtp = 0;
+inline constexpr uint32_t kUrmaTpTypeRtpMask = 1U << kUrmaTpTypeRtp;
 
 // Adapter-neutral subset of the capabilities needed by the TENT UB data
 // plane. Values of zero mean that the provider did not report a limit.
@@ -42,6 +102,8 @@ struct DeviceCapabilities {
     uint32_t max_write_size = 0;
     uint32_t feature_flags = 0;
     uint16_t transport_modes = 0;
+    uint32_t rm_tp_cap = 0;
+    std::array<uint32_t, kUrmaPriorityCount> priority_tp_type_masks{};
 };
 
 // One DeviceInfo represents one native URMA device/EID pair. A native device
@@ -54,8 +116,48 @@ struct DeviceInfo {
     uint32_t eid_index = 0;
     std::string eid;
     bool active = false;
+    DeviceKind kind = DeviceKind::UNKNOWN;
+    DeviceKindSource kind_source = DeviceKindSource::NONE;
     DeviceCapabilities capabilities;
 };
+
+// LocalSendProfile is derived only from trusted local provider capabilities.
+// bind_tp_type_mask is never accepted as a peer-supplied JFS configuration.
+struct LocalSendProfile {
+    uint16_t trans_mode = kUrmaTransportModeRm;
+    uint8_t priority = kUrmaMaxPriority;
+    uint32_t bind_tp_type_mask = 0;
+    DeviceCapabilities local_capabilities;
+};
+
+inline Status buildLocalSendProfile(const DeviceInfo& device, int64_t priority,
+                                    LocalSendProfile& output) {
+    const auto& capabilities = device.capabilities;
+    if (priority < 0 || priority > kUrmaMaxPriority) {
+        return Status::InvalidArgument("URMA JFS priority must be in [0, 15]");
+    }
+    if ((capabilities.transport_modes &
+         static_cast<uint16_t>(~kUrmaTransportModeMask)) != 0 ||
+        (capabilities.transport_modes & kUrmaTransportModeRm) == 0) {
+        return Status::InvalidArgument(
+            "URMA device transport_modes must be valid and include RM");
+    }
+    if ((capabilities.rm_tp_cap & kUrmaTpTypeRtpMask) == 0) {
+        return Status::InvalidArgument("URMA RM capability does not include RTP");
+    }
+    const uint32_t bind_tp_type_mask =
+        capabilities.priority_tp_type_masks[static_cast<size_t>(priority)];
+    if ((bind_tp_type_mask & kUrmaTpTypeRtpMask) == 0) {
+        return Status::InvalidArgument(
+            "URMA JFS priority does not support the remote RTP target");
+    }
+    LocalSendProfile profile;
+    profile.priority = static_cast<uint8_t>(priority);
+    profile.bind_tp_type_mask = bind_tp_type_mask;
+    profile.local_capabilities = capabilities;
+    output = profile;
+    return Status::OK();
+}
 
 // The segment descriptor is intentionally an explicit envelope. Raw
 // urma_seg_t bytes are ABI-specific; import must reject a different API
@@ -149,7 +251,7 @@ struct JfcOptions {
 
 struct JettyOptions {
     uint32_t depth = 256;
-    uint8_t priority = 15;
+    uint32_t priority = kUrmaMaxPriority;
     uint8_t max_sge = 1;
     uint8_t rnr_retry = 7;
     uint8_t error_timeout = 17;

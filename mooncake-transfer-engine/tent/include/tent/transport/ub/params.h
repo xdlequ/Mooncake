@@ -17,22 +17,127 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <glog/logging.h>
 #include <limits>
+#include <sstream>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 #include "tent/common/config.h"
 #include "tent/common/status.h"
+#include "tent/transport/ub/device_selection.h"
 
 namespace mooncake {
 namespace tent {
 namespace ub {
 
+// Runtime selection is explicit and fail-closed. The RC legacy data plane is
+// the only mode implemented today; RM legacy and pooled RM must be requested
+// explicitly and are rejected before any native resource is created until
+// their gates are implemented and verified.
+enum class UbRuntimeProfile : uint8_t {
+    kRcLegacy,
+    kRmLegacy,
+    kRmPool,
+};
+
+enum class UbTransportMode : uint8_t {
+    kRc,
+    kRm,
+};
+
+// Pooled resources stay off unless the full gate matrix passes. force_disable
+// is a runtime brake for pooled attempts and never switches the native mode.
+struct UbJettyPoolParams {
+    bool enable = false;
+    bool force_disable = false;
+};
+
+// Probe keys are schema-complete but dormant until the P4 health scheduler
+// exists. `enabled` only declares resource capability; it never starts a
+// periodic WR on its own.
+struct UbProbeParams {
+    bool enabled = false;
+    uint32_t interval = 1000;
+    uint32_t timeout = 500;
+    uint32_t backoff_max = 30000;
+    uint32_t peer_budget = 1;
+    uint32_t recover_success_threshold = 1;
+    uint32_t failure_threshold = 3;
+    bool stop_on_recovery = true;
+};
+
+// The mode a caller may actually enter after gate evaluation.
+enum class UbRuntimeMode : uint8_t {
+    kRcLegacy,
+    kRmLegacy,
+    kPooledRm,
+};
+
+inline bool parseUbRuntimeProfile(std::string_view value,
+                                  UbRuntimeProfile& profile) {
+    if (value == "rc_legacy" || value == "RC_LEGACY") {
+        profile = UbRuntimeProfile::kRcLegacy;
+    } else if (value == "rm_legacy" || value == "RM_LEGACY") {
+        profile = UbRuntimeProfile::kRmLegacy;
+    } else if (value == "rm_pool" || value == "RM_POOL") {
+        profile = UbRuntimeProfile::kRmPool;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+inline bool parseUbTransportMode(std::string_view value,
+                                 UbTransportMode& mode) {
+    if (value == "rc" || value == "RC") {
+        mode = UbTransportMode::kRc;
+    } else if (value == "rm" || value == "RM") {
+        mode = UbTransportMode::kRm;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+inline const char* ubRuntimeProfileName(UbRuntimeProfile profile) noexcept {
+    switch (profile) {
+        case UbRuntimeProfile::kRcLegacy:
+            return "rc_legacy";
+        case UbRuntimeProfile::kRmLegacy:
+            return "rm_legacy";
+        case UbRuntimeProfile::kRmPool:
+            return "rm_pool";
+    }
+    return "unknown";
+}
+
+inline const char* ubTransportModeName(UbTransportMode mode) noexcept {
+    return mode == UbTransportMode::kRm ? "rm" : "rc";
+}
+
+inline const char* ubRuntimeModeName(UbRuntimeMode mode) noexcept {
+    switch (mode) {
+        case UbRuntimeMode::kRcLegacy:
+            return "rc_legacy";
+        case UbRuntimeMode::kRmLegacy:
+            return "rm_legacy";
+        case UbRuntimeMode::kPooledRm:
+            return "rm_pool";
+    }
+    return "unknown";
+}
+
 struct UbParams {
     // UB is opt-in until a real URMA provider and NIC topology are present.
     bool enable = false;
     std::vector<std::string> device_filter;
+    // Legacy selection remains the default. physical_only requires explicit
+    // trusted identities and never falls back to name-based classification.
+    bool physical_only = false;
+    std::vector<DeviceIdentity> device_identities;
 
     uint32_t worker_count = 6;
     uint32_t poller_count = 2;
@@ -44,6 +149,12 @@ struct UbParams {
     uint32_t max_retries = 8;
     uint32_t slice_timeout_ms = 5000;
     uint32_t endpoint_cooldown_ms = 1000;
+
+    // Defaults are the verified RC legacy baseline; pool and probe stay off.
+    UbRuntimeProfile runtime_profile = UbRuntimeProfile::kRcLegacy;
+    UbTransportMode trans_mode = UbTransportMode::kRc;
+    UbJettyPoolParams jetty_pool;
+    UbProbeParams probe;
 
     bool enable_bandwidth_estimation = true;
     bool enable_notifications = false;
@@ -57,6 +168,13 @@ struct UbParams {
         CHECK_STATUS(readBool(config, "transports/ub/enable", parsed.enable,
                               parsed.enable));
         CHECK_STATUS(readDeviceFilter(config, parsed.device_filter));
+        CHECK_STATUS(readBool(config, "transports/ub/physical_only",
+                              parsed.physical_only, parsed.physical_only));
+        CHECK_STATUS(readDeviceIdentities(config, parsed.device_identities));
+        if (parsed.physical_only && parsed.device_identities.empty()) {
+            return Status::InvalidArgument(
+                "transports/ub/physical_only requires device_identities");
+        }
         CHECK_STATUS(readPositive(config, "transports/ub/worker_count",
                                   parsed.worker_count, parsed.worker_count));
         CHECK_STATUS(readPositive(config, "transports/ub/poller_count",
@@ -103,12 +221,84 @@ struct UbParams {
         CHECK_STATUS(readBool(config, "transports/ub/enable_notifications",
                               parsed.enable_notifications,
                               parsed.enable_notifications));
+        CHECK_STATUS(readRuntimeProfile(config, parsed.runtime_profile));
+        CHECK_STATUS(readTransportMode(config, parsed.trans_mode));
+        CHECK_STATUS(readBool(config, "transports/ub/jetty_pool/enable",
+                              parsed.jetty_pool.enable,
+                              parsed.jetty_pool.enable));
+        CHECK_STATUS(readBool(config, "transports/ub/jetty_pool/force_disable",
+                              parsed.jetty_pool.force_disable,
+                              parsed.jetty_pool.force_disable));
+        CHECK_STATUS(readBool(config, "transports/ub/probe/enabled",
+                              parsed.probe.enabled, parsed.probe.enabled));
+        CHECK_STATUS(readPositive(config, "transports/ub/probe/interval",
+                                  parsed.probe.interval,
+                                  parsed.probe.interval));
+        CHECK_STATUS(readPositive(config, "transports/ub/probe/timeout",
+                                  parsed.probe.timeout, parsed.probe.timeout));
+        CHECK_STATUS(readPositive(config, "transports/ub/probe/backoff_max",
+                                  parsed.probe.backoff_max,
+                                  parsed.probe.backoff_max));
+        CHECK_STATUS(readPositive(config, "transports/ub/probe/peer_budget",
+                                  parsed.probe.peer_budget,
+                                  parsed.probe.peer_budget));
+        CHECK_STATUS(readPositive(
+            config, "transports/ub/probe/recover_success_threshold",
+            parsed.probe.recover_success_threshold,
+            parsed.probe.recover_success_threshold));
+        CHECK_STATUS(readPositive(config,
+                                  "transports/ub/probe/failure_threshold",
+                                  parsed.probe.failure_threshold,
+                                  parsed.probe.failure_threshold));
+        CHECK_STATUS(readBool(config, "transports/ub/probe/stop_on_recovery",
+                              parsed.probe.stop_on_recovery,
+                              parsed.probe.stop_on_recovery));
+        if (!parsed.probe.stop_on_recovery) {
+            return Status::InvalidArgument(
+                "transports/ub/probe/stop_on_recovery must remain true in v1");
+        }
 
         output = std::move(parsed);
         return Status::OK();
     }
 
    private:
+    static Status readRuntimeProfile(const Config& config,
+                                     UbRuntimeProfile& output) {
+        static constexpr const char* kKey =
+            "transports/ub/runtime_profile";
+        const json value = config.get<json>(kKey, json());
+        if (value.is_null()) return Status::OK();
+        if (!value.is_string()) {
+            return Status::InvalidArgument(std::string(kKey) +
+                                           " must be a string");
+        }
+        const auto text = value.get<std::string>();
+        if (!parseUbRuntimeProfile(text, output)) {
+            return Status::InvalidArgument(
+                std::string(kKey) +
+                " must be rc_legacy, rm_legacy or rm_pool");
+        }
+        return Status::OK();
+    }
+
+    static Status readTransportMode(const Config& config,
+                                    UbTransportMode& output) {
+        static constexpr const char* kKey = "transports/ub/trans_mode";
+        const json value = config.get<json>(kKey, json());
+        if (value.is_null()) return Status::OK();
+        if (!value.is_string()) {
+            return Status::InvalidArgument(std::string(kKey) +
+                                           " must be a string");
+        }
+        const auto text = value.get<std::string>();
+        if (!parseUbTransportMode(text, output)) {
+            return Status::InvalidArgument(std::string(kKey) +
+                                           " must be rc or rm");
+        }
+        return Status::OK();
+    }
+
     template <typename T>
     static Status readPositive(const Config& config, const char* key,
                                T default_value, T& output) {
@@ -185,6 +375,79 @@ struct UbParams {
         return Status::OK();
     }
 
+    static Status readDeviceIdentities(
+        const Config& config, std::vector<DeviceIdentity>& output) {
+        static constexpr const char* kKey = "transports/ub/device_identities";
+        const json value = config.get<json>(kKey, json());
+        if (value.is_null()) {
+            output.clear();
+            return Status::OK();
+        }
+        if (!value.is_array()) {
+            return Status::InvalidArgument(
+                "transports/ub/device_identities must be an array");
+        }
+
+        std::vector<DeviceIdentity> parsed;
+        for (size_t i = 0; i < value.size(); ++i) {
+            try {
+                const auto& entry = value[i];
+                DeviceIdentity identity;
+                identity.native_device_name =
+                    entry.at("native_device_name").get<std::string>();
+                identity.native_device_path =
+                    entry.at("native_device_path").get<std::string>();
+                identity.eid = entry.at("eid").get<std::string>();
+
+                const auto& eid_index = entry.at("eid_index");
+                const auto& transport_modes = entry.at("transport_modes");
+                if (!eid_index.is_number_integer() ||
+                    !transport_modes.is_number_integer()) {
+                    return Status::InvalidArgument(
+                        "UB device identity indices and transport_modes must "
+                        "be integers");
+                }
+                const int64_t parsed_eid_index = eid_index.get<int64_t>();
+                const int64_t parsed_modes = transport_modes.get<int64_t>();
+                if (parsed_eid_index < 0 ||
+                    static_cast<uint64_t>(parsed_eid_index) >
+                        std::numeric_limits<uint32_t>::max() ||
+                    parsed_modes <= 0 ||
+                    static_cast<uint64_t>(parsed_modes) >
+                        std::numeric_limits<uint16_t>::max()) {
+                    return Status::InvalidArgument(
+                        "UB device identity index or transport_modes is out "
+                        "of range");
+                }
+                identity.eid_index =
+                    static_cast<uint32_t>(parsed_eid_index);
+                identity.transport_modes =
+                    static_cast<uint16_t>(parsed_modes);
+
+                std::string kind;
+                entry.at("kind").get_to(kind);
+                if (!parseDeviceKind(kind, identity.kind)) {
+                    return Status::InvalidArgument(
+                        "unknown UB device kind in device_identities");
+                }
+                CHECK_STATUS(validateDeviceIdentityRecord(identity));
+                for (const auto& existing : parsed) {
+                    if (sameDeviceLocator(identity, existing)) {
+                        return Status::InvalidArgument(
+                            "duplicate UB device identity configuration");
+                    }
+                }
+                parsed.push_back(std::move(identity));
+            } catch (const std::exception& error) {
+                return Status::InvalidArgument(
+                    "invalid transports/ub/device_identities entry " +
+                    std::to_string(i) + ": " + error.what());
+            }
+        }
+        output = std::move(parsed);
+        return Status::OK();
+    }
+
     static Status readDeviceFilter(const Config& config,
                                    std::vector<std::string>& output) {
         static constexpr const char* kKey = "transports/ub/device_filter";
@@ -221,6 +484,88 @@ struct UbParams {
         return Status::OK();
     }
 };
+
+// Evaluates the default-off matrix before any adapter or native resource is
+// created. Structural conflicts are rejected as invalid configuration; a
+// well-formed request for a mode whose gates are not implemented is rejected
+// as NotImplemented so TENT can fall back instead of silently running RC under
+// an RM label. `jetty_pool/enable=false` alone is not a failure: it simply
+// selects the RC legacy baseline.
+inline Status resolveUbRuntimeMode(const UbParams& params,
+                                   UbRuntimeMode& mode) {
+    const bool pool = params.jetty_pool.enable;
+    const bool probe = params.probe.enabled;
+
+    // One snapshot feeds every branch, so a CI failure prints the complete
+    // selection instead of only the first field that happened to disagree.
+    const auto snapshot = [&] {
+        std::ostringstream out;
+        out << "profile=" << ubRuntimeProfileName(params.runtime_profile)
+            << " trans_mode=" << ubTransportModeName(params.trans_mode)
+            << " jetty_pool=" << (pool ? "on" : "off")
+            << " force_disable="
+            << (params.jetty_pool.force_disable ? "true" : "false")
+            << " probe=" << (probe ? "on" : "off")
+            << " physical_only="
+            << (params.physical_only ? "true" : "false");
+        return out.str();
+    };
+    const auto reject = [&](Status status) {
+        LOG(WARNING) << "UB runtime selection rejected: " << snapshot()
+                     << " status=" << status.ToString();
+        return status;
+    };
+
+    if (params.runtime_profile == UbRuntimeProfile::kRcLegacy) {
+        if (params.trans_mode != UbTransportMode::kRc) {
+            return reject(Status::InvalidArgument(
+                "runtime_profile=rc_legacy requires trans_mode=rc"));
+        }
+        if (pool) {
+            return reject(Status::InvalidArgument(
+                "jetty_pool.enable requires runtime_profile=rm_pool"));
+        }
+        if (probe) {
+            return reject(Status::InvalidArgument(
+                "probe.enabled requires runtime_profile=rm_pool"));
+        }
+        mode = UbRuntimeMode::kRcLegacy;
+        VLOG(1) << "UB runtime selection accepted: mode=rc_legacy "
+                << snapshot();
+        return Status::OK();
+    }
+
+    if (params.trans_mode != UbTransportMode::kRm) {
+        return reject(Status::InvalidArgument(
+            "RM runtime profiles require trans_mode=rm"));
+    }
+    if (params.runtime_profile == UbRuntimeProfile::kRmLegacy) {
+        if (pool) {
+            return reject(Status::InvalidArgument(
+                "runtime_profile=rm_legacy must not enable jetty_pool"));
+        }
+        if (probe) {
+            return reject(Status::InvalidArgument(
+                "probe.enabled requires runtime_profile=rm_pool"));
+        }
+        return reject(Status::NotImplemented(
+            "RM legacy is unsupported: the RM adapter, priority/tp_type and "
+            "bootstrap v2 target gates are not implemented"));
+    }
+
+    if (!pool) {
+        return reject(Status::InvalidArgument(
+            "runtime_profile=rm_pool requires jetty_pool.enable=true"));
+    }
+    if (!probe) {
+        return reject(Status::InvalidArgument(
+            "runtime_profile=rm_pool requires probe.enabled=true"));
+    }
+    return reject(Status::NotImplemented(
+        "pooled RM is unsupported: trusted physical, rm_legacy_baseline, "
+        "topology/probe, shared target fence, async recovery and role budget "
+        "gates are not verified"));
+}
 
 }  // namespace ub
 }  // namespace tent
