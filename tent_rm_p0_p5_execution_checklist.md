@@ -1,12 +1,12 @@
 # TENT Physical UB RM：P0–P5 可执行落地清单与 RM Legacy 验收方案
 
-> 基线：Mooncake `tent/perf` / `956af65e`（已回退 `1b4472d5..7f2d08f0` 共 6 次未验证性能提交）+ 当前未提交工作树；UMDK `master` / `965ceae8`。
+> 基线：Mooncake `tent/tent_rm` / `e1d39c4d`（父提交 `0d3463c0`；在 `956af65e` 之上含 13 个上游提交，已回退 `1b4472d5..7f2d08f0` 共 6 次未验证性能提交）；UMDK 使用经 Provider Owner 选定并记录 SHA 的验证版本，不以浮动的 `master HEAD` 作为可复现基线；当前实际 ABI/驱动/固件组合待 P0-2 冻结。
 > 生成日期：2026-11-08；参考答复整合：2026-11-09。
 > 范围：non-bonding physical UB、URMA RM、CPU DRAM 单边 READ/WRITE。RC 仅作为独立 legacy 回归路径。
 >
 > 状态标记：`[x]` 表示验收已实际通过；`[~]` 表示实现或部分验证已完成，但仍有关联门禁未通过；`[ ]` 表示未开始或尚未实现。**不得仅因代码已写入就把任务改为 `[x]`。**
 >
-> 参考来源：`new 12.md` 对 V3 的 B1—B7、Q1—Q12 核查结论。该答复基于 Mooncake `956af65` / UMDK `09086da5` / V3，本文只采纳其问题收敛与证据边界，不采纳其过时基线；所有落地口径以 V4 和本清单为准。逐项采纳见 1.4，provider 契约用例见第 12 节，未提交代码与剩余工作见第 13 节。
+> 参考来源：`new 12.md` 对 V3 的 B1—B7、Q1—Q12 核查结论。该答复基于 Mooncake `956af65` / UMDK `09086da5` / V3，本文只采纳其问题收敛与证据边界，不采纳其过时基线；所有落地口径以 V4 和本清单为准。逐项采纳见 1.4，provider 契约用例见第 12 节，当前分支实现与剩余工作见第 13 节。
 
 ## 1. 全局执行规则
 
@@ -75,7 +75,7 @@
 | 状态/ID | 执行主体与完成时点 | 操作步骤 | 文件、前置与资源依赖 | 可量化验收流程与通过判定 |
 |---|---|---|---|---|
 | `[~] P0-1 统一规范与数据字典` | UB 架构 Owner；P1 合入前 | 以 V4 为唯一口径合并冲突裁决；固定 attempt、PathVersion、ImportedTargetKey、错误分类、健康状态、配置键；同步 B4/B5/Q4/Q6/Q7/Q8/Q12 的修正结论 | V4 设计、两份输入设计、P0-2；架构评审 | 19 项冲突均有唯一裁决且指向 V4；无“Slice 只发送一次”“delete 失败统一重试”“idle 低即扩池”等旧表述；`new 12.md` 的过时基线不得作为执行依据 |
-| `[~] P0-2 固定源码和 provider 基线` | 架构 Owner + Provider Owner；任何实现分支基线冻结前 | 记录 commit/ABI；比较文档 `09086da5` 与实际 `965ceae8`；验证 priority→tp_type 检查；建立支持/不支持矩阵 | Mooncake/UMDK 仓库、真实驱动和固件清单 | 交付版本清单和支持矩阵；缺失字段全部标 UNKNOWN；不得在验收记录中出现未标版本的“最新 master” |
+| `[~] P0-2 固定源码和 provider 基线` | 架构 Owner + Provider Owner；任何实现分支基线冻结前 | 选定可复现的 UMDK commit 并记录 SHA/ABI；验证 priority→tp_type 检查；建立支持/不支持矩阵 | Mooncake/UMDK 仓库、真实驱动和固件清单 | 交付版本清单和支持矩阵；缺失字段全部标 UNKNOWN；浮动 `master` 只能用于探索，不可作为验收版本 |
 | `[~] P0-3 验证逐 WR inflight 计数配对（替代原批量计数项）` | 数据面开发；P1 RM legacy 运行前 | 为回退后的单 WR 路径补计数不变量测试：每 slice 一次 `addInflight`、一次完成一次 `removeInflight`；partial/flush/timeout 恰好一次 | `tent/src/transport/ub/endpoint.cpp`、`context.cpp`、`workers.cpp`；fake provider | **测试已编写，尚未运行**：`UbTeardown.ContextCountsEachSliceOnceAndDrainsToZero` 验证显式 add/remove 配对；`UbNativeDataPathTest.SingleWrRejectedPostRollsBackInflightExactlyOnce`（partial）、`SingleWrFlushCompletionReleasesInflightOnce`（flush）、`SingleWrTimeoutFenceReclaimsInflightOnce`（timeout）验证 worker 级恰好一次释放且计数归零。**回退后原批量少记缺陷不存在**：`addInflight(uint64_t)` 仍每次 +1，但每 slice 只调用一次。本机缺 gtest/CMake，需在完整 CI 环境执行后才能判为通过。K>1 仅在 P2 引入批量准入后另测 |
 | `[~] P0-4 建立统一构建与证据框架` | 测试 Owner；P1 首次 CI 前 | 配置 CMake/CTest；收集 JSONL、native 调用计数、环境清单；区分 fake、interposer、物理结果 | `tent/tests/CMakeLists.txt`、CI、clang-format 20/pre-commit | **已部分完成**：`bootstrap.cpp` 已加入 `tent_ub_core_test` 目标并注册 CTest；仍缺完整 Linux 构建、证据归档、NOT_RUN 判定和 pre-commit/clang-format 20 执行。指定目标可构建、CTest 通过且证据归档后才算通过 |
 | `[~] P0-5 明确功能开关与失败策略` | 架构 Owner + 控制面开发；P1 配置合入前 | 默认 RC legacy；pool/probe 默认关闭；gate 失败仅允许已验证 RM legacy，否则 unsupported；禁止自动 bonding/RC fallback | `params.h`、`ub_transport.cpp`、部署配置模板 | **配置与矩阵已实现，待 CI 运行**：`runtime_profile`、`trans_mode`、`jetty_pool/enable`、`jetty_pool/force_disable`、`probe/*` 已严格解析并在安装前经 `resolveUbRuntimeMode` 判定；默认 RC legacy、pool/probe 关闭；RC 下开启 pool/probe 或 RM profile 与 trans_mode 不一致均 InvalidArgument；RM legacy / pooled RM 在无对应 native gate 时返回 NotImplemented，adapter 初始化前即拒绝。`physical_only` 与 v1/v2 fail-closed 已完成。pool/probe/refill 生产路径仍不存在，配置矩阵测试已写入 `ub_core_test.cpp`；本机独立 smoke（真实 `params.h`/`config.cpp`/`status.cpp` 实现，仅 glog 打桩）矩阵 11 项 + 解析 17 项通过，完整 CTest 待 CI 执行后判为通过 |
@@ -304,16 +304,17 @@
 | 独立 DeviceKind/config smoke（真实 clang++ 编译运行） | **11/11 PASS** |
 | `git diff --check` | PASS |
 | 新增协议文件 clang-format 17 | 已执行；项目要求的 clang-format 20/pre-commit 仍待 CI |
+| 第一步 physical RM 前置代码自测 UT | **按本次用户报告：全部通过**；本会话未取得可重放命令、构建参数和逐测试日志，不能替代 CI 证据 |
 
 轻量 smoke 仅对 `Status` 的日志头使用临时 stub；被测协议、JSON、身份、代次、resolver 和配置函数均为仓库真实实现，未替换其逻辑。
 
 ### 11.3 尚未执行，不得宣称通过
 
 - 本机没有 CMake，首次构建在工具检查阶段停止。
-- 本机没有 glog/gtest，完整 `tent_transport_selector_test`、`tent_ub_core_test`、`tent_ub_native_data_path_test` 未运行。
+- 本机没有 glog/gtest，完整 `tent_transport_selector_test`、`tent_ub_core_test`、`tent_ub_native_data_path_test` 未在本会话复跑；用户报告的自测通过需由 CI 日志复现。
 - pre-commit 与 clang-format 20 不可用，PR 范围 hooks 未运行。
 - 当前没有真实 RM adapter、v2 producer/target owner 和 RM legacy 数据面。
-- P0-3 已改为逐 WR 计数配对验证；回退后的基线不再存在批量少记缺陷。回归测试已编写（`ub_teardown_test.cpp` 的配对用例，`ub_native_data_path_test.cpp` 的 partial/flush/timeout 用例），但因本机缺 gtest/CMake 尚未运行。
+- P0-3 已改为逐 WR 计数配对验证；回退后的基线不再存在批量少记缺陷。回归测试已编写（`ub_teardown_test.cpp` 的配对用例，`ub_native_data_path_test.cpp` 的 partial/flush/timeout 用例）。用户报告第一步自测 UT 全部通过，但本会话未取得完整可重放日志，仍需 CI 归档。
 - 未执行真实 provider、双端 RM、物理 fence、4/6 口或性能测试。
 
 ### 11.4 CI 中必须执行的软件验收命令
@@ -349,15 +350,15 @@ pre-commit run --files \
 
 **通过判定：**四个 CTest 目标全部构建并 100% 通过，pre-commit 无错误；否则 P1-1～P1-6 保持 `[~]`，不得改成 `[x]`。
 
-## 12. 需向 UMDK `965ceae8` 验证的 provider 契约用例
+## 12. 需向选定 UMDK 验证版本验证的 provider 契约用例
 
-本节只覆盖参考答复中标记“可直接复用”的 B1、B2、B3、Q10，以及它们依赖的最小环境。用例必须在指定 UMDK commit、驱动、固件和 liburma ABI 上执行；源码阅读只能作为预期，不得替代运行证据。
+本节只覆盖参考答复中标记“可直接复用”的 B1、B2、B3、Q10，以及它们依赖的最小环境。用例必须在 P0-2 选定并固定的 UMDK commit、驱动、固件和 liburma ABI 上执行；源码阅读只能作为预期，不得替代运行证据。
 
 ### 12.1 前置环境用例
 
 | ID | 目的 | 步骤 | 证据 | 通过判定 | 归属 |
 |---|---|---|---|---|---|
-| `UC-ENV-01` 版本与能力快照 | 固定契约解释版本 | 记录 Mooncake/UMDK commit、内核、驱动、固件、liburma ABI、编译参数；导出 device attr 的 transport_modes、rm_tp_cap、priority_info[16].tp_type | 版本清单、attr dump | 字段完整；缺项标 UNKNOWN，不进入后续数据面用例 | P0-2 |
+| `UC-ENV-01` 版本与能力快照 | 固定契约解释版本 | 记录 Mooncake/选定 UMDK commit、内核、驱动、固件、liburma ABI、编译参数；导出 device attr 的 transport_modes、rm_tp_cap、priority_info[16].tp_type | 版本清单、attr dump | 字段完整；缺项标 UNKNOWN，不进入后续数据面用例 | P0-2 |
 | `UC-ENV-02` priority/RTP 可用性 | 确认本地 JFS 可覆盖 RTP target | 对每个候选 priority 创建 RM JFS，尝试提交 RTP target WR | create/post 返回、native 计数 | 至少一个 priority 的 bind mask 含 RTP 位；不匹配必须在 post 前拒绝 | P0-2 / P1-5 |
 
 ### 12.2 B1：flush、JFC 与删除并发
@@ -407,7 +408,7 @@ pre-commit run --files \
 
 ## 13. 编码计划：已完成、部分完成与未完成
 
-### 13.1 当前未提交代码已覆盖
+### 13.1 当前分支代码已覆盖
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
@@ -417,7 +418,7 @@ pre-commit run --files \
 | 代次比较与 native 分配前 gate | 已实现 helper，未接入事务 | duplicate/stale/newer/conflict；真实 producer/consumer 未接 |
 | Local/Remote Profile 拆分 | 已实现 | 本地派生 0..15 priority 与 RTP 掩码；远端只含 RM/JETTY/RTP |
 | 能力采集与 native 常量校验 | 已实现 | `rm_tp_cap`、16 项 priority 掩码；UMDK 头下 static_assert |
-| 测试 | 部分执行 | 38 项 profile smoke、11 项 DeviceKind smoke；完整 CTest 未跑 |
+| 测试 | 作者报告自测通过，正式证据待补 | 38 项 profile smoke、11 项 DeviceKind smoke；完整 CTest/CI 日志需归档 |
 
 ### 13.2 尚未完成，按依赖排序
 

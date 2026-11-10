@@ -135,13 +135,14 @@ class FakeRemoteSegment final : public RemoteSegment {
 
 class FakeJetty final : public Jetty {
    public:
-    FakeJetty(uint32_t id, std::shared_ptr<FakeJfc> jfc)
-        : id_(id), jfc_(std::move(jfc)) {}
+    FakeJetty(uint32_t id, std::shared_ptr<FakeJfc> jfc, bool rm_mode = false)
+        : id_(id), jfc_(std::move(jfc)), rm_mode_(rm_mode) {}
     bool valid() const noexcept override { return valid_; }
     uint32_t id() const noexcept override { return id_; }
     uint32_t uasid() const noexcept override { return 0; }
     std::shared_ptr<FakeJfc> jfc() const { return jfc_; }
     bool bound() const { return bound_; }
+    bool rmMode() const { return rm_mode_; }
     void bind() { bound_ = true; }
     void unbind() { bound_ = false; }
     void close() {
@@ -152,8 +153,26 @@ class FakeJetty final : public Jetty {
    private:
     uint32_t id_;
     std::shared_ptr<FakeJfc> jfc_;
+    bool rm_mode_{false};
     bool valid_{true};
     bool bound_{false};
+};
+
+class FakeRemoteTarget final : public RemoteTarget {
+   public:
+    FakeRemoteTarget(std::string eid, uint32_t uasid, uint32_t id)
+        : eid_(std::move(eid)), uasid_(uasid), id_(id) {}
+    bool valid() const noexcept override { return valid_; }
+    uint32_t id() const noexcept override { return id_; }
+    uint32_t uasid() const noexcept override { return uasid_; }
+    const std::string& eid() const noexcept override { return eid_; }
+    void close() { valid_ = false; }
+
+   private:
+    std::string eid_;
+    uint32_t uasid_{0};
+    uint32_t id_{0};
+    bool valid_{true};
 };
 
 class FakeUrmaAdapter final : public UrmaAdapter {
@@ -247,11 +266,18 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         return Status::OK();
     }
     Status createJetty(const ContextPtr&, const JfcPtr& jfc,
-                       const JettyOptions&, JettyPtr& jetty) override {
+                       const JettyOptions& options,
+                       JettyPtr& jetty) override {
         create_jetty_calls_.fetch_add(1, std::memory_order_relaxed);
         auto fake_jfc = std::dynamic_pointer_cast<FakeJfc>(jfc);
         if (!fake_jfc) return Status::InvalidArgument("bad JFC");
-        jetty = std::make_shared<FakeJetty>(next_jetty_id_++, fake_jfc);
+        const bool rm_mode = options.trans_mode == kUrmaTransportModeRm;
+        if (rm_mode && (options.bind_tp_type_mask & kUrmaTpTypeRtpMask) == 0) {
+            return Status::InvalidArgument(
+                "RM JFS bind mask does not cover URMA_RTP");
+        }
+        jetty =
+            std::make_shared<FakeJetty>(next_jetty_id_++, fake_jfc, rm_mode);
         return Status::OK();
     }
     Status deleteJetty(JettyPtr& jetty) override {
@@ -262,10 +288,14 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         return Status::OK();
     }
     Status bindJetty(const JettyPtr& jetty, const RemoteJettyInfo&) override {
-        bind_jetty_calls_.fetch_add(1, std::memory_order_relaxed);
         auto fake = std::dynamic_pointer_cast<FakeJetty>(jetty);
         if (!fake || !fake->valid())
             return Status::InvalidArgument("bad Jetty");
+        if (fake->rmMode()) {
+            return Status::InvalidArgument(
+                "RM Legacy Jettys never bind a remote Jetty");
+        }
+        bind_jetty_calls_.fetch_add(1, std::memory_order_relaxed);
         fake->bind();
         return Status::OK();
     }
@@ -279,6 +309,41 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         if (fail_resets_.load(std::memory_order_acquire)) {
             return Status::RdmaError("injected Jetty reset failure");
         }
+        return Status::OK();
+    }
+    Status importRemoteTarget(const ContextPtr&, const std::string& eid,
+                              uint32_t uasid, uint32_t id, uint16_t trans_mode,
+                              uint8_t target_type, uint8_t tp_type,
+                              RemoteTargetPtr& target) override {
+        target.reset();
+        import_calls_.fetch_add(1, std::memory_order_relaxed);
+        if (trans_mode != kUrmaTransportModeRm ||
+            target_type != kUrmaTargetTypeJetty ||
+            tp_type != kUrmaTpTypeRtp) {
+            return Status::InvalidArgument(
+                "RM target profile must be RM/JETTY/RTP");
+        }
+        if (id == 0) {
+            return Status::InvalidArgument("RM target Jetty ID is zero");
+        }
+        if (fail_imports_.load(std::memory_order_acquire) > 0) {
+            fail_imports_.fetch_sub(1, std::memory_order_acq_rel);
+            return Status::RdmaError("injected import failure");
+        }
+        imported_ids_.push_back(id);
+        target = std::make_shared<FakeRemoteTarget>(eid, uasid, id);
+        return Status::OK();
+    }
+    Status unimportRemoteTarget(RemoteTargetPtr& target) override {
+        unimport_calls_.fetch_add(1, std::memory_order_relaxed);
+        if (fail_unimports_.load(std::memory_order_acquire) > 0) {
+            fail_unimports_.fetch_sub(1, std::memory_order_acq_rel);
+            return Status::RdmaError("injected unimport failure");
+        }
+        if (auto fake = std::dynamic_pointer_cast<FakeRemoteTarget>(target)) {
+            fake->close();
+        }
+        target.reset();
         return Status::OK();
     }
     Status quiesceJetty(const JettyPtr& jetty, uint32_t timeout_ms,
@@ -316,16 +381,41 @@ class FakeUrmaAdapter final : public UrmaAdapter {
                 size_t& posted_count) override {
         posted_count = 0;
         auto fake = std::dynamic_pointer_cast<FakeJetty>(jetty);
-        if (!fake || !fake->valid() || !fake->bound()) {
+        if (!fake || !fake->valid() ||
+            (!fake->bound() && !fake->rmMode())) {
             return Status::InvalidArgument("unbound Jetty");
+        }
+        const bool rm_mode = fake->rmMode();
+        for (const auto& request : requests) {
+            if (rm_mode != (request.target != nullptr)) {
+                return Status::InvalidArgument(
+                    rm_mode ? "RM work requests must set an explicit target"
+                            : "RC work requests must not set a target");
+            }
+            if (!request.local_segment || !request.remote_segment ||
+                request.token == 0 || request.length == 0) {
+                return Status::InvalidArgument("bad WR");
+            }
         }
         if (fail_next_post_.exchange(false, std::memory_order_acq_rel)) {
             return Status::RdmaError("injected post rejection");
         }
+        if (accept_then_fail_post_.exchange(false, std::memory_order_acq_rel)) {
+            // Mirrors a contradictory provider result: the WR crossed the
+            // native boundary but the post still reports an error. The RM
+            // acceptance classifier must map this to Unknown.
+            for (const auto& request : requests) {
+                std::lock_guard<std::mutex> lock(pending_mutex_);
+                pending_.push_back(Pending{fake->id(), request});
+                ++posted_count;
+            }
+            return Status::RdmaError("injected post error after acceptance");
+        }
         for (const auto& request : requests) {
-            if (!request.local_segment || !request.remote_segment ||
-                request.token == 0 || request.length == 0) {
-                return Status::InvalidArgument("bad WR");
+            if (rm_mode) {
+                last_post_target_id_.store(request.target->id(),
+                                            std::memory_order_release);
+                rm_post_calls_.fetch_add(1, std::memory_order_relaxed);
             }
             const auto category = next_completion_.exchange(
                 CompletionCategory::SUCCESS, std::memory_order_acq_rel);
@@ -376,6 +466,17 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     void failNextPostWithoutAccept() {
         fail_next_post_.store(true, std::memory_order_release);
     }
+    // Accept the next post then report an error: posted_count advances while
+    // the status fails, which the RM classifier must treat as Unknown.
+    void failNextPostAfterAccept() {
+        accept_then_fail_post_.store(true, std::memory_order_release);
+    }
+    void failNextImports(int count) {
+        fail_imports_.store(count, std::memory_order_release);
+    }
+    void failNextUnimports(int count) {
+        fail_unimports_.store(count, std::memory_order_release);
+    }
     void holdNextCompletion() {
         hold_next_completion_.store(true, std::memory_order_release);
     }
@@ -409,6 +510,19 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     uint64_t bindJettyCalls() const {
         return bind_jetty_calls_.load(std::memory_order_relaxed);
     }
+    uint64_t importCalls() const {
+        return import_calls_.load(std::memory_order_relaxed);
+    }
+    uint64_t unimportCalls() const {
+        return unimport_calls_.load(std::memory_order_relaxed);
+    }
+    uint64_t rmPostCalls() const {
+        return rm_post_calls_.load(std::memory_order_relaxed);
+    }
+    uint32_t lastPostedTargetId() const {
+        return last_post_target_id_.load(std::memory_order_relaxed);
+    }
+    const std::vector<uint32_t>& importedIds() const { return imported_ids_; }
     uint32_t lastRegisteredAccess() const {
         return last_registered_access_.load(std::memory_order_acquire);
     }
@@ -426,6 +540,9 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         CompletionCategory::SUCCESS};
     std::atomic<bool> hold_next_completion_{false};
     std::atomic<bool> fail_next_post_{false};
+    std::atomic<bool> accept_then_fail_post_{false};
+    std::atomic<int> fail_imports_{0};
+    std::atomic<int> fail_unimports_{0};
     std::atomic<bool> drop_next_quiesced_completion_{false};
     std::atomic<bool> fail_next_quiesce_{false};
     std::atomic<bool> quiesce_drops_completions_{false};
@@ -433,10 +550,15 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     std::atomic<bool> fail_next_shutdown_{false};
     mutable std::mutex pending_mutex_;
     std::vector<Pending> pending_;
+    std::vector<uint32_t> imported_ids_;
     std::atomic<uint64_t> quiesce_calls_{0};
     std::atomic<uint64_t> open_context_calls_{0};
     std::atomic<uint64_t> create_jetty_calls_{0};
     std::atomic<uint64_t> bind_jetty_calls_{0};
+    std::atomic<uint64_t> import_calls_{0};
+    std::atomic<uint64_t> unimport_calls_{0};
+    std::atomic<uint64_t> rm_post_calls_{0};
+    std::atomic<uint32_t> last_post_target_id_{0};
     std::atomic<uint32_t> last_registered_access_{0};
 };
 
@@ -1466,6 +1588,604 @@ TEST(UbNativeDataPathTest, UbTransportRunsSelfReadWriteOverNativeControlPlane) {
     EXPECT_FALSE(transport.uninstall().ok());
     EXPECT_EQ(adapter->pendingCount(), 0U);
     EXPECT_TRUE(transport.freeSubBatch(draining_batch).ok());
+    EXPECT_TRUE(transport.uninstall().ok());
+}
+
+// ---------------------------------------------------------------------------
+// RM Legacy: mode admission, bootstrap v2 handshake, imported targets and the
+// single-WR data plane.
+// ---------------------------------------------------------------------------
+
+JettyOptions rmJettyOptions() {
+    JettyOptions options;
+    options.trans_mode = kUrmaTransportModeRm;
+    options.bind_tp_type_mask = kUrmaTpTypeRtpMask;
+    return options;
+}
+
+DeviceInfo rmCapableDevice() {
+    auto device = fakeDevice();
+    device.capabilities.transport_modes = 3;  // RC|RM
+    device.capabilities.rm_tp_cap = kUrmaTpTypeRtpMask;
+    device.capabilities.priority_tp_type_masks[kUrmaMaxPriority] =
+        kUrmaTpTypeRtpMask;
+    return device;
+}
+
+UbExpectedPeerIdentity expectedForRmPeer(const UbBootstrapDesc& desc) {
+    UbExpectedPeerIdentity expected;
+    expected.segment_name = desc.segment_name;
+    expected.local_nic_path = desc.local_nic_path;
+    expected.native_device_name = desc.local_device_name;
+    expected.device_id = desc.local_device_id;
+    expected.eid_index = desc.local_eid_index;
+    expected.eid = desc.local_eid;
+    expected.physical_device_identity = desc.rm->physical_device_identity;
+    expected.transport_modes = desc.rm->transport_modes;
+    return expected;
+}
+
+TEST(UbRmLegacyTest, EndpointProducesV2AndImportsPeerTargets) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    auto context = std::make_shared<UbContext>(0, fakeDevice(), adapter);
+    ASSERT_TRUE(context->initialize(1, JfcOptions{}).ok());
+    auto endpoint = std::make_shared<UbEndpoint>(
+        UbEndpointKey{0, 123, 9, "peer/ub:fake0:eid0"}, context, adapter, 1,
+        rmJettyOptions());
+    ASSERT_TRUE(endpoint->prepare().ok());
+    ASSERT_TRUE(endpoint->rmMode());
+
+    // Producer side: a v2 descriptor with one RM target per local Jetty.
+    UbBootstrapDesc local;
+    ASSERT_TRUE(endpoint
+                    ->makeBootstrapDescV2("seg-a", "seg-a/ub:fake0:eid0",
+                                          "seg-b/ub:fake0:eid0", 5, 1, 1,
+                                          local)
+                    .ok());
+    ASSERT_TRUE(endpoint->makeBootstrapDesc("seg-a", "seg-a/ub:fake0:eid0",
+                                           "seg-b/ub:fake0:eid0", 5, local)
+                    .IsInvalidArgument());
+    EXPECT_EQ(local.protocol_version, 2U);
+    ASSERT_TRUE(local.rm.has_value());
+    EXPECT_TRUE(validateUbBootstrap(local).ok());
+    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::RM, local).ok());
+    EXPECT_EQ(local.rm->targets.size(), 1U);
+    EXPECT_EQ(local.rm->targets[0].id, endpoint->jetty(0)->id());
+    EXPECT_EQ(local.rm->targets[0].target_epoch, local.endpoint_generation);
+    EXPECT_EQ(local.rm->physical_device_identity, "/fake/fake0#0001");
+    EXPECT_EQ(local.rm->context_incarnation, context->incarnation());
+
+    // Consumer side: bindRm imports the peer targets and never binds.
+    auto peer = local;
+    peer.segment_name = "seg-b";
+    peer.local_nic_path = "seg-b/ub:fake0:eid0";
+    peer.peer_nic_path = "seg-a/ub:fake0:eid0";
+    const auto expected = expectedForRmPeer(peer);
+    ASSERT_TRUE(endpoint->bindRm(peer, expected).ok());
+    EXPECT_EQ(endpoint->importedTargetCount(), 1U);
+    EXPECT_EQ(adapter->bindJettyCalls(), 0U)
+        << "RM Legacy must never call bindJetty";
+    EXPECT_TRUE(endpoint->rmTarget(0) != nullptr);
+
+    // Idempotent re-bind of the same peer descriptor is accepted and must
+    // not import the peer targets a second time.
+    EXPECT_TRUE(endpoint->bindRm(peer, expected).ok());
+    EXPECT_EQ(adapter->importCalls(), 1U);
+    // A different peer generation is rejected without disturbing the
+    // established incarnation.
+    auto other_generation = peer;
+    other_generation.endpoint_generation = peer.endpoint_generation + 1;
+    EXPECT_TRUE(endpoint
+                    ->bindRm(other_generation,
+                             expectedForRmPeer(other_generation))
+                    .IsInvalidArgument());
+    EXPECT_EQ(endpoint->importedTargetCount(), 1U);
+
+    // RC bind is rejected on an RM endpoint.
+    UbBootstrapDesc v1_peer;
+    v1_peer.protocol_version = 1;
+    v1_peer.local_eid = fakeDevice().eid;
+    v1_peer.endpoint_generation = 7;
+    v1_peer.jetty_ids = {11};
+    EXPECT_TRUE(endpoint->bind(v1_peer).IsInvalidArgument());
+
+    EXPECT_TRUE(endpoint->retire().ok());
+    EXPECT_EQ(endpoint->state(), UbEndpoint::State::kDestroyed);
+    EXPECT_EQ(adapter->unimportCalls(), 1U);
+    EXPECT_TRUE(context->shutdown().ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+TEST(UbRmLegacyTest, BindRmRejectsBadDescriptorsAndRollsBackImports) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    auto context = std::make_shared<UbContext>(0, fakeDevice(), adapter);
+    ASSERT_TRUE(context->initialize(1, JfcOptions{}).ok());
+
+    auto make_endpoint = [&] {
+        return std::make_shared<UbEndpoint>(
+            UbEndpointKey{0, 123, 9, "peer/ub:fake0:eid0"}, context, adapter, 2,
+            rmJettyOptions());
+    };
+
+    // A v1 descriptor can never be consumed by bindRm.
+    auto v1_endpoint = make_endpoint();
+    ASSERT_TRUE(v1_endpoint->prepare().ok());
+    UbBootstrapDesc v1;
+    v1.protocol_version = 1;
+    v1.local_eid = fakeDevice().eid;
+    v1.endpoint_generation = 7;
+    v1.jetty_ids = {1, 2};
+    EXPECT_TRUE(v1_endpoint->bindRm(v1, UbExpectedPeerIdentity{})
+                    .IsInvalidArgument());
+    EXPECT_EQ(v1_endpoint->state(), UbEndpoint::State::kFailed);
+    EXPECT_EQ(v1_endpoint->importedTargetCount(), 0U);
+
+    // Identity mismatch fails closed before any import.
+    auto identity_endpoint = make_endpoint();
+    ASSERT_TRUE(identity_endpoint->prepare().ok());
+    UbBootstrapDesc local;
+    ASSERT_TRUE(identity_endpoint
+                    ->makeBootstrapDescV2("seg-a", "seg-a/ub:fake0:eid0",
+                                          "seg-b/ub:fake0:eid0", 5, 1, 1,
+                                          local)
+                    .ok());
+    auto peer = local;
+    peer.segment_name = "seg-b";
+    peer.local_nic_path = "seg-b/ub:fake0:eid0";
+    peer.peer_nic_path = "seg-a/ub:fake0:eid0";
+    auto mismatched = expectedForRmPeer(peer);
+    mismatched.eid = "0002:0000:0000:0000:0000:0000:0000:0000";
+    EXPECT_TRUE(identity_endpoint->bindRm(peer, mismatched).IsInvalidArgument());
+    EXPECT_EQ(identity_endpoint->state(), UbEndpoint::State::kFailed);
+    EXPECT_EQ(adapter->importCalls(), 0U);
+
+    // Target count must match the local Jetty set.
+    auto count_endpoint = make_endpoint();
+    ASSERT_TRUE(count_endpoint->prepare().ok());
+    auto short_peer = peer;
+    short_peer.rm->targets.pop_back();
+    EXPECT_TRUE(count_endpoint
+                    ->bindRm(short_peer, expectedForRmPeer(short_peer))
+                    .IsInvalidArgument());
+    EXPECT_EQ(count_endpoint->state(), UbEndpoint::State::kFailed);
+
+    // A failing import rolls back every target imported by this attempt in
+    // reverse order and destroys the incarnation.
+    auto rollback_endpoint = make_endpoint();
+    ASSERT_TRUE(rollback_endpoint->prepare().ok());
+    adapter->failNextImports(1);
+    EXPECT_TRUE(rollback_endpoint
+                    ->bindRm(peer, expectedForRmPeer(peer))
+                    .IsRdmaError());
+    EXPECT_EQ(rollback_endpoint->state(), UbEndpoint::State::kFailed);
+    EXPECT_EQ(rollback_endpoint->importedTargetCount(), 0U);
+    EXPECT_EQ(adapter->importCalls(), 2U);
+    EXPECT_EQ(adapter->unimportCalls(), 1U)
+        << "the first imported target must be rolled back";
+
+    EXPECT_TRUE(context->shutdown().ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+TEST(UbRmLegacyTest, RetireRetainsTargetWhenUnimportFailsAndRetries) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    auto context = std::make_shared<UbContext>(0, fakeDevice(), adapter);
+    ASSERT_TRUE(context->initialize(1, JfcOptions{}).ok());
+    auto endpoint = std::make_shared<UbEndpoint>(
+        UbEndpointKey{0, 123, 9, "peer/ub:fake0:eid0"}, context, adapter, 2,
+        rmJettyOptions());
+    ASSERT_TRUE(endpoint->prepare().ok());
+
+    UbBootstrapDesc local;
+    ASSERT_TRUE(endpoint
+                    ->makeBootstrapDescV2("seg-a", "seg-a/ub:fake0:eid0",
+                                          "seg-b/ub:fake0:eid0", 5, 1, 1,
+                                          local)
+                    .ok());
+    auto peer = local;
+    peer.segment_name = "seg-b";
+    peer.local_nic_path = "seg-b/ub:fake0:eid0";
+    peer.peer_nic_path = "seg-a/ub:fake0:eid0";
+    ASSERT_TRUE(endpoint->bindRm(peer, expectedForRmPeer(peer)).ok());
+    EXPECT_EQ(endpoint->importedTargetCount(), 2U);
+    EXPECT_EQ(adapter->importCalls(), 2U);
+
+    // The first unimport fails: the handle stays owned by this incarnation
+    // and the endpoint never reaches kDestroyed with a live target.
+    adapter->failNextUnimports(1);
+    EXPECT_TRUE(endpoint->retire().IsRdmaError());
+    EXPECT_NE(endpoint->state(), UbEndpoint::State::kDestroyed);
+    EXPECT_EQ(endpoint->importedTargetCount(), 1U)
+        << "the failed unimport must retain its target handle";
+    EXPECT_EQ(adapter->unimportCalls(), 2U)
+        << "the successful sibling unimport still completes";
+
+    // A retry completes the release: no target survives kDestroyed.
+    EXPECT_TRUE(endpoint->retire().ok());
+    EXPECT_EQ(endpoint->state(), UbEndpoint::State::kDestroyed);
+    EXPECT_EQ(endpoint->importedTargetCount(), 0U);
+    EXPECT_EQ(adapter->unimportCalls(), 3U);
+
+    EXPECT_TRUE(context->shutdown().ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+TEST(UbRmLegacyTest, RmJettyBindIsRejectedByTheAdapter) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    auto context = std::make_shared<UbContext>(0, fakeDevice(), adapter);
+    ASSERT_TRUE(context->initialize(1, JfcOptions{}).ok());
+    JettyPtr jetty;
+    JfcPtr jfc;
+    ASSERT_TRUE(adapter->createJfc(context->handle(), JfcOptions{}, jfc).ok());
+    ASSERT_TRUE(adapter
+                    ->createJetty(context->handle(), jfc, rmJettyOptions(),
+                                  jetty)
+                    .ok());
+    EXPECT_TRUE(
+        adapter->bindJetty(jetty, RemoteJettyInfo{}).IsInvalidArgument());
+    EXPECT_TRUE(context->shutdown().ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+TEST(UbRmLegacyTest, RmInstallGateFailsClosedWithoutRmCapabilities) {
+    auto device = fakeDevice();
+    // transport_modes without RM or no RTP priority mask must reject install
+    // with NotImplemented before any Jetty is created.
+    device.capabilities.transport_modes = 1;
+    auto adapter = std::make_shared<FakeUrmaAdapter>(device);
+    auto topology = fakeTopology();
+    auto control = std::make_shared<ControlService>("p2p", "", nullptr);
+    uint16_t port = 0;
+    ASSERT_TRUE(control->start(port).ok());
+    const std::string segment_name =
+        "127.0.0.1:" + std::to_string(static_cast<unsigned>(port));
+
+    auto config = std::make_shared<Config>();
+    config->set("transports/ub/enable", true);
+    config->set("transports/ub/runtime_profile", "rm_legacy");
+    config->set("transports/ub/trans_mode", "rm");
+    setPhysicalOnlyIdentity(*config, device);
+
+    UbTransport transport(adapter);
+    std::string mutable_segment_name = segment_name;
+    const auto status =
+        transport.install(mutable_segment_name, control, topology, config);
+    EXPECT_TRUE(status.IsNotImplemented()) << status.ToString();
+    EXPECT_EQ(adapter->createJettyCalls(), 0U)
+        << "the capability gate must run before Jetty creation";
+}
+
+TEST(UbRmLegacyTest, TransportRunsSelfReadWriteWithExplicitRmTargets) {
+    auto device = rmCapableDevice();
+    auto adapter = std::make_shared<FakeUrmaAdapter>(device);
+    auto topology = fakeTopology(false);
+    auto control = std::make_shared<ControlService>("p2p", "", nullptr);
+    uint16_t port = 0;
+    ASSERT_TRUE(control->start(port).ok());
+    const std::string segment_name =
+        "127.0.0.1:" + std::to_string(static_cast<unsigned>(port));
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        segment.name = segment_name;
+                        segment.rpc_server_addr = segment_name;
+                        segment.machine_id = "fake-machine";
+                        segment.type = SegmentType::Memory;
+                        segment.detail = MemorySegmentDesc{};
+                        std::get<MemorySegmentDesc>(segment.detail).topology =
+                            *topology;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    auto config = std::make_shared<Config>();
+    config->set("transports/ub/enable", true);
+    config->set("transports/ub/runtime_profile", "rm_legacy");
+    config->set("transports/ub/trans_mode", "rm");
+    config->set("transports/ub/worker_count", 1);
+    config->set("transports/ub/poller_count", 1);
+    config->set("transports/ub/jfc_per_context", 1);
+    config->set("transports/ub/jetty_per_endpoint", 1);
+    config->set("transports/ub/max_endpoints", 16);
+    config->set("transports/ub/slice_size", 16);
+    config->set("transports/ub/max_slices_per_task", 8);
+    config->set("transports/ub/max_retries", 1);
+    config->set("transports/ub/slice_timeout_ms", 1000);
+    config->set("transports/ub/endpoint_cooldown_ms", 100);
+    setPhysicalOnlyIdentity(*config, device);
+
+    UbTransport transport(adapter);
+    std::string mutable_segment_name = segment_name;
+    ASSERT_TRUE(
+        transport.install(mutable_segment_name, control, topology, config)
+            .ok());
+    EXPECT_EQ(adapter->openContextCalls(), 1U);
+
+    // A v1 request must be rejected by the RM runtime gate.
+    UbBootstrapDesc v1_request;
+    v1_request.protocol_version = 1;
+    v1_request.local_eid = device.eid;
+    v1_request.endpoint_generation = 9;
+    v1_request.jetty_ids = {1};
+    UbBootstrapDesc v1_response;
+    ASSERT_TRUE(
+        ControlClient::bootstrapUb(segment_name, v1_request, v1_response).ok());
+    EXPECT_NE(v1_response.reply_msg, "");
+
+    std::array<char, 64> source{};
+    std::array<char, 64> target{};
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(100 - i);
+    }
+    const auto expected = source;
+    BufferDesc source_desc{};
+    source_desc.addr = reinterpret_cast<uint64_t>(source.data());
+    source_desc.length = source.size();
+    source_desc.location = kWildcardLocation;
+    BufferDesc target_desc{};
+    target_desc.addr = reinterpret_cast<uint64_t>(target.data());
+    target_desc.length = target.size();
+    target_desc.location = kWildcardLocation;
+    MemoryOptions options;
+    options.perm = kGlobalReadWrite;
+    std::vector<BufferDesc> descriptors{source_desc, target_desc};
+    ASSERT_TRUE(transport.addMemoryBuffer(descriptors, options).ok());
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        std::get<MemorySegmentDesc>(segment.detail).buffers =
+                            descriptors;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 2).ok());
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(target.data());
+    request.length = source.size();
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {request}).ok());
+
+    TransferStatus transfer{PENDING, 0};
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (transfer.s == PENDING &&
+           std::chrono::steady_clock::now() < deadline) {
+        ASSERT_TRUE(transport.getTransferStatus(batch, 0, transfer).ok());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(transfer.s, COMPLETED);
+    EXPECT_EQ(transfer.transferred_bytes, source.size());
+    EXPECT_EQ(source, target);
+    EXPECT_GE(adapter->rmPostCalls(), 1U)
+        << "the RM data plane must post with an explicit target";
+    EXPECT_EQ(adapter->bindJettyCalls(), 0U)
+        << "RM Legacy posts must not rely on bound remote Jettys";
+    ASSERT_FALSE(adapter->importedIds().empty());
+    EXPECT_EQ(adapter->lastPostedTargetId(), adapter->importedIds().front());
+
+    source.fill(0);
+    Request read_request = request;
+    read_request.opcode = Request::READ;
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {read_request}).ok());
+    transfer = TransferStatus{PENDING, 0};
+    const auto read_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (transfer.s == PENDING &&
+           std::chrono::steady_clock::now() < read_deadline) {
+        ASSERT_TRUE(transport.getTransferStatus(batch, 1, transfer).ok());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(transfer.s, COMPLETED);
+    EXPECT_EQ(transfer.transferred_bytes, source.size());
+    EXPECT_EQ(source, expected);
+
+    ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+    EXPECT_TRUE(transport.uninstall().ok());
+    EXPECT_GE(adapter->unimportCalls(), adapter->importCalls())
+        << "every imported target must be unimported before uninstall ends";
+}
+
+TEST(UbRmLegacyTest, NotAcceptedPostRollsBackAndRetriesAsNewAttempt) {
+    auto device = rmCapableDevice();
+    auto adapter = std::make_shared<FakeUrmaAdapter>(device);
+    auto topology = fakeTopology(false);
+    auto control = std::make_shared<ControlService>("p2p", "", nullptr);
+    uint16_t port = 0;
+    ASSERT_TRUE(control->start(port).ok());
+    const std::string segment_name =
+        "127.0.0.1:" + std::to_string(static_cast<unsigned>(port));
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        segment.name = segment_name;
+                        segment.rpc_server_addr = segment_name;
+                        segment.machine_id = "fake-machine";
+                        segment.type = SegmentType::Memory;
+                        segment.detail = MemorySegmentDesc{};
+                        std::get<MemorySegmentDesc>(segment.detail).topology =
+                            *topology;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    auto config = std::make_shared<Config>();
+    config->set("transports/ub/enable", true);
+    config->set("transports/ub/runtime_profile", "rm_legacy");
+    config->set("transports/ub/trans_mode", "rm");
+    config->set("transports/ub/worker_count", 1);
+    config->set("transports/ub/poller_count", 1);
+    config->set("transports/ub/jfc_per_context", 1);
+    config->set("transports/ub/jetty_per_endpoint", 1);
+    config->set("transports/ub/max_endpoints", 16);
+    config->set("transports/ub/slice_size", 16);
+    config->set("transports/ub/max_slices_per_task", 8);
+    config->set("transports/ub/max_retries", 1);
+    config->set("transports/ub/slice_timeout_ms", 1000);
+    config->set("transports/ub/endpoint_cooldown_ms", 100);
+    setPhysicalOnlyIdentity(*config, device);
+
+    UbTransport transport(adapter);
+    std::string mutable_segment_name = segment_name;
+    ASSERT_TRUE(
+        transport.install(mutable_segment_name, control, topology, config)
+            .ok());
+
+    std::array<char, 32> source{};
+    std::array<char, 32> target{};
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(i);
+    }
+    BufferDesc source_desc{};
+    source_desc.addr = reinterpret_cast<uint64_t>(source.data());
+    source_desc.length = source.size();
+    source_desc.location = kWildcardLocation;
+    BufferDesc target_desc{};
+    target_desc.addr = reinterpret_cast<uint64_t>(target.data());
+    target_desc.length = target.size();
+    target_desc.location = kWildcardLocation;
+    MemoryOptions options;
+    options.perm = kGlobalReadWrite;
+    std::vector<BufferDesc> descriptors{source_desc, target_desc};
+    ASSERT_TRUE(transport.addMemoryBuffer(descriptors, options).ok());
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        std::get<MemorySegmentDesc>(segment.detail).buffers =
+                            descriptors;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(target.data());
+    request.length = source.size();
+
+    // The first post is deterministically rejected before any WR crosses the
+    // native boundary: the pre-registered responsibility is rolled back and a
+    // new attempt may be posted.
+    adapter->failNextPostWithoutAccept();
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {request}).ok());
+    TransferStatus transfer{PENDING, 0};
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (transfer.s == PENDING &&
+           std::chrono::steady_clock::now() < deadline) {
+        ASSERT_TRUE(transport.getTransferStatus(batch, 0, transfer).ok());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(transfer.s, COMPLETED);
+    EXPECT_EQ(source, target);
+    EXPECT_GE(adapter->rmPostCalls(), 2U)
+        << "the rejected attempt must be retried as a new post";
+
+    ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+    EXPECT_TRUE(transport.uninstall().ok());
+}
+
+TEST(UbRmLegacyTest, UnknownPostAcceptanceNeverReplaysAndFenceSettles) {
+    auto device = rmCapableDevice();
+    auto adapter = std::make_shared<FakeUrmaAdapter>(device);
+    auto topology = fakeTopology(false);
+    auto control = std::make_shared<ControlService>("p2p", "", nullptr);
+    uint16_t port = 0;
+    ASSERT_TRUE(control->start(port).ok());
+    const std::string segment_name =
+        "127.0.0.1:" + std::to_string(static_cast<unsigned>(port));
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        segment.name = segment_name;
+                        segment.rpc_server_addr = segment_name;
+                        segment.machine_id = "fake-machine";
+                        segment.type = SegmentType::Memory;
+                        segment.detail = MemorySegmentDesc{};
+                        std::get<MemorySegmentDesc>(segment.detail).topology =
+                            *topology;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    auto config = std::make_shared<Config>();
+    config->set("transports/ub/enable", true);
+    config->set("transports/ub/runtime_profile", "rm_legacy");
+    config->set("transports/ub/trans_mode", "rm");
+    config->set("transports/ub/worker_count", 1);
+    config->set("transports/ub/poller_count", 1);
+    config->set("transports/ub/jfc_per_context", 1);
+    config->set("transports/ub/jetty_per_endpoint", 1);
+    config->set("transports/ub/max_endpoints", 16);
+    config->set("transports/ub/slice_size", 16);
+    config->set("transports/ub/max_slices_per_task", 8);
+    config->set("transports/ub/max_retries", 0);
+    config->set("transports/ub/slice_timeout_ms", 200);
+    config->set("transports/ub/endpoint_cooldown_ms", 100);
+    setPhysicalOnlyIdentity(*config, device);
+
+    UbTransport transport(adapter);
+    std::string mutable_segment_name = segment_name;
+    ASSERT_TRUE(
+        transport.install(mutable_segment_name, control, topology, config)
+            .ok());
+
+    std::array<char, 32> source{};
+    std::array<char, 32> target{};
+    BufferDesc source_desc{};
+    source_desc.addr = reinterpret_cast<uint64_t>(source.data());
+    source_desc.length = source.size();
+    source_desc.location = kWildcardLocation;
+    BufferDesc target_desc{};
+    target_desc.addr = reinterpret_cast<uint64_t>(target.data());
+    target_desc.length = target.size();
+    target_desc.location = kWildcardLocation;
+    MemoryOptions options;
+    options.perm = kGlobalReadWrite;
+    std::vector<BufferDesc> descriptors{source_desc, target_desc};
+    ASSERT_TRUE(transport.addMemoryBuffer(descriptors, options).ok());
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        std::get<MemorySegmentDesc>(segment.detail).buffers =
+                            descriptors;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(target.data());
+    request.length = source.size();
+
+    // Contradictory acceptance: the WR crosses the boundary while the post
+    // reports an error. The worker must not roll back or replay; the timeout
+    // fence settles the pre-registered owners.
+    adapter->failNextPostAfterAccept();
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {request}).ok());
+    TransferStatus transfer{PENDING, 0};
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (transfer.s == PENDING &&
+           std::chrono::steady_clock::now() < deadline) {
+        ASSERT_TRUE(transport.getTransferStatus(batch, 0, transfer).ok());
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    EXPECT_NE(transfer.s, PENDING);
+    EXPECT_EQ(adapter->rmPostCalls(), 1U)
+        << "a WR with unknown acceptance must never be replayed transparently";
+    EXPECT_EQ(adapter->pendingCount(), 0U)
+        << "the fence must have settled the outstanding WR";
+
+    ASSERT_TRUE(transport.freeSubBatch(batch).ok());
     EXPECT_TRUE(transport.uninstall().ok());
 }
 

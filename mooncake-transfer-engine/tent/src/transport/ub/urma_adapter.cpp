@@ -440,7 +440,11 @@ class RealJfc final : public Jfc {
         urma_jfr_cfg_t receiver_cfg{};
         receiver_cfg.depth = options.receiver_depth;
         receiver_cfg.flag.bs.tag_matching = 0;
-        receiver_cfg.trans_mode = URMA_TM_RC;
+        // The receive-side JFR transport mode follows the JFC options so an
+        // RM Legacy context creates an RM receiver. The static_asserts above
+        // pin the TENT constants to the UMDK enum values.
+        receiver_cfg.trans_mode =
+            static_cast<urma_transport_mode_t>(options.trans_mode);
         receiver_cfg.max_sge = 1;
         receiver_cfg.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
         receiver_cfg.jfc = receive_jfc_;
@@ -688,10 +692,29 @@ class RealJetty final : public Jetty {
             return Status::InvalidArgument(
                 "URMA JFS priority must be in [0, 15]");
         }
+        if (options.trans_mode != kUrmaTransportModeRc &&
+            options.trans_mode != kUrmaTransportModeRm) {
+            return Status::InvalidArgument(
+                "URMA JFS transport mode must be RC or RM");
+        }
+        rm_mode_ = options.trans_mode == kUrmaTransportModeRm;
+        if (rm_mode_) {
+            // Precheck replicates the native WR gate: this JFS may only
+            // address imported targets whose tp_type is covered by the
+            // provider-derived bind mask carried in the LocalSendProfile.
+            // The native post remains the final fence.
+            if ((options.bind_tp_type_mask & kUrmaTpTypeRtpMask) == 0) {
+                return Status::InvalidArgument(
+                    "RM JFS bind mask does not cover URMA_RTP");
+            }
+        }
         urma_jetty_cfg_t config{};
         config.flag.bs.share_jfr = 1;
         config.jfs_cfg.depth = options.depth;
-        config.jfs_cfg.trans_mode = URMA_TM_RC;
+        // The JFS transport mode follows the trusted LocalSendProfile. RM
+        // Legacy never falls back to RC here.
+        config.jfs_cfg.trans_mode =
+            static_cast<urma_transport_mode_t>(options.trans_mode);
         config.jfs_cfg.priority = static_cast<uint8_t>(
             context_->isBondingDevice() ? context_->ctpPriority()
                                         : options.priority);
@@ -727,7 +750,14 @@ class RealJetty final : public Jetty {
     std::mutex& mutex() noexcept { return mutex_; }
     urma_jetty_t* native() const noexcept { return native_; }
     urma_target_jetty_t* remote() const noexcept { return remote_; }
-    bool postable() const noexcept { return state_ == State::BOUND; }
+    // RM Legacy never binds a remote Jetty: each WR carries its own imported
+    // target, so an unbound RM JFS is still postable. RC keeps requiring a
+    // completed bind.
+    bool postable() const noexcept {
+        return rm_mode_ ? (state_ == State::CREATED || state_ == State::BOUND)
+                        : state_ == State::BOUND;
+    }
+    bool rmMode() const noexcept { return rm_mode_; }
     uint32_t depth() const noexcept { return depth_; }
 
     Status beginError() {
@@ -767,6 +797,11 @@ class RealJetty final : public Jetty {
                 const urma_eid_t& remote_eid) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (native_ == nullptr) return invalidHandle("Jetty");
+        if (rm_mode_) {
+            return Status::InvalidArgument(
+                "RM Legacy Jetties never bind a remote Jetty; every RM work "
+                "request carries an explicit imported target");
+        }
         if (state_ == State::RESET) {
             return Status::InvalidArgument("cannot bind a reset Jetty");
         }
@@ -934,8 +969,59 @@ class RealJetty final : public Jetty {
     bool needs_native_unbind_{false};
     uint32_t depth_ = 0;
     State state_ = State::CREATED;
+    bool rm_mode_{false};
     bool flush_fenced_{false};
     mutable std::mutex mutex_;
+};
+
+// One imported RM remote target, owned by exactly one endpoint incarnation.
+// The handle is created from a validated bootstrap v2 descriptor (RM/JETTY/
+// RTP) and released only after every WR referencing it has completed or been
+// fenced by the provider.
+class RealRemoteTarget final : public RemoteTarget {
+   public:
+    // The Jetty ID/UASID/EID are cached from the validated bootstrap v2
+    // descriptor at import time; accessors must not dereference provider
+    // structs whose layout is not pinned by the static_asserts above.
+    RealRemoteTarget(std::shared_ptr<RealContext> context,
+                     urma_target_jetty_t* native, uint32_t id, uint32_t uasid,
+                     std::string eid)
+        : context_(std::move(context)),
+          native_(native),
+          cached_id_(id),
+          cached_uasid_(uasid),
+          eid_(std::move(eid)) {}
+
+    ~RealRemoteTarget() override { (void)close(); }
+
+    bool valid() const noexcept override { return native_ != nullptr; }
+    uint32_t id() const noexcept override {
+        return native_ == nullptr ? 0 : cached_id_;
+    }
+    uint32_t uasid() const noexcept override {
+        return native_ == nullptr ? 0 : cached_uasid_;
+    }
+    const std::string& eid() const noexcept override { return eid_; }
+
+    urma_target_jetty_t* native() const noexcept { return native_; }
+    const std::shared_ptr<RealContext>& context() const noexcept {
+        return context_;
+    }
+
+    Status close() {
+        if (native_ == nullptr) return Status::OK();
+        const int rc = urma_unimport_jetty(native_);
+        if (rc != URMA_SUCCESS) return nativeError("urma_unimport_jetty", rc);
+        native_ = nullptr;
+        return Status::OK();
+    }
+
+   private:
+    std::shared_ptr<RealContext> context_;
+    urma_target_jetty_t* native_ = nullptr;
+    uint32_t cached_id_ = 0;
+    uint32_t cached_uasid_ = 0;
+    std::string eid_;
 };
 
 uint32_t nativeAccess(uint32_t access) {
@@ -1488,6 +1574,59 @@ class RealUrmaAdapter final : public UrmaAdapter {
         return real_jetty->unbind();
     }
 
+    Status importRemoteTarget(const ContextPtr& context, const std::string& eid,
+                              uint32_t uasid, uint32_t id, uint16_t trans_mode,
+                              uint8_t target_type, uint8_t tp_type,
+                              RemoteTargetPtr& target) override {
+        target.reset();
+        std::shared_ptr<RuntimeLease> runtime;
+        CHECK_STATUS(getRuntime(runtime));
+        auto real_context = std::dynamic_pointer_cast<RealContext>(context);
+        if (!real_context || !real_context->valid()) {
+            return invalidHandle("Context");
+        }
+        if (id == 0) {
+            return Status::InvalidArgument(
+                "RM target Jetty ID must be non-zero");
+        }
+        // Fail closed on any profile outside the verified RM/RTP contract.
+        if (trans_mode != URMA_TM_RM || target_type != URMA_JETTY ||
+            tp_type != URMA_RTP) {
+            return Status::InvalidArgument(
+                "RM target profile must be URMA_TM_RM/URMA_JETTY/URMA_RTP");
+        }
+        urma_eid_t remote_eid{};
+        if (!parseEid(eid, remote_eid) || isAllZero(remote_eid)) {
+            return Status::InvalidArgument("invalid or null RM target EID");
+        }
+
+        urma_rjetty_t descriptor{};
+        descriptor.jetty_id.eid = remote_eid;
+        descriptor.jetty_id.uasid = uasid;
+        descriptor.jetty_id.id = id;
+        descriptor.trans_mode = URMA_TM_RM;
+        descriptor.type = URMA_JETTY;
+        descriptor.tp_type = URMA_RTP;
+
+        // The import token mirrors the receive-side JFR default; the UASID
+        // contract itself is decided by the selected provider and validated
+        // by native post.
+        urma_token_t token{.token = kUrmaJfrDefaultToken};
+        urma_target_jetty_t* imported =
+            urma_import_jetty(real_context->native(), &descriptor, &token);
+        if (imported == nullptr) {
+            return nativePointerError("urma_import_jetty(RM)");
+        }
+        target = std::make_shared<RealRemoteTarget>(std::move(real_context),
+                                                     imported, id, uasid, eid);
+        return Status::OK();
+    }
+
+    Status unimportRemoteTarget(RemoteTargetPtr& target) override {
+        return releaseTypedHandle<RealRemoteTarget, RemoteTarget>(target,
+                                                                  "RemoteTarget");
+    }
+
     Status resetJetty(const JettyPtr& jetty) override {
         if (!jetty) return Status::OK();
         auto real_jetty = std::dynamic_pointer_cast<RealJetty>(jetty);
@@ -1601,11 +1740,39 @@ class RealUrmaAdapter final : public UrmaAdapter {
         std::vector<NativeWorkRequest> native_requests(requests.size());
 
         std::lock_guard<std::mutex> jetty_lock(real_jetty->mutex());
-        if (!real_jetty->postable() || real_jetty->remote() == nullptr) {
+        const bool rm_mode = real_jetty->rmMode();
+        // RM posts carry an explicit imported target per WR and never rely on
+        // a bound remote Jetty; RC posts must not set a target and require a
+        // completed bind.
+        if (rm_mode) {
+            if (!real_jetty->postable()) {
+                return Status::InvalidArgument("RM Jetty is not postable");
+            }
+        } else if (!real_jetty->postable() ||
+                   real_jetty->remote() == nullptr) {
             return Status::InvalidArgument("Jetty is not bound and postable");
         }
         for (size_t i = 0; i < requests.size(); ++i) {
             const WorkRequest& request = requests[i];
+            if (rm_mode != (request.target != nullptr)) {
+                return Status::InvalidArgument(
+                    rm_mode ? "RM work requests must set an explicit target"
+                            : "RC work requests must not set a target");
+            }
+            urma_target_jetty_t* request_target = nullptr;
+            if (rm_mode) {
+                auto real_target = std::dynamic_pointer_cast<RealRemoteTarget>(
+                    request.target);
+                if (!real_target || !real_target->valid()) {
+                    return invalidHandle("RemoteTarget");
+                }
+                if (real_target->context().get() !=
+                    real_jetty->context().get()) {
+                    return Status::InvalidArgument(
+                        "RM target belongs to another Context");
+                }
+                request_target = real_target->native();
+            }
             if (request.token == 0) {
                 return Status::InvalidArgument(
                     "work request token zero is reserved");
@@ -1648,7 +1815,10 @@ class RealUrmaAdapter final : public UrmaAdapter {
                                    ? URMA_OPC_READ
                                    : URMA_OPC_WRITE;
             native.wr.flag.bs.complete_enable = 1;
-            native.wr.tjetty = real_jetty->remote();
+            // RM Legacy uses this WR's explicit imported target; RC keeps
+            // the bound remote Jetty.
+            native.wr.tjetty =
+                rm_mode ? request_target : real_jetty->remote();
             native.wr.user_ctx = request.token;
             if (request.operation == Operation::READ) {
                 native.wr.rw.src.sge = &native.remote_sge;

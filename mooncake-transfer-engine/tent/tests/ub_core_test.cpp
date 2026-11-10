@@ -100,48 +100,97 @@ TEST(UbParamsTest, ParsesDormantPoolAndProbeKeysWithoutStartingResources) {
 
 TEST(UbParamsTest, RuntimeMatrixRejectsInconsistentOrUnsupportedModes) {
     auto evaluate = [](UbRuntimeProfile profile, UbTransportMode mode,
-                       bool pool, bool probe) {
+                       bool pool, bool probe, bool physical_only) {
         UbParams params;
         params.runtime_profile = profile;
         params.trans_mode = mode;
         params.jetty_pool.enable = pool;
         params.probe.enabled = probe;
+        params.physical_only = physical_only;
         UbRuntimeMode resolved = UbRuntimeMode::kRcLegacy;
         return resolveUbRuntimeMode(params, resolved);
     };
 
     EXPECT_TRUE(evaluate(UbRuntimeProfile::kRcLegacy, UbTransportMode::kRm,
-                         false, false)
+                         false, false, false)
                     .IsInvalidArgument());
     EXPECT_TRUE(evaluate(UbRuntimeProfile::kRcLegacy, UbTransportMode::kRc,
-                         true, false)
+                         true, false, false)
                     .IsInvalidArgument());
     EXPECT_TRUE(evaluate(UbRuntimeProfile::kRcLegacy, UbTransportMode::kRc,
-                         false, true)
+                         false, true, false)
                     .IsInvalidArgument());
 
     EXPECT_TRUE(evaluate(UbRuntimeProfile::kRmLegacy, UbTransportMode::kRc,
-                         false, false)
+                         false, false, true)
+                    .IsInvalidArgument());
+    // A well-formed RM Legacy configuration passes the config gate; the
+    // provider/capability gates run during install and fail closed there.
+    EXPECT_TRUE(evaluate(UbRuntimeProfile::kRmLegacy, UbTransportMode::kRm,
+                         false, false, true)
+                    .ok());
+    EXPECT_TRUE(evaluate(UbRuntimeProfile::kRmLegacy, UbTransportMode::kRm,
+                         true, false, true)
                     .IsInvalidArgument());
     EXPECT_TRUE(evaluate(UbRuntimeProfile::kRmLegacy, UbTransportMode::kRm,
-                         false, false)
-                    .IsNotImplemented());
-    EXPECT_TRUE(evaluate(UbRuntimeProfile::kRmLegacy, UbTransportMode::kRm,
-                         true, false)
+                         false, true, true)
                     .IsInvalidArgument());
+    // RM Legacy is physical-only: no bonding device may be selected.
     EXPECT_TRUE(evaluate(UbRuntimeProfile::kRmLegacy, UbTransportMode::kRm,
-                         false, true)
+                         false, false, false)
                     .IsInvalidArgument());
 
     EXPECT_TRUE(evaluate(UbRuntimeProfile::kRmPool, UbTransportMode::kRm,
-                         false, true)
+                         false, true, true)
                     .IsInvalidArgument());
     EXPECT_TRUE(evaluate(UbRuntimeProfile::kRmPool, UbTransportMode::kRm,
-                         true, false)
+                         true, false, true)
                     .IsInvalidArgument());
     EXPECT_TRUE(evaluate(UbRuntimeProfile::kRmPool, UbTransportMode::kRm,
-                         true, true)
+                         true, true, true)
                     .IsNotImplemented());
+}
+
+TEST(UbParamsTest, RmLegacyResolvesToRmRuntimeMode) {
+    UbParams params;
+    params.runtime_profile = UbRuntimeProfile::kRmLegacy;
+    params.trans_mode = UbTransportMode::kRm;
+    params.physical_only = true;
+    UbRuntimeMode resolved = UbRuntimeMode::kRcLegacy;
+    ASSERT_TRUE(resolveUbRuntimeMode(params, resolved).ok());
+    EXPECT_EQ(resolved, UbRuntimeMode::kRmLegacy);
+}
+
+TEST(UbAdapterContractTest, ClassifiesPostAcceptanceFromNativeResult) {
+    // Full success: Accepted.
+    EXPECT_EQ(classifyPostAcceptance(Status::OK(), 1, 1),
+              PostAcceptance::kAccepted);
+    // Deterministic rejection before any WR crossed: NotAccepted.
+    EXPECT_EQ(classifyPostAcceptance(
+                  Status::InvalidArgument("rejected"), 0, 1),
+              PostAcceptance::kNotAccepted);
+    // Accepted-prefix error: the WR may have crossed, so Unknown.
+    EXPECT_EQ(classifyPostAcceptance(Status::RdmaError("late"), 1, 1),
+              PostAcceptance::kUnknown);
+    // Success with a short count is contradictory: Unknown.
+    EXPECT_EQ(classifyPostAcceptance(Status::OK(), 0, 1),
+              PostAcceptance::kUnknown);
+    // Empty post succeeds trivially: Accepted.
+    EXPECT_EQ(classifyPostAcceptance(Status::OK(), 0, 0),
+              PostAcceptance::kAccepted);
+    EXPECT_STREQ(postAcceptanceName(PostAcceptance::kAccepted), "accepted");
+    EXPECT_STREQ(postAcceptanceName(PostAcceptance::kNotAccepted),
+                 "not_accepted");
+    EXPECT_STREQ(postAcceptanceName(PostAcceptance::kUnknown), "unknown");
+}
+
+TEST(UbBootstrapTest, BuildsCanonicalPhysicalDeviceIdentity) {
+    EXPECT_EQ(makePhysicalDeviceIdentity("/dev/uburma/udma0",
+                                         "0001:0002:0000:0000"),
+              "/dev/uburma/udma0#0001");
+    EXPECT_EQ(makePhysicalDeviceIdentity("/dev/uburma/udma1", "0002"),
+              "/dev/uburma/udma1#0002");
+    EXPECT_EQ(makePhysicalDeviceIdentity("", ""), "#");
 }
 
 TEST(UbParamsTest, RejectsUnknownRuntimeKeysAndNonFixedProbeRecovery) {
@@ -217,6 +266,66 @@ TEST(UbBootstrapTest, GatesVersionAndModeWithoutClaimingRmRuntimeSupport) {
     response_envelope.reply_msg = "response is not a request";
     EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::RM, response_envelope)
                     .IsInvalidArgument());
+}
+
+TEST(UbBootstrapTest, RmWireFormatParsesStrictlyAndRejectsUnknownFields) {
+    const auto desc = makeValidRmBootstrap();
+    ASSERT_TRUE(desc.rm.has_value());
+
+    // Round-trip: a valid v2 request survives encode/decode with the RM
+    // payload intact.
+    nlohmann::json wire = desc;
+    UbBootstrapDesc decoded = wire.get<UbBootstrapDesc>();
+    EXPECT_EQ(decoded.protocol_version, 2U);
+    ASSERT_TRUE(decoded.rm.has_value());
+    EXPECT_EQ(decoded.rm->physical_device_identity,
+              desc.rm->physical_device_identity);
+    ASSERT_EQ(decoded.rm->targets.size(), 1U);
+    EXPECT_EQ(decoded.rm->targets[0].id, desc.rm->targets[0].id);
+    EXPECT_EQ(decoded.rm->targets[0].profile.trans_mode,
+              desc.rm->targets[0].profile.trans_mode);
+
+    // A remote target profile is a closed allowlist: unknown extensions and
+    // local-only fields are never silently reinterpreted.
+    {
+        auto profile = wire["rm"]["targets"][0]["profile"];
+        profile["bind_tp_type_mask"] = 4;
+        EXPECT_THROW(profile.get<UbRemoteTargetProfile>(),
+                     std::invalid_argument);
+    }
+    {
+        auto profile = wire["rm"]["targets"][0]["profile"];
+        profile["trans_mode"] = -1;
+        EXPECT_THROW(profile.get<UbRemoteTargetProfile>(),
+                     std::invalid_argument);
+    }
+    // Required RM fields may not be dropped from the wire.
+    {
+        auto rm = wire["rm"];
+        rm.erase("targets");
+        EXPECT_THROW(rm.get<UbRmBootstrapDesc>(),
+                     nlohmann::json::out_of_range);
+    }
+    // v2 wire bytes stay immutable: v1-only fields never leak into v2.
+    EXPECT_EQ(wire.count("jetty_ids"), 0U);
+
+    // A v2 rejection response carries only the version and the reply.
+    UbBootstrapDesc rejection;
+    rejection.protocol_version = 2;
+    rejection.reply_msg = "peer rejected the request";
+    nlohmann::json rejection_wire = rejection;
+    EXPECT_EQ(rejection_wire.size(), 2U);
+    EXPECT_TRUE(rejection_wire.contains("protocol_version"));
+    EXPECT_TRUE(rejection_wire.contains("reply_msg"));
+    const auto decoded_rejection = rejection_wire.get<UbBootstrapDesc>();
+    EXPECT_EQ(decoded_rejection.protocol_version, 2U);
+    EXPECT_FALSE(decoded_rejection.rm.has_value());
+    EXPECT_EQ(decoded_rejection.reply_msg, "peer rejected the request");
+
+    // An empty v2 envelope without a payload is not a valid rejection.
+    UbBootstrapDesc empty;
+    empty.protocol_version = 2;
+    EXPECT_THROW(nlohmann::json{empty}, std::invalid_argument);
 }
 
 TEST(UbBootstrapTest, ValidatesRmIdentityProfilesAndProbeReferences) {

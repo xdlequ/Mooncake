@@ -55,6 +55,11 @@ class UbContext final : public std::enable_shared_from_this<UbContext> {
     [[nodiscard]] Topology::NicID topologyId() const noexcept {
         return topology_id_;
     }
+    // Process-unique identity for bootstrap v2 context_incarnation. It is
+    // allocated once per constructed context and never reused.
+    [[nodiscard]] uint64_t incarnation() const noexcept {
+        return incarnation_;
+    }
     [[nodiscard]] const DeviceInfo& deviceInfo() const noexcept {
         return device_;
     }
@@ -87,10 +92,12 @@ class UbContext final : public std::enable_shared_from_this<UbContext> {
 
    private:
     Status shutdownLocked();
+    static uint64_t allocateIncarnation() noexcept;
 
     const Topology::NicID topology_id_;
     const DeviceInfo device_;
     std::shared_ptr<UrmaAdapter> adapter_;
+    const uint64_t incarnation_;
     ContextPtr handle_;
     std::vector<std::shared_ptr<UbJfc>> jfcs_;
     mutable std::mutex lifecycle_mutex_;

@@ -4,6 +4,9 @@
 #ifndef TENT_TRANSPORT_UB_BOOTSTRAP_H_
 #define TENT_TRANSPORT_UB_BOOTSTRAP_H_
 
+#include <string>
+#include <string_view>
+
 #include "tent/common/status.h"
 #include "tent/transport/ub/bootstrap_types.h"
 
@@ -33,6 +36,13 @@ struct UbExpectedPeerIdentity {
     std::string eid;
     uint16_t transport_modes = 0;
 };
+
+// Canonical physical device identity used by bootstrap v2: the native device
+// path plus the first EID group (for example "/dev/udma0#0001"). Both sides
+// derive it from trusted local discovery/segment metadata; it is never taken
+// from a peer's self-asserted fields.
+std::string makePhysicalDeviceIdentity(std::string_view native_device_path,
+                                       std::string_view eid);
 
 // Validates the strict v2 wire contract. V1 retains its legacy optional-field
 // behavior and is validated by the existing RC endpoint path.

@@ -134,10 +134,10 @@ struct UbTransport::Impl {
                 "UB notifications are not supported by protocol version "
                 "1" LOC_MARK);
         }
-        ub::UbRuntimeMode runtime_mode = ub::UbRuntimeMode::kRcLegacy;
-        CHECK_STATUS(ub::resolveUbRuntimeMode(parsed, runtime_mode));
+        ub::UbRuntimeMode selected_mode = ub::UbRuntimeMode::kRcLegacy;
+        CHECK_STATUS(ub::resolveUbRuntimeMode(parsed, selected_mode));
         LOG(INFO) << "UB runtime selection: mode="
-                  << ub::ubRuntimeModeName(runtime_mode)
+                  << ub::ubRuntimeModeName(selected_mode)
                   << " profile="
                   << ub::ubRuntimeProfileName(parsed.runtime_profile)
                   << " trans_mode="
@@ -154,6 +154,7 @@ struct UbTransport::Impl {
         local_topology = std::move(topology);
         conf = std::move(config);
         params = parsed;
+        runtime_mode = selected_mode;
 
         auto status = adapter->initialize();
         if (!status.ok()) return failInstall(status);
@@ -190,6 +191,42 @@ struct UbTransport::Impl {
             by_topology_name.emplace(device.topology_name, std::move(device));
         }
 
+        // RM Legacy capability gate: every selectable device must be a
+        // trusted PHYSICAL device whose provider capabilities pass the
+        // LocalSendProfile derivation (RM transport mode, RM/RTP support,
+        // priority bind mask). The gate runs before any native resource
+        // (context, JFC, Jetty) is created and fails closed with
+        // NotImplemented; there is never a silent fallback to RC or bonding.
+        uint32_t rm_capability_bind_tp_type_mask = 0;
+        if (runtime_mode == ub::UbRuntimeMode::kRmLegacy) {
+            for (const auto& [name, device] : by_topology_name) {
+                if (preferred_topology_names.find(device.topology_name) ==
+                    preferred_topology_names.end()) {
+                    continue;
+                }
+                if (!filterAllows(params.device_filter, device)) continue;
+                if (device.kind != ub::DeviceKind::PHYSICAL) {
+                    return failInstall(Status::NotImplemented(
+                        "RM legacy requires trusted PHYSICAL devices; "
+                        "device " +
+                        device.native_device_name + " is not physical"
+                        LOC_MARK));
+                }
+                ub::LocalSendProfile profile;
+                const auto profile_status = ub::buildLocalSendProfile(
+                    device,
+                    static_cast<uint8_t>(ub::JettyOptions{}.priority),
+                    profile);
+                if (!profile_status.ok()) {
+                    return failInstall(Status::NotImplemented(
+                        "RM legacy capability gate failed for device " +
+                        device.native_device_name + ": " +
+                        profile_status.ToString() LOC_MARK));
+                }
+                rm_capability_bind_tp_type_mask = profile.bind_tp_type_mask;
+            }
+        }
+
         std::vector<std::string> preferred_names;
         std::vector<std::string> skipped_names;
 
@@ -209,6 +246,11 @@ struct UbTransport::Impl {
 
             ub::JfcOptions jfc_options;
             const auto& device_caps = found->second.capabilities;
+            if (runtime_mode == ub::UbRuntimeMode::kRmLegacy) {
+                // RM Legacy creates an RM receive-side JFR; it never falls
+                // back to RC.
+                jfc_options.trans_mode = ub::kUrmaTransportModeRm;
+            }
             if (device_caps.max_jfc_depth != 0) {
                 jfc_options.depth =
                     std::min(jfc_options.depth, device_caps.max_jfc_depth);
@@ -281,6 +323,11 @@ struct UbTransport::Impl {
 
         size_t safe_slice_size = params.slice_size;
         ub::JettyOptions jetty_options;
+        if (runtime_mode == ub::UbRuntimeMode::kRmLegacy) {
+            jetty_options.trans_mode = ub::kUrmaTransportModeRm;
+            jetty_options.bind_tp_type_mask =
+                rm_capability_bind_tp_type_mask;
+        }
         for (const auto& context : contexts) {
             const auto& device_caps = context->deviceInfo().capabilities;
             auto clamp_slice = [&safe_slice_size](uint64_t limit) {
@@ -548,9 +595,17 @@ struct UbTransport::Impl {
             MakeNicPath(local_segment_name,
                         request.local_context->deviceInfo().topology_name);
         UbBootstrapDesc bootstrap;
-        auto status = endpoint->makeBootstrapDesc(
-            local_segment_name, local_path, peer_path,
-            request.segment_generation, bootstrap);
+        Status status;
+        if (runtime_mode == ub::UbRuntimeMode::kRmLegacy) {
+            status = endpoint->makeBootstrapDescV2(
+                local_segment_name, local_path, peer_path,
+                request.segment_generation, node_incarnation, topology_epoch,
+                bootstrap);
+        } else {
+            status = endpoint->makeBootstrapDesc(
+                local_segment_name, local_path, peer_path,
+                request.segment_generation, bootstrap);
+        }
         if (!status.ok()) {
             (void)endpoints->retire(endpoint);
             endpoint.reset();
@@ -559,7 +614,32 @@ struct UbTransport::Impl {
         UbBootstrapDesc response;
         status = ControlClient::bootstrapUb(
             request.remote_segment->rpc_server_addr, bootstrap, response);
-        if (status.ok()) status = endpoint->bind(response);
+        if (status.ok()) {
+            if (runtime_mode == ub::UbRuntimeMode::kRmLegacy) {
+                // Trusted anchors for the peer identity: the registered remote
+                // segment name and the locally constructed peer NIC path. The
+                // remaining device fields are anchored by the control-plane
+                // mediated handshake at the same trust level as the RC v1
+                // endpoint; a mismatch fails closed before any import.
+                ub::UbExpectedPeerIdentity expected;
+                expected.segment_name = request.remote_segment->name;
+                expected.local_nic_path = peer_path;
+                expected.native_device_name = response.local_device_name;
+                expected.device_id = response.local_device_id;
+                expected.eid_index = response.local_eid_index;
+                expected.eid = response.local_eid;
+                expected.physical_device_identity =
+                    response.rm.has_value()
+                        ? response.rm->physical_device_identity
+                        : "";
+                expected.transport_modes = response.rm.has_value()
+                                               ? response.rm->transport_modes
+                                               : 0;
+                status = endpoint->bindRm(response, expected);
+            } else {
+                status = endpoint->bind(response);
+            }
+        }
         if (!status.ok()) {
             (void)endpoints->retire(endpoint);
             endpoint.reset();
@@ -574,11 +654,13 @@ struct UbTransport::Impl {
             response.reply_msg = "UB transport is shutting down";
             return -1;
         }
-        // RC remains on v1. A valid RM v2 request is rejected here because the
-        // RM runtime is not implemented yet; crucially, this precedes endpoint
-        // eviction, Jetty creation and native import/bind side effects.
-        auto gate_status =
-            ub::gateUbBootstrapForMode(ub::UbBootstrapMode::RC, request);
+        // The mode gate precedes endpoint eviction, Jetty creation and native
+        // import/bind side effects. RC remains on v1; RM requires a strict v2
+        // request with no reply_msg.
+        const bool rm_runtime = runtime_mode == ub::UbRuntimeMode::kRmLegacy;
+        auto gate_status = ub::gateUbBootstrapForMode(
+            rm_runtime ? ub::UbBootstrapMode::RM : ub::UbBootstrapMode::RC,
+            request);
         if (!gate_status.ok()) {
             response = request;
             response.reply_msg = gate_status.ToString();
@@ -591,6 +673,9 @@ struct UbTransport::Impl {
             context_it == context_by_topology_name.end()) {
             response.reply_msg = "UB bootstrap selected an unknown local NIC";
             return -1;
+        }
+        if (rm_runtime) {
+            return onBootstrapRm(request, response, context_it->second);
         }
         if (request.local_device_id < 0 || request.local_eid.empty() ||
             request.jetty_ids.empty() || request.endpoint_generation == 0) {
@@ -621,6 +706,49 @@ struct UbTransport::Impl {
         return 0;
     }
 
+    int onBootstrapRm(const UbBootstrapDesc& request, UbBootstrapDesc& response,
+                      const ub::UbContextPtr& context) {
+        // Server-side consumer of the peer's v2 request descriptor. The
+        // identity anchors are the fields the control-plane-mediated
+        // handshake carries (same trust level as the RC v1 request); every
+        // strict v2 validation and the RM target profile checks run in
+        // bindRm before any native import.
+        ub::UbExpectedPeerIdentity expected;
+        expected.segment_name = request.segment_name;
+        expected.local_nic_path = request.local_nic_path;
+        expected.native_device_name = request.local_device_name;
+        expected.device_id = request.local_device_id;
+        expected.eid_index = request.local_eid_index;
+        expected.eid = request.local_eid;
+        expected.physical_device_identity =
+            request.rm.has_value() ? request.rm->physical_device_identity : "";
+        expected.transport_modes =
+            request.rm.has_value() ? request.rm->transport_modes : 0;
+
+        ub::UbEndpointKey key{context->topologyId(), LOCAL_SEGMENT_ID,
+                              request.local_device_id, request.local_nic_path};
+        std::shared_ptr<ub::UbEndpoint> endpoint;
+        auto status = endpoints->getOrCreate(key, context, endpoint);
+        if (status.ok()) status = endpoint->bindRm(request, expected);
+        if (status.ok()) {
+            status = endpoint->makeBootstrapDescV2(
+                local_segment_name, request.peer_nic_path,
+                request.local_nic_path, currentSegmentGeneration(),
+                node_incarnation, topology_epoch, response);
+        }
+        if (status.ok()) {
+            recordReadyEndpoint(endpoint);
+        }
+        if (!status.ok()) {
+            if (endpoint) (void)endpoints->retire(endpoint);
+            response = UbBootstrapDesc{};
+            response.protocol_version = 2;
+            response.reply_msg = status.ToString();
+            return -1;
+        }
+        return 0;
+    }
+
     uint64_t currentSegmentGeneration() const {
         // Buffer generations are carried in buffer metadata. The bootstrap
         // field is a peer restart/refresh hint and must still be nonzero even
@@ -636,6 +764,12 @@ struct UbTransport::Impl {
     std::atomic<bool> shutting_down{false};
     std::atomic<uint64_t> segment_generation{generationSeed()};
     ub::UbParams params;
+    // Resolved once during install and never switched at runtime. RM Legacy
+    // carries the node incarnation and topology epoch published in bootstrap
+    // v2 descriptors; both are transport-lifetime stable in the P1 baseline.
+    ub::UbRuntimeMode runtime_mode{ub::UbRuntimeMode::kRcLegacy};
+    const uint64_t node_incarnation{generationSeed()};
+    const uint64_t topology_epoch{generationSeed()};
     std::string local_segment_name;
     std::shared_ptr<ControlService> metadata;
     std::shared_ptr<Topology> local_topology;

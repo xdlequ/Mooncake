@@ -144,6 +144,22 @@ int compareUint64(uint64_t lhs, uint64_t rhs) {
 
 }  // namespace
 
+std::string makePhysicalDeviceIdentity(std::string_view native_device_path,
+                                       std::string_view eid) {
+    // The first EID group (four hex digits before the first ':') is enough to
+    // disambiguate one physical device path; the full EID remains part of the
+    // trusted identity fields compared separately.
+    std::string_view group = eid;
+    const auto separator = eid.find(':');
+    if (separator != std::string_view::npos) group = eid.substr(0, separator);
+    std::string identity;
+    identity.reserve(native_device_path.size() + 1 + group.size());
+    identity.append(native_device_path);
+    identity.push_back('#');
+    identity.append(group);
+    return identity;
+}
+
 Status validateUbBootstrap(const UbBootstrapDesc& desc) {
     if (desc.protocol_version == 1) return Status::OK();
     if (desc.protocol_version != 2) {

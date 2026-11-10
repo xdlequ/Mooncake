@@ -901,17 +901,48 @@ void UbWorkers::processPending(const PendingSlice& pending,
     work.token = completion_token;
     work.local_segment = local.segment;
     work.remote_segment = remote.segment;
+    // RM Legacy: one slice attempt is one native WR that must reference the
+    // imported target positional with this Jetty; the target is never
+    // substituted by a bound remote Jetty.
+    const bool rm_endpoint = endpoint->rmMode();
+    if (rm_endpoint) work.target = endpoint->rmTarget(worker_index);
     auto jetty = endpoint->jetty(worker_index);
     size_t posted_count = 0;
-    status = jetty ? adapter_->post(jetty, {work}, posted_count)
-                   : Status::InternalError("UB endpoint has no Jetty" LOC_MARK);
+    PostAcceptance acceptance = PostAcceptance::kNotAccepted;
+    if (!jetty) {
+        status = Status::InternalError("UB endpoint has no Jetty" LOC_MARK);
+    } else if (rm_endpoint && !work.target) {
+        status = Status::InternalError(
+            "RM endpoint has no imported target for this Jetty" LOC_MARK);
+    } else {
+        status = adapter_->post(jetty, {work}, posted_count, acceptance);
+    }
     if (posted_count == 1) {
         rail_monitor_->registerPath(path);
-        if (!status.ok()) {
+        if (acceptance == PostAcceptance::kUnknown) {
+            // A contradictory native result cannot prove the WR was rejected:
+            // never roll back or replay; the CQE or the timeout fence settles
+            // the pre-registered owners.
+            LOG(WARNING)
+                << "UB post acceptance is unknown; retaining WR owners until "
+                   "a CQE or fence settles: "
+                << status.ToString();
+        } else if (!status.ok()) {
             LOG_EVERY_N(WARNING, 1000)
                 << "UB post returned an error after accepting the WR: "
                 << status.ToString();
         }
+        return;
+    }
+    if (acceptance == PostAcceptance::kUnknown) {
+        // Zero-count but contradictory: the WR may still have crossed. Keep
+        // the token, buffer, segment and endpoint owners; the timeout fence
+        // settles responsibility. Never replay here.
+        LOG(WARNING)
+            << "UB post acceptance is unknown with no posted WR; retaining "
+               "WR owners until a fence settles: "
+            << status.ToString();
+        rail_monitor_->registerPath(path);
         return;
     }
 

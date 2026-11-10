@@ -17,13 +17,41 @@ uint64_t steadyNowNs() noexcept {
             .count());
 }
 
+uint64_t incarnationSeed() {
+    const auto wall = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    const auto steady = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    const uint64_t seed =
+        (wall ^ (steady << 17) ^ (steady >> 3)) & 0x7fffffffffffffffULL;
+    return seed == 0 ? 1 : seed;
+}
+
+std::atomic<uint64_t> g_next_context_incarnation{incarnationSeed()};
+
 }  // namespace
+
+uint64_t UbContext::allocateIncarnation() noexcept {
+    const uint64_t incarnation =
+        g_next_context_incarnation.fetch_add(1, std::memory_order_relaxed);
+    // Zero is reserved for "no incarnation"; exhausting the 64-bit sequence
+    // would reuse incarnations and is not recoverable.
+    if (incarnation == 0 || incarnation == std::numeric_limits<uint64_t>::max()) {
+        std::terminate();
+    }
+    return incarnation;
+}
 
 UbContext::UbContext(Topology::NicID topology_id, DeviceInfo device,
                      std::shared_ptr<UrmaAdapter> adapter)
     : topology_id_(topology_id),
       device_(std::move(device)),
-      adapter_(std::move(adapter)) {}
+      adapter_(std::move(adapter)),
+      incarnation_(allocateIncarnation()) {}
 
 UbContext::~UbContext() { (void)shutdown(); }
 

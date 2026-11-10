@@ -33,10 +33,12 @@ namespace mooncake {
 namespace tent {
 namespace ub {
 
-// Runtime selection is explicit and fail-closed. The RC legacy data plane is
-// the only mode implemented today; RM legacy and pooled RM must be requested
-// explicitly and are rejected before any native resource is created until
-// their gates are implemented and verified.
+// Runtime selection is explicit and fail-closed. RC legacy is the default.
+// RM legacy must be requested explicitly (runtime_profile=rm_legacy,
+// trans_mode=rm, physical_only=true) and passes the config gate only when
+// every structural constraint holds; provider/capability gates still run at
+// install time before any native resource is created. Pooled RM remains
+// rejected until its gates are implemented and verified.
 enum class UbRuntimeProfile : uint8_t {
     kRcLegacy,
     kRmLegacy,
@@ -548,9 +550,19 @@ inline Status resolveUbRuntimeMode(const UbParams& params,
             return reject(Status::InvalidArgument(
                 "probe.enabled requires runtime_profile=rm_pool"));
         }
-        return reject(Status::NotImplemented(
-            "RM legacy is unsupported: the RM adapter, priority/tp_type and "
-            "bootstrap v2 target gates are not implemented"));
+        if (!params.physical_only) {
+            return reject(Status::InvalidArgument(
+                "runtime_profile=rm_legacy requires physical_only=true"));
+        }
+        // A well-formed RM Legacy configuration passes the config gate. The
+        // provider/capability gates (trusted PHYSICAL identity, RM/RTP
+        // priority masks, bootstrap v2) run during install before any native
+        // resource is created and fail closed with NotImplemented or
+        // InvalidArgument; they never fall back to RC or bonding.
+        mode = UbRuntimeMode::kRmLegacy;
+        VLOG(1) << "UB runtime selection accepted: mode=rm_legacy "
+                << snapshot();
+        return Status::OK();
     }
 
     if (!pool) {

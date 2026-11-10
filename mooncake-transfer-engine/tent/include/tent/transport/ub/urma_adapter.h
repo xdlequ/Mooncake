@@ -86,6 +86,8 @@ inline constexpr size_t kUrmaPriorityCount = 16;
 inline constexpr uint8_t kUrmaTargetTypeJetty = 1;
 inline constexpr uint8_t kUrmaTpTypeRtp = 0;
 inline constexpr uint32_t kUrmaTpTypeRtpMask = 1U << kUrmaTpTypeRtp;
+// Default receive-side JFR token shared by the RC and RM import paths.
+inline constexpr uint32_t kUrmaJfrDefaultToken = 0xACFE;
 
 // Adapter-neutral subset of the capabilities needed by the TENT UB data
 // plane. Values of zero mean that the provider did not report a limit.
@@ -221,11 +223,24 @@ class Jetty : public OpaqueHandle {
     [[nodiscard]] virtual uint32_t uasid() const noexcept = 0;
 };
 
+// RM Legacy imported remote target. One handle represents one peer Jetty
+// imported into a local context; it is referenced explicitly by each RM WR
+// and is never bound to a local Jetty. Ownership follows the endpoint
+// incarnation: the owner may release the handle only after every WR that
+// referenced it has completed or a provider fence proved it is unreferenced.
+class RemoteTarget : public OpaqueHandle {
+   public:
+    [[nodiscard]] virtual uint32_t id() const noexcept = 0;
+    [[nodiscard]] virtual uint32_t uasid() const noexcept = 0;
+    [[nodiscard]] virtual const std::string& eid() const noexcept = 0;
+};
+
 using ContextPtr = std::shared_ptr<Context>;
 using JfcPtr = std::shared_ptr<Jfc>;
 using LocalSegmentPtr = std::shared_ptr<LocalSegment>;
 using RemoteSegmentPtr = std::shared_ptr<RemoteSegment>;
 using JettyPtr = std::shared_ptr<Jetty>;
+using RemoteTargetPtr = std::shared_ptr<RemoteTarget>;
 
 enum SegmentAccess : uint32_t {
     SEGMENT_ACCESS_READ = 1U << 0,
@@ -245,8 +260,11 @@ struct SegmentOptions {
 struct JfcOptions {
     uint32_t depth = 4096;
     uint32_t receiver_depth = 2048;
-    uint32_t token = 0xACFE;
+    uint32_t token = kUrmaJfrDefaultToken;
     bool enable_completion_events = false;
+    // RM Legacy: drives the native JFR transport mode. Defaults to RC so the
+    // RC legacy baseline is byte-for-byte unchanged.
+    uint16_t trans_mode = kUrmaTransportModeRc;
 };
 
 struct JettyOptions {
@@ -255,6 +273,12 @@ struct JettyOptions {
     uint8_t max_sge = 1;
     uint8_t rnr_retry = 7;
     uint8_t error_timeout = 17;
+    // RM Legacy: drives the native JFS transport mode and the RTP bind mask.
+    // Both are derived from the trusted LocalSendProfile at install time and
+    // are never taken from peer-supplied bootstrap fields. Defaults keep the
+    // RC legacy creation path unchanged.
+    uint16_t trans_mode = kUrmaTransportModeRc;
+    uint32_t bind_tp_type_mask = 0;
 };
 
 struct RemoteJettyInfo {
@@ -269,6 +293,52 @@ enum class Operation : uint8_t {
     WRITE,
 };
 
+// RM Legacy acceptance classification for a post attempt. The classification
+// decides resource responsibility:
+//  - kNotAccepted: the provider definitively rejected the WR before accepting
+//    it. The caller may roll back the pre-registered responsibility exactly
+//    once and retry as a new attempt.
+//  - kAccepted: the WR crossed the native boundary. The caller must wait for
+//    a real CQE or a successful fence; it must never roll back early.
+//  - kUnknown: acceptance cannot be established (contradictory status/count
+//    or an unclassifiable provider error). The caller must not replay the WR
+//    and must keep the token, buffer, segment and endpoint owners alive until
+//    a synchronous fence settles the responsibility.
+enum class PostAcceptance : uint8_t {
+    kAccepted,
+    kNotAccepted,
+    kUnknown,
+};
+
+inline const char* postAcceptanceName(PostAcceptance acceptance) noexcept {
+    switch (acceptance) {
+        case PostAcceptance::kAccepted:
+            return "accepted";
+        case PostAcceptance::kNotAccepted:
+            return "not_accepted";
+        case PostAcceptance::kUnknown:
+            return "unknown";
+    }
+    return "unknown";
+}
+
+// Maps the legacy post contract (status + accepted prefix count) onto the RM
+// acceptance states for a whole post attempt. A successful post that accepted
+// every request is Accepted; a failed post that accepted nothing is
+// NotAccepted; every contradictory combination (partial acceptance, success
+// with a short count, failure with a nonzero count) is Unknown.
+inline PostAcceptance classifyPostAcceptance(const Status& post_status,
+                                             size_t posted_count,
+                                             size_t request_count) noexcept {
+    if (post_status.ok() && posted_count == request_count) {
+        return PostAcceptance::kAccepted;
+    }
+    if (!post_status.ok() && posted_count == 0) {
+        return PostAcceptance::kNotAccepted;
+    }
+    return PostAcceptance::kUnknown;
+}
+
 struct WorkRequest {
     Operation operation = Operation::READ;
     uint64_t local_address = 0;
@@ -281,6 +351,11 @@ struct WorkRequest {
 
     LocalSegmentPtr local_segment;
     RemoteSegmentPtr remote_segment;
+
+    // RM Legacy: the explicit imported target for this WR. RM posts must set
+    // it; RC posts must leave it null. The adapter never substitutes a bound
+    // remote Jetty for a missing RM target.
+    RemoteTargetPtr target;
 };
 
 enum class CompletionCategory : uint8_t {
@@ -348,10 +423,40 @@ class UrmaAdapter {
                                const JettyOptions& options,
                                JettyPtr& jetty) = 0;
     virtual Status deleteJetty(JettyPtr& jetty) = 0;
+    // RC-only connection operations. RM Legacy never calls bindJetty or
+    // unbindJetty: every RM WR carries its own explicit imported target.
     virtual Status bindJetty(const JettyPtr& jetty,
                              const RemoteJettyInfo& remote) = 0;
     virtual Status unbindJetty(const JettyPtr& jetty) = 0;
     virtual Status resetJetty(const JettyPtr& jetty) = 0;
+
+    // RM Legacy remote target import. The descriptor must be a validated
+    // bootstrap v2 target (RM/JETTY/RTP profile); the adapter maps it onto
+    // the native import call and never derives the target from a local bind.
+    // unimportRemoteTarget follows the same retryable shared_ptr contract as
+    // the other release operations and must only be called after every WR
+    // referencing the target has completed or been fenced.
+    virtual Status importRemoteTarget(const ContextPtr& context,
+                                      const std::string& eid, uint32_t uasid,
+                                      uint32_t id, uint16_t trans_mode,
+                                      uint8_t target_type, uint8_t tp_type,
+                                      RemoteTargetPtr& target) {
+        (void)context;
+        (void)eid;
+        (void)uasid;
+        (void)id;
+        (void)trans_mode;
+        (void)target_type;
+        (void)tp_type;
+        (void)target;
+        return Status::NotImplemented(
+            "RM remote target import is not supported by this adapter");
+    }
+    virtual Status unimportRemoteTarget(RemoteTargetPtr& target) {
+        if (!target) return Status::OK();
+        return Status::NotImplemented(
+            "RM remote target unimport is not supported by this adapter");
+    }
 
     // Synchronously fences one Jetty. A successful return guarantees that no
     // previously posted WR on this Jetty can perform any further DMA. The
@@ -370,6 +475,20 @@ class UrmaAdapter {
     virtual Status post(const JettyPtr& jetty,
                         const std::vector<WorkRequest>& requests,
                         size_t& posted_count) = 0;
+
+    // RM Legacy post with explicit acceptance classification. The default
+    // implementation derives the classification from the legacy post contract
+    // so RC-oriented adapters keep their exact behavior; adapters with native
+    // RM acceptance semantics override it.
+    virtual Status post(const JettyPtr& jetty,
+                        const std::vector<WorkRequest>& requests,
+                        size_t& posted_count, PostAcceptance& acceptance) {
+        auto status = post(jetty, requests, posted_count);
+        acceptance = classifyPostAcceptance(status, posted_count,
+                                            requests.size());
+        return status;
+    }
+
     virtual Status poll(const JfcPtr& jfc, size_t max_completions,
                         std::vector<Completion>& completions) = 0;
 };

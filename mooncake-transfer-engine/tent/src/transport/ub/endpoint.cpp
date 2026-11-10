@@ -76,13 +76,22 @@ UbEndpoint::~UbEndpoint() {
     if (!status.ok() || outstanding_wrs_.load(std::memory_order_relaxed) != 0) {
         // A caller that drops the final endpoint reference after a failed
         // native fence must not let Jetty destructors force RESET/delete. A
-        // process-lifetime quarantine is safer than DMA-after-free.
+        // process-lifetime quarantine is safer than DMA-after-free. Imported
+        // RM targets are quarantined together with the Jettys: a WR that was
+        // never proven complete may still reference them.
         static auto* leaked = new std::vector<JettyPtr>();
+        static auto* leaked_targets = new std::vector<RemoteTargetPtr>();
         static auto* leaked_mutex = new std::mutex();
         std::scoped_lock lock(lifecycle_mutex_, *leaked_mutex);
         leaked->insert(leaked->end(), std::make_move_iterator(jetties_.begin()),
                        std::make_move_iterator(jetties_.end()));
         jetties_.clear();
+        leaked_targets->insert(leaked_targets->end(),
+                               std::make_move_iterator(
+                                   imported_targets_.begin()),
+                               std::make_move_iterator(
+                                   imported_targets_.end()));
+        imported_targets_.clear();
     }
 }
 
@@ -101,8 +110,35 @@ Status UbEndpoint::resetAndUnbindLocked() {
         // Unimporting a peer before RESET succeeds can sever resources still
         // referenced by hardware. Keep this Jetty intact for a retry.
         if (!reset_status.ok()) continue;
-        rememberFirstError(adapter_->unbindJetty(*it), first_error);
+        // RM Legacy never calls bindJetty/unbindJetty: WRs reference explicit
+        // imported targets instead of a bound remote Jetty. RESET remains part
+        // of the accepted provider delete contract for this Jetty.
+        if (!rmMode()) {
+            rememberFirstError(adapter_->unbindJetty(*it), first_error);
+        }
     }
+    return first_error;
+}
+
+Status UbEndpoint::unimportTargetsLocked() {
+    Status first_error = Status::OK();
+    if (imported_targets_.empty()) return first_error;
+    if (!adapter_) {
+        return Status::InternalError(
+            "UB endpoint cannot unimport RM targets without an adapter"
+            LOC_MARK);
+    }
+    std::vector<RemoteTargetPtr> retained;
+    for (size_t index = imported_targets_.size(); index > 0; --index) {
+        auto& target = imported_targets_[index - 1];
+        if (!target) continue;
+        auto status = adapter_->unimportRemoteTarget(target);
+        rememberFirstError(status, first_error);
+        // A failed unimport leaves the handle owned by this incarnation; it
+        // is never dereferenced blindly or retried without a budget.
+        if (!status.ok()) retained.push_back(std::move(target));
+    }
+    imported_targets_ = std::move(retained);
     return first_error;
 }
 
@@ -157,8 +193,14 @@ Status UbEndpoint::failLocked(Status status) {
     lifecycle_status_ = status;
     state_.store(State::kFailed, std::memory_order_release);
 
+    // Roll back native dependencies in reverse creation order. Imported RM
+    // targets are released only after every Jetty that could reference them
+    // has been deleted.
     rememberFirstError(resetAndUnbindLocked(), retire_status_);
     rememberFirstError(deleteJettysLocked(), retire_status_);
+    if (jetties_.empty()) {
+        rememberFirstError(unimportTargetsLocked(), retire_status_);
+    }
     return lifecycle_status_;
 }
 
@@ -244,6 +286,10 @@ Status UbEndpoint::prepare() {
 
 Status UbEndpoint::bind(const UbBootstrapDesc& peer) {
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    if (rmMode()) {
+        return Status::InvalidArgument(
+            "RM Legacy endpoints must use bindRm, not RC bind" LOC_MARK);
+    }
     const State current = state_.load(std::memory_order_relaxed);
     if (current == State::kReady) {
         if (samePeer(peer_, peer)) return Status::OK();
@@ -304,12 +350,111 @@ Status UbEndpoint::bind(const UbBootstrapDesc& peer) {
     return Status::OK();
 }
 
+Status UbEndpoint::bindRm(const UbBootstrapDesc& peer,
+                          const UbExpectedPeerIdentity& expected) {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    if (!rmMode()) {
+        return Status::InvalidArgument(
+            "RC legacy endpoints must use bind, not bindRm" LOC_MARK);
+    }
+    const State current = state_.load(std::memory_order_relaxed);
+    if (current == State::kReady) {
+        if (samePeer(peer_, peer)) return Status::OK();
+        return Status::InvalidArgument(
+            "UB endpoint is already bound to another peer generation" LOC_MARK);
+    }
+    if (current == State::kFailed) return lifecycle_status_;
+    if (current != State::kPrepared) {
+        return Status::InvalidArgument(
+            "UB endpoint must be prepared before bindRm" LOC_MARK);
+    }
+
+    state_.store(State::kBinding, std::memory_order_release);
+    if (!peer.reply_msg.empty()) {
+        return failLocked(Status::RpcServiceError(
+            std::string("Peer rejected UB bootstrap: ") + peer.reply_msg));
+    }
+    if (peer.protocol_version != 2 || !peer.rm.has_value()) {
+        return failLocked(Status::InvalidArgument(
+            "RM bootstrap requires a v2 descriptor with an RM payload"
+            LOC_MARK));
+    }
+    auto valid_status = validateUbBootstrap(peer);
+    if (!valid_status.ok()) return failLocked(std::move(valid_status));
+    const UbRmBootstrapDesc& rm = *peer.rm;
+    if (rm.transport_mode != "RM" || rm.device_kind != "PHYSICAL") {
+        return failLocked(Status::InvalidArgument(
+            "RM bootstrap must declare transport_mode=RM and "
+            "device_kind=PHYSICAL" LOC_MARK));
+    }
+    // Identity gate: every peer-asserted identity field must match the
+    // trusted metadata the transport derived (registered segment name, the
+    // locally constructed peer NIC path, and the control-plane-anchored
+    // device fields). Mismatch fails closed; nothing is imported.
+    auto identity_status = validateUbBootstrapV2PeerIdentity(peer, expected);
+    if (!identity_status.ok()) {
+        return failLocked(Status::InvalidArgument(
+            "Peer RM bootstrap identity does not match trusted metadata: " +
+            identity_status.ToString() LOC_MARK));
+    }
+    if (rm.targets.size() != jetties_.size()) {
+        return failLocked(
+            Status::InvalidArgument("Peer RM target count does not match "
+                                    "local endpoint" LOC_MARK));
+    }
+    for (const auto& target : rm.targets) {
+        if (target.eid != peer.local_eid || target.id == 0 ||
+            target.target_epoch != peer.endpoint_generation ||
+            target.profile.trans_mode != kUrmaTransportModeRm ||
+            target.profile.target_type != kUrmaTargetTypeJetty ||
+            target.profile.tp_type != kUrmaTpTypeRtp) {
+            return failLocked(Status::InvalidArgument(
+                "Peer RM target descriptor violates the RM/RTP profile "
+                "contract" LOC_MARK));
+        }
+    }
+
+    // Import every peer target owned by this endpoint incarnation. A failed
+    // import rolls back the targets imported by this attempt in reverse order
+    // before the incarnation is marked failed.
+    std::vector<RemoteTargetPtr> imported;
+    imported.reserve(rm.targets.size());
+    for (const auto& target : rm.targets) {
+        RemoteTargetPtr handle;
+        auto status = adapter_->importRemoteTarget(
+            context_->handle(), target.eid, target.uasid, target.id,
+            target.profile.trans_mode, target.profile.target_type,
+            target.profile.tp_type, handle);
+        if (!status.ok()) {
+            for (size_t index = imported.size(); index > 0; --index) {
+                RemoteTargetPtr rollback = std::move(imported[index - 1]);
+                (void)adapter_->unimportRemoteTarget(rollback);
+            }
+            return failLocked(std::move(status));
+        }
+        imported.push_back(std::move(handle));
+    }
+
+    // Compare-and-commit: the incumbent state is only replaced after every
+    // validation and import succeeded.
+    imported_targets_ = std::move(imported);
+    peer_ = peer;
+    peer_generation_.store(peer.endpoint_generation, std::memory_order_release);
+    lifecycle_status_ = Status::OK();
+    state_.store(State::kReady, std::memory_order_release);
+    return Status::OK();
+}
+
 Status UbEndpoint::makeBootstrapDesc(const std::string& segment_name,
                                      const std::string& local_nic_path,
                                      const std::string& peer_nic_path,
                                      uint64_t segment_generation,
                                      UbBootstrapDesc& output) const {
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    if (rmMode()) {
+        return Status::InvalidArgument(
+            "RM Legacy endpoints must use makeBootstrapDescV2" LOC_MARK);
+    }
     const State current = state_.load(std::memory_order_relaxed);
     if (current != State::kPrepared && current != State::kReady) {
         return Status::InvalidArgument(
@@ -341,6 +486,74 @@ Status UbEndpoint::makeBootstrapDesc(const std::string& segment_name,
     output.endpoint_generation = generation_;
     output.segment_generation = segment_generation;
     output.capabilities = {"read", "write", "endpoint_generation"};
+    return Status::OK();
+}
+
+Status UbEndpoint::makeBootstrapDescV2(const std::string& segment_name,
+                                       const std::string& local_nic_path,
+                                       const std::string& peer_nic_path,
+                                       uint64_t segment_generation,
+                                       uint64_t node_incarnation,
+                                       uint64_t topology_epoch,
+                                       UbBootstrapDesc& output) const {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    if (!rmMode()) {
+        return Status::InvalidArgument(
+            "RC legacy endpoints must use makeBootstrapDesc" LOC_MARK);
+    }
+    const State current = state_.load(std::memory_order_relaxed);
+    if (current != State::kPrepared && current != State::kReady) {
+        return Status::InvalidArgument(
+            "UB endpoint must be prepared before bootstrap" LOC_MARK);
+    }
+
+    const auto& device = context_->deviceInfo();
+    const std::string local_identity =
+        makePhysicalDeviceIdentity(device.native_device_path, device.eid);
+
+    output = UbBootstrapDesc{};
+    output.protocol_version = 2;
+    output.segment_name = segment_name;
+    output.local_nic_path = local_nic_path.empty()
+                                ? device.native_device_path
+                                : local_nic_path;
+    output.peer_nic_path =
+        peer_nic_path.empty() ? key_.peer_nic_path : peer_nic_path;
+    output.local_device_name = device.native_device_name;
+    output.local_device_id = context_->topologyId();
+    output.local_eid_index = static_cast<int>(device.eid_index);
+    output.local_eid = device.eid;
+    output.endpoint_generation = generation_;
+    output.segment_generation = segment_generation;
+
+    UbRmBootstrapDesc rm;
+    rm.transport_mode = "RM";
+    rm.device_kind = std::string(deviceKindName(device.kind));
+    rm.physical_device_identity = local_identity;
+    rm.node_incarnation = node_incarnation;
+    rm.context_incarnation = context_->incarnation();
+    rm.topology_epoch = topology_epoch;
+    rm.transport_modes = device.capabilities.transport_modes;
+    rm.provider_capabilities = {"rm_read", "rm_write"};
+    rm.targets.reserve(jetties_.size());
+    for (const auto& jetty : jetties_) {
+        if (!jetty || !jetty->valid() || jetty->id() == 0) {
+            return Status::InternalError(
+                "UB endpoint contains an invalid Jetty" LOC_MARK);
+        }
+        UbRmTargetDescriptor target;
+        target.target_identity = local_identity + "#jetty#" +
+                                 std::to_string(jetty->id());
+        target.eid = device.eid;
+        target.uasid = jetty->uasid();
+        target.id = jetty->id();
+        target.target_epoch = generation_;
+        target.profile.trans_mode = jetty_options_.trans_mode;
+        target.profile.target_type = kUrmaTargetTypeJetty;
+        target.profile.tp_type = kUrmaTpTypeRtp;
+        rm.targets.push_back(std::move(target));
+    }
+    output.rm = std::move(rm);
     return Status::OK();
 }
 
@@ -396,6 +609,19 @@ Status UbEndpoint::finishRetireLocked() {
     if (!delete_status.ok()) {
         retire_status_ = delete_status;
         return delete_status;
+    }
+    // Imported RM targets are unimported only after every Jetty that could
+    // reference them has been deleted; a failed unimport keeps the handle
+    // owned and leaves the incarnation short of kDestroyed.
+    auto unimport_status = unimportTargetsLocked();
+    if (!unimport_status.ok()) {
+        retire_status_ = unimport_status;
+        return unimport_status;
+    }
+    if (!imported_targets_.empty()) {
+        retire_status_ = Status::InternalError(
+            "UB endpoint retains RM targets whose unimport failed" LOC_MARK);
+        return retire_status_;
     }
     retire_status_ = Status::OK();
     peer_ = UbBootstrapDesc{};
@@ -508,6 +734,17 @@ size_t UbEndpoint::jfcIndex(size_t jetty_index) const {
 std::vector<JettyPtr> UbEndpoint::jetties() const {
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);
     return jetties_;
+}
+
+RemoteTargetPtr UbEndpoint::rmTarget(size_t jetty_index) const {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    if (imported_targets_.empty()) return nullptr;
+    return imported_targets_[jetty_index % imported_targets_.size()];
+}
+
+size_t UbEndpoint::importedTargetCount() const {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    return imported_targets_.size();
 }
 
 Status UbEndpoint::lifecycleStatus() const {
