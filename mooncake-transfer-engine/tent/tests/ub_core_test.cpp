@@ -187,7 +187,8 @@ UbBootstrapDesc makeValidRmBootstrap() {
     rm.transport_mode = "RM";
     rm.device_kind = "PHYSICAL";
     rm.physical_device_identity = "/dev/uburma/udma0#0001";
-    rm.node_incarnation = 1;
+    // 父代际变小 -> kStale
+    rm.node_incarnation = 2;
     rm.context_incarnation = 2;
     rm.topology_epoch = 3;
     rm.transport_modes = 3;
