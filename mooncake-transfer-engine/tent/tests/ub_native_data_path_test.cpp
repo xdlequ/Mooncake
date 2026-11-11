@@ -1626,9 +1626,9 @@ UbExpectedPeerIdentity expectedForRmPeer(const UbBootstrapDesc& desc) {
 }
 
 TEST(UbRmLegacyTest, EndpointProducesV2AndImportsPeerTargets) {
-    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    auto adapter = std::make_shared<FakeUrmaAdapter>(rmCapableDevice());
     ASSERT_TRUE(adapter->initialize().ok());
-    auto context = std::make_shared<UbContext>(0, fakeDevice(), adapter);
+    auto context = std::make_shared<UbContext>(0, rmCapableDevice(), adapter);
     ASSERT_TRUE(context->initialize(1, JfcOptions{}).ok());
     auto endpoint = std::make_shared<UbEndpoint>(
         UbEndpointKey{0, 123, 9, "peer/ub:fake0:eid0"}, context, adapter, 1,
@@ -1698,9 +1698,9 @@ TEST(UbRmLegacyTest, EndpointProducesV2AndImportsPeerTargets) {
 }
 
 TEST(UbRmLegacyTest, BindRmRejectsBadDescriptorsAndRollsBackImports) {
-    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    auto adapter = std::make_shared<FakeUrmaAdapter>(rmCapableDevice());
     ASSERT_TRUE(adapter->initialize().ok());
-    auto context = std::make_shared<UbContext>(0, fakeDevice(), adapter);
+    auto context = std::make_shared<UbContext>(0, rmCapableDevice(), adapter);
     ASSERT_TRUE(context->initialize(1, JfcOptions{}).ok());
 
     auto make_endpoint = [&] {
@@ -1770,9 +1770,9 @@ TEST(UbRmLegacyTest, BindRmRejectsBadDescriptorsAndRollsBackImports) {
 }
 
 TEST(UbRmLegacyTest, RetireRetainsTargetWhenUnimportFailsAndRetries) {
-    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    auto adapter = std::make_shared<FakeUrmaAdapter>(rmCapableDevice());
     ASSERT_TRUE(adapter->initialize().ok());
-    auto context = std::make_shared<UbContext>(0, fakeDevice(), adapter);
+    auto context = std::make_shared<UbContext>(0, rmCapableDevice(), adapter);
     ASSERT_TRUE(context->initialize(1, JfcOptions{}).ok());
     auto endpoint = std::make_shared<UbEndpoint>(
         UbEndpointKey{0, 123, 9, "peer/ub:fake0:eid0"}, context, adapter, 2,

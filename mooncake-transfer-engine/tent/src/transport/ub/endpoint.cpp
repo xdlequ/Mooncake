@@ -395,7 +395,7 @@ Status UbEndpoint::bindRm(const UbBootstrapDesc& peer,
     if (!identity_status.ok()) {
         return failLocked(Status::InvalidArgument(
             "Peer RM bootstrap identity does not match trusted metadata: " +
-            identity_status.ToString() LOC_MARK));
+            identity_status.ToString() + LOC_MARK));
     }
     if (rm.targets.size() != jetties_.size()) {
         return failLocked(

@@ -561,7 +561,8 @@ if(USE_UB)
 
   add_executable(
     tent_ub_teardown_test
-    ub_teardown_test.cpp ../src/transport/ub/buffers.cpp
+    ub_teardown_test.cpp ../src/transport/ub/bootstrap.cpp
+    ../src/transport/ub/buffers.cpp
     ../src/transport/ub/context.cpp ../src/transport/ub/endpoint.cpp
     ../src/transport/ub/endpoint_store.cpp ../src/transport/ub/jfc.cpp)
   target_link_libraries(tent_ub_teardown_test PRIVATE tent_common gtest

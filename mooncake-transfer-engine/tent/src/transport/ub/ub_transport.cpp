@@ -221,7 +221,7 @@ struct UbTransport::Impl {
                     return failInstall(Status::NotImplemented(
                         "RM legacy capability gate failed for device " +
                         device.native_device_name + ": " +
-                        profile_status.ToString() LOC_MARK));
+                        profile_status.ToString() + LOC_MARK));
                 }
                 rm_capability_bind_tp_type_mask = profile.bind_tp_type_mask;
             }
