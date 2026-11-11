@@ -108,7 +108,7 @@ void Topology::print() const {
     }
 }
 
-Status Topology::discover(const std::vector<Platform*>& platforms, const Config& conf) {
+Status Topology::discover(const std::vector<Platform*>& platforms, const Config* conf) {
     clear();
     for (auto& entry : platforms) {
         CHECK_STATUS(entry->probe(nic_list_, mem_list_));
@@ -121,13 +121,13 @@ Status Topology::discover(const std::vector<Platform*>& platforms, const Config&
         std::vector<std::string> ub_whitelist;
         std::vector<std::string> ub_blacklist;
         if(conf) {
-            ub_whitelist = conf.getArray<std::string>("topology/rdma_whitelist");
-            ub_blacklist = conf.getArray<std::string>("topology/rdma_blacklist");
+            ub_whitelist = conf->getArray<std::string>("topology/rdma_whitelist");
+            ub_blacklist = conf->getArray<std::string>("topology/rdma_blacklist");
         }
         const auto ub_device_allowed = [&](const std::string& name) {
             if (ub_whitelist.empty() && ub_blacklist.empty()) return true;
             if (!ub_whitelist.empty() &&
-                std::find(ub_whitelist.begin(), ub_whitelist.end(), name) !=
+                std::find(ub_whitelist.begin(), ub_whitelist.end(), name) ==
                     ub_whitelist.end()) {
                 return false;
             }

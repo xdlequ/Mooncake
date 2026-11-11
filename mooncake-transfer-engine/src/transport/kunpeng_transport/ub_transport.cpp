@@ -537,7 +537,6 @@ int UbTransport::initializeUbResources(UbTransport* t) {
         LOG(ERROR) << "UbTransport: No available RNIC";
         return ERR_DEVICE_NOT_FOUND;
     }
-}
 
     LOG(INFO) << "ub resources init success";
     return 0;
