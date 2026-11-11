@@ -1606,6 +1606,7 @@ JettyOptions rmJettyOptions() {
 DeviceInfo rmCapableDevice() {
     auto device = fakeDevice();
     device.capabilities.transport_modes = 3;  // RC|RM
+    device.kind = DeviceKind::PHYSICAL;
     device.capabilities.rm_tp_cap = kUrmaTpTypeRtpMask;
     device.capabilities.priority_tp_type_masks[kUrmaMaxPriority] =
         kUrmaTpTypeRtpMask;

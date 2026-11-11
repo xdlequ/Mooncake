@@ -419,6 +419,7 @@ Status UbEndpoint::bindRm(const UbBootstrapDesc& peer,
     // before the incarnation is marked failed.
     std::vector<RemoteTargetPtr> imported;
     imported.reserve(rm.targets.size());
+    Status first_error = Status::OK();
     for (const auto& target : rm.targets) {
         RemoteTargetPtr handle;
         auto status = adapter_->importRemoteTarget(
@@ -426,13 +427,19 @@ Status UbEndpoint::bindRm(const UbBootstrapDesc& peer,
             target.profile.trans_mode, target.profile.target_type,
             target.profile.tp_type, handle);
         if (!status.ok()) {
-            for (size_t index = imported.size(); index > 0; --index) {
-                RemoteTargetPtr rollback = std::move(imported[index - 1]);
-                (void)adapter_->unimportRemoteTarget(rollback);
+            if (first_error.ok()) {
+                first_error = std::move(status);
             }
-            return failLocked(std::move(status));
+            continue;
         }
         imported.push_back(std::move(handle));
+    }
+    if (!first_error.ok()) {
+        for (size_t index = imported.size(); index > 0; --index) {
+            RemoteTargetPtr rollback = std::move(imported[index - 1]);
+            (void)adapter_->unimportRemoteTarget(rollback);
+        }
+        return failLocked(std::move(first_error));
     }
 
     // Compare-and-commit: the incumbent state is only replaced after every
@@ -508,6 +515,10 @@ Status UbEndpoint::makeBootstrapDescV2(const std::string& segment_name,
     }
 
     const auto& device = context_->deviceInfo();
+    if (device.kind != DeviceKind::PHYSICAL) {
+        return Status::InvalidArgument(
+            "RM bootstrap may only be produced by a trusted physical device" LOC_MARK);
+    }
     const std::string local_identity =
         makePhysicalDeviceIdentity(device.native_device_path, device.eid);
 
@@ -528,13 +539,13 @@ Status UbEndpoint::makeBootstrapDescV2(const std::string& segment_name,
 
     UbRmBootstrapDesc rm;
     rm.transport_mode = "RM";
-    rm.device_kind = std::string(deviceKindName(device.kind));
+    rm.device_kind = "PHYSICAL";
     rm.physical_device_identity = local_identity;
     rm.node_incarnation = node_incarnation;
     rm.context_incarnation = context_->incarnation();
     rm.topology_epoch = topology_epoch;
     rm.transport_modes = device.capabilities.transport_modes;
-    rm.provider_capabilities = {"rm_read", "rm_write"};
+    rm.provider_capabilities = {"read", "write", "rm"};
     rm.targets.reserve(jetties_.size());
     for (const auto& jetty : jetties_) {
         if (!jetty || !jetty->valid() || jetty->id() == 0) {
