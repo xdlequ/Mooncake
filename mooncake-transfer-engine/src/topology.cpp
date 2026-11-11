@@ -460,10 +460,6 @@ static std::vector<UBDevice> listUBDevices(
     int num_devices = 0;
     std::vector<UBDevice> devices;
     urma_init_attr_t init_attr = {};
-<<<<<<< Updated upstream
-    init_attr.version = URMA_INIT_ATTR_VERSION;
-=======
->>>>>>> Stashed changes
     auto init_ret = urma_init(&init_attr);
     const bool urma_initialized_here = init_ret == URMA_SUCCESS;
     if (!urma_initialized_here && init_ret != URMA_SUCCESS) {
