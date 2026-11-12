@@ -415,8 +415,12 @@ Status UbEndpoint::bindRm(const UbBootstrapDesc& peer,
     }
 
     // Import every peer target owned by this endpoint incarnation. A failed
-    // import rolls back the targets imported by this attempt in reverse order
-    // before the incarnation is marked failed.
+    // import publishes the partial import set to this incarnation so the
+    // retire cleanup owns every handle: failLocked() unimports them in
+    // reverse order, retains handles whose unimport fails, and the destructor
+    // quarantine takes over persistent failures. A provider may also return a
+    // partially allocated handle alongside the error (same contract as
+    // createJetty in prepare()); such handles are adopted, never dropped.
     std::vector<RemoteTargetPtr> imported;
     imported.reserve(rm.targets.size());
     Status first_error = Status::OK();
@@ -427,6 +431,9 @@ Status UbEndpoint::bindRm(const UbBootstrapDesc& peer,
             target.profile.trans_mode, target.profile.target_type,
             target.profile.tp_type, handle);
         if (!status.ok()) {
+            if (handle) {
+                imported.push_back(std::move(handle));
+            }
             if (first_error.ok()) {
                 first_error = std::move(status);
             }
@@ -435,10 +442,7 @@ Status UbEndpoint::bindRm(const UbBootstrapDesc& peer,
         imported.push_back(std::move(handle));
     }
     if (!first_error.ok()) {
-        for (size_t index = imported.size(); index > 0; --index) {
-            RemoteTargetPtr rollback = std::move(imported[index - 1]);
-            (void)adapter_->unimportRemoteTarget(rollback);
-        }
+        imported_targets_ = std::move(imported);
         return failLocked(std::move(first_error));
     }
 

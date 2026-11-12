@@ -328,6 +328,11 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         }
         if (fail_imports_.load(std::memory_order_acquire) > 0) {
             fail_imports_.fetch_sub(1, std::memory_order_acq_rel);
+            if (partial_import_on_failure_.load(std::memory_order_acquire)) {
+                // Provider contract: a failed import may still return a
+                // partially allocated handle the caller must adopt.
+                target = std::make_shared<FakeRemoteTarget>(eid, uasid, id);
+            }
             return Status::RdmaError("injected import failure");
         }
         imported_ids_.push_back(id);
@@ -474,6 +479,9 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     void failNextImports(int count) {
         fail_imports_.store(count, std::memory_order_release);
     }
+    void setPartialImportOnFailure(bool enabled) {
+        partial_import_on_failure_.store(enabled, std::memory_order_release);
+    }
     void failNextUnimports(int count) {
         fail_unimports_.store(count, std::memory_order_release);
     }
@@ -542,6 +550,7 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     std::atomic<bool> fail_next_post_{false};
     std::atomic<bool> accept_then_fail_post_{false};
     std::atomic<int> fail_imports_{0};
+    std::atomic<bool> partial_import_on_failure_{false};
     std::atomic<int> fail_unimports_{0};
     std::atomic<bool> drop_next_quiesced_completion_{false};
     std::atomic<bool> fail_next_quiesce_{false};
@@ -1809,6 +1818,93 @@ TEST(UbRmLegacyTest, RetireRetainsTargetWhenUnimportFailsAndRetries) {
     EXPECT_EQ(endpoint->state(), UbEndpoint::State::kDestroyed);
     EXPECT_EQ(endpoint->importedTargetCount(), 0U);
     EXPECT_EQ(adapter->unimportCalls(), 3U);
+
+    EXPECT_TRUE(context->shutdown().ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+// P1-01: a failed import may still return a partially allocated handle. The
+// endpoint must adopt it and roll it back through the audited unimport path
+// instead of dropping it via the local shared_ptr destructor.
+TEST(UbRmLegacyTest, BindRmAdoptsPartialHandleFromFailedImport) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(rmCapableDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    auto context = std::make_shared<UbContext>(0, rmCapableDevice(), adapter);
+    ASSERT_TRUE(context->initialize(1, JfcOptions{}).ok());
+    auto endpoint = std::make_shared<UbEndpoint>(
+        UbEndpointKey{0, 123, 9, "peer/ub:fake0:eid0"}, context, adapter, 2,
+        rmJettyOptions());
+    ASSERT_TRUE(endpoint->prepare().ok());
+
+    UbBootstrapDesc local;
+    ASSERT_TRUE(endpoint
+                    ->makeBootstrapDescV2("seg-a", "seg-a/ub:fake0:eid0",
+                                          "seg-b/ub:fake0:eid0", 5, 1, 1,
+                                          local)
+                    .ok());
+    auto peer = local;
+    peer.segment_name = "seg-b";
+    peer.local_nic_path = "seg-b/ub:fake0:eid0";
+    peer.peer_nic_path = "seg-a/ub:fake0:eid0";
+
+    // The second import fails but still returns a handle: both the first
+    // target and the adopted partial handle must be rolled back.
+    adapter->failNextImports(1);
+    adapter->setPartialImportOnFailure(true);
+    EXPECT_TRUE(
+        endpoint->bindRm(peer, expectedForRmPeer(peer)).IsRdmaError());
+    EXPECT_EQ(endpoint->state(), UbEndpoint::State::kFailed);
+    EXPECT_EQ(adapter->importCalls(), 2U);
+    EXPECT_EQ(adapter->unimportCalls(), 2U)
+        << "the adopted partial handle is rolled back, never dropped";
+    EXPECT_EQ(endpoint->importedTargetCount(), 0U);
+
+    EXPECT_TRUE(context->shutdown().ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+// P1-01: a rollback unimport failure must leave the handle owned by the
+// failed incarnation (retained for retry) and surface the original import
+// error, not the cleanup error.
+TEST(UbRmLegacyTest, BindRmRollbackRetainsTargetWhenUnimportFails) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(rmCapableDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    auto context = std::make_shared<UbContext>(0, rmCapableDevice(), adapter);
+    ASSERT_TRUE(context->initialize(1, JfcOptions{}).ok());
+    auto endpoint = std::make_shared<UbEndpoint>(
+        UbEndpointKey{0, 123, 9, "peer/ub:fake0:eid0"}, context, adapter, 2,
+        rmJettyOptions());
+    ASSERT_TRUE(endpoint->prepare().ok());
+
+    UbBootstrapDesc local;
+    ASSERT_TRUE(endpoint
+                    ->makeBootstrapDescV2("seg-a", "seg-a/ub:fake0:eid0",
+                                          "seg-b/ub:fake0:eid0", 5, 1, 1,
+                                          local)
+                    .ok());
+    auto peer = local;
+    peer.segment_name = "seg-b";
+    peer.local_nic_path = "seg-b/ub:fake0:eid0";
+    peer.peer_nic_path = "seg-a/ub:fake0:eid0";
+
+    // The second import fails and the rollback unimport of the first target
+    // fails too: the retained handle stays owned by this incarnation and the
+    // caller still sees the original import error.
+    adapter->failNextImports(1);
+    adapter->failNextUnimports(1);
+    EXPECT_TRUE(
+        endpoint->bindRm(peer, expectedForRmPeer(peer)).IsRdmaError());
+    EXPECT_EQ(endpoint->state(), UbEndpoint::State::kFailed);
+    EXPECT_EQ(adapter->importCalls(), 2U);
+    EXPECT_EQ(adapter->unimportCalls(), 1U);
+    EXPECT_EQ(endpoint->importedTargetCount(), 1U)
+        << "the failed rollback unimport retains its target handle";
+
+    // A retry completes the release: no target survives kDestroyed.
+    EXPECT_TRUE(endpoint->retire().ok());
+    EXPECT_EQ(endpoint->state(), UbEndpoint::State::kDestroyed);
+    EXPECT_EQ(endpoint->importedTargetCount(), 0U);
+    EXPECT_EQ(adapter->unimportCalls(), 2U);
 
     EXPECT_TRUE(context->shutdown().ok());
     EXPECT_TRUE(adapter->shutdown().ok());
