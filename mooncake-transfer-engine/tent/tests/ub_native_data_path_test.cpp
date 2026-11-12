@@ -1910,6 +1910,73 @@ TEST(UbRmLegacyTest, BindRmRollbackRetainsTargetWhenUnimportFails) {
     EXPECT_TRUE(adapter->shutdown().ok());
 }
 
+// P1-02: a repeated bootstrap against a READY endpoint is classified with
+// the full v2 comparison. Conflict, stale and newer outcomes all preserve
+// the incumbent; only an exact duplicate is idempotent.
+TEST(UbRmLegacyTest, BindRmClassifiesRepeatedBootstrapAgainstIncumbent) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(rmCapableDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    auto context = std::make_shared<UbContext>(0, rmCapableDevice(), adapter);
+    ASSERT_TRUE(context->initialize(1, JfcOptions{}).ok());
+    auto endpoint = std::make_shared<UbEndpoint>(
+        UbEndpointKey{0, 123, 9, "peer/ub:fake0:eid0"}, context, adapter, 1,
+        rmJettyOptions());
+    ASSERT_TRUE(endpoint->prepare().ok());
+
+    UbBootstrapDesc local;
+    ASSERT_TRUE(endpoint
+                    ->makeBootstrapDescV2("seg-a", "seg-a/ub:fake0:eid0",
+                                          "seg-b/ub:fake0:eid0", 5, 1, 1,
+                                          local)
+                    .ok());
+    auto peer = local;
+    peer.segment_name = "seg-b";
+    peer.local_nic_path = "seg-b/ub:fake0:eid0";
+    peer.peer_nic_path = "seg-a/ub:fake0:eid0";
+    ASSERT_TRUE(endpoint->bindRm(peer, expectedForRmPeer(peer)).ok());
+    EXPECT_TRUE(endpoint->ready());
+    EXPECT_EQ(adapter->importCalls(), 1U);
+
+    // Same generations but different RM content is a conflict.
+    auto conflict = peer;
+    conflict.rm->targets[0].id = peer.rm->targets[0].id + 100;
+    EXPECT_TRUE(
+        endpoint->bindRm(conflict, expectedForRmPeer(conflict))
+            .IsInvalidArgument());
+    EXPECT_TRUE(endpoint->ready());
+    EXPECT_EQ(endpoint->importedTargetCount(), 1U);
+
+    // An older peer generation is stale and must not overwrite the incumbent.
+    auto stale = peer;
+    stale.endpoint_generation = peer.endpoint_generation - 1;
+    stale.rm->targets[0].target_epoch = stale.endpoint_generation;
+    EXPECT_TRUE(
+        endpoint->bindRm(stale, expectedForRmPeer(stale)).IsInvalidArgument());
+    EXPECT_TRUE(endpoint->ready());
+    EXPECT_EQ(endpoint->importedTargetCount(), 1U);
+
+    // A newer peer generation turns over through retire + a fresh
+    // incarnation, never an in-place rebind of the READY incumbent.
+    auto newer = peer;
+    newer.endpoint_generation = peer.endpoint_generation + 1;
+    newer.rm->targets[0].target_epoch = newer.endpoint_generation;
+    EXPECT_TRUE(
+        endpoint->bindRm(newer, expectedForRmPeer(newer)).IsInvalidArgument());
+    EXPECT_TRUE(endpoint->ready());
+    EXPECT_EQ(endpoint->importedTargetCount(), 1U);
+
+    // Every rejection left the incumbent untouched: still the exact
+    // duplicate, still exactly one import, no unimport churn.
+    EXPECT_TRUE(endpoint->bindRm(peer, expectedForRmPeer(peer)).ok());
+    EXPECT_EQ(adapter->importCalls(), 1U);
+    EXPECT_EQ(adapter->unimportCalls(), 0U);
+
+    EXPECT_TRUE(endpoint->retire().ok());
+    EXPECT_EQ(adapter->unimportCalls(), 1U);
+    EXPECT_TRUE(context->shutdown().ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
 TEST(UbRmLegacyTest, RmJettyBindIsRejectedByTheAdapter) {
     auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
     ASSERT_TRUE(adapter->initialize().ok());

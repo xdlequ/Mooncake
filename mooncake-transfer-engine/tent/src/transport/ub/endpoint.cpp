@@ -3,6 +3,8 @@
 
 #include "tent/transport/ub/endpoint.h"
 
+#include "tent/transport/ub/bootstrap.h"
+
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -359,9 +361,39 @@ Status UbEndpoint::bindRm(const UbBootstrapDesc& peer,
     }
     const State current = state_.load(std::memory_order_relaxed);
     if (current == State::kReady) {
-        if (samePeer(peer_, peer)) return Status::OK();
-        return Status::InvalidArgument(
-            "UB endpoint is already bound to another peer generation" LOC_MARK);
+        // P1-02: classify a repeated RM bootstrap against the incumbent with
+        // the full v2 content and hierarchical generation comparison instead
+        // of the RM-blind samePeer(). Every non-duplicate outcome preserves
+        // the incumbent: stale/conflict are rejected, and a newer peer
+        // generation turns over through retire + a fresh incarnation rather
+        // than an in-place rebind that could unimport targets still
+        // referenced by in-flight WRs.
+        UbBootstrapGenerationComparison comparison =
+            UbBootstrapGenerationComparison::kConflict;
+        const auto compare_status = compareUbBootstrapV2(peer, peer_, comparison);
+        if (!compare_status.ok()) {
+            return Status::InvalidArgument(
+                "Repeated RM bootstrap descriptor is structurally invalid: " +
+                compare_status.ToString() + LOC_MARK);
+        }
+        switch (comparison) {
+            case UbBootstrapGenerationComparison::kDuplicate:
+                return Status::OK();
+            case UbBootstrapGenerationComparison::kStale:
+                return Status::InvalidArgument(
+                    "RM bootstrap generation is stale; the incumbent endpoint "
+                    "is preserved" LOC_MARK);
+            case UbBootstrapGenerationComparison::kConflict:
+                return Status::InvalidArgument(
+                    "RM bootstrap conflicts with the incumbent generation: "
+                    "the same incarnation published different content"
+                    LOC_MARK);
+            case UbBootstrapGenerationComparison::kNewer:
+            default:
+                return Status::InvalidArgument(
+                    "RM peer generation advanced; the endpoint must be "
+                    "re-created through a new incarnation" LOC_MARK);
+        }
     }
     if (current == State::kFailed) return lifecycle_status_;
     if (current != State::kPrepared) {
