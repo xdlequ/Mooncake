@@ -55,6 +55,7 @@ TEST(UbParamsTest, RuntimeDefaultsSelectRcLegacyWithPoolAndProbeOff) {
     EXPECT_EQ(params.trans_mode, UbTransportMode::kRc);
     EXPECT_FALSE(params.jetty_pool.enable);
     EXPECT_FALSE(params.jetty_pool.force_disable);
+    EXPECT_FALSE(params.jetty_reuse.enable);
     EXPECT_FALSE(params.probe.enabled);
     EXPECT_TRUE(params.probe.stop_on_recovery);
 
@@ -159,6 +160,38 @@ TEST(UbParamsTest, RmLegacyResolvesToRmRuntimeMode) {
     UbRuntimeMode resolved = UbRuntimeMode::kRcLegacy;
     ASSERT_TRUE(resolveUbRuntimeMode(params, resolved).ok());
     EXPECT_EQ(resolved, UbRuntimeMode::kRmLegacy);
+}
+
+TEST(UbParamsTest, JettyReuseRequiresRmLegacyProfile) {
+    auto evaluate = [](UbRuntimeProfile profile, UbRuntimeMode& resolved) {
+        UbParams params;
+        params.runtime_profile = profile;
+        params.trans_mode = profile == UbRuntimeProfile::kRcLegacy
+                                ? UbTransportMode::kRc
+                                : UbTransportMode::kRm;
+        params.jetty_reuse.enable = true;
+        // rm_pool is otherwise well-formed (pool+probe on) so the rejection
+        // can only come from the jetty_reuse gate itself.
+        params.jetty_pool.enable = profile == UbRuntimeProfile::kRmPool;
+        params.probe.enabled = profile == UbRuntimeProfile::kRmPool;
+        params.physical_only = profile == UbRuntimeProfile::kRmLegacy;
+        return resolveUbRuntimeMode(params, resolved);
+    };
+
+    UbRuntimeMode resolved = UbRuntimeMode::kRcLegacy;
+    EXPECT_TRUE(
+        evaluate(UbRuntimeProfile::kRcLegacy, resolved).IsInvalidArgument());
+    EXPECT_TRUE(
+        evaluate(UbRuntimeProfile::kRmPool, resolved).IsInvalidArgument());
+    ASSERT_TRUE(evaluate(UbRuntimeProfile::kRmLegacy, resolved).ok());
+    EXPECT_EQ(resolved, UbRuntimeMode::kRmLegacy);
+
+    // The config key must round-trip through FromConfig.
+    Config config;
+    config.set("transports/ub/jetty_reuse/enable", true);
+    UbParams params;
+    ASSERT_TRUE(UbParams::FromConfig(config, params).ok());
+    EXPECT_TRUE(params.jetty_reuse.enable);
 }
 
 TEST(UbAdapterContractTest, ClassifiesPostAcceptanceFromNativeResult) {

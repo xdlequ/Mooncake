@@ -27,6 +27,8 @@
 #include "tent/transport/ub/ub_transport.h"
 #include "tent/transport/ub/workers.h"
 
+#include "../src/transport/ub/jetty_pool.h"
+
 namespace mooncake::tent::ub {
 namespace {
 
@@ -281,6 +283,7 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         return Status::OK();
     }
     Status deleteJetty(JettyPtr& jetty) override {
+        delete_jetty_calls_.fetch_add(1, std::memory_order_relaxed);
         if (auto fake = std::dynamic_pointer_cast<FakeJetty>(jetty)) {
             fake->close();
         }
@@ -515,6 +518,9 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     uint64_t createJettyCalls() const {
         return create_jetty_calls_.load(std::memory_order_relaxed);
     }
+    uint64_t deleteJettyCalls() const {
+        return delete_jetty_calls_.load(std::memory_order_relaxed);
+    }
     uint64_t bindJettyCalls() const {
         return bind_jetty_calls_.load(std::memory_order_relaxed);
     }
@@ -563,6 +569,7 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     std::atomic<uint64_t> quiesce_calls_{0};
     std::atomic<uint64_t> open_context_calls_{0};
     std::atomic<uint64_t> create_jetty_calls_{0};
+    std::atomic<uint64_t> delete_jetty_calls_{0};
     std::atomic<uint64_t> bind_jetty_calls_{0};
     std::atomic<uint64_t> import_calls_{0};
     std::atomic<uint64_t> unimport_calls_{0};
@@ -1977,6 +1984,161 @@ TEST(UbRmLegacyTest, BindRmClassifiesRepeatedBootstrapAgainstIncumbent) {
     EXPECT_TRUE(adapter->shutdown().ok());
 }
 
+// Simple send-Jetty reuse: a cleanly retired incarnation returns its
+// drained Jettys to the per-context pool and the next incarnation re-leases
+// them instead of creating new ones.
+TEST(UbRmLegacyTest, SendJettyPoolReusesDrainedJettys) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(rmCapableDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    auto context = std::make_shared<UbContext>(0, rmCapableDevice(), adapter);
+    ASSERT_TRUE(context->initialize(1, JfcOptions{}).ok());
+    auto pool = std::make_shared<UbSendJettyPool>(
+        adapter, context->handle(), context->jfcs(), rmJettyOptions());
+    context->attachJettyPool(pool);
+
+    auto make_endpoint = [&] {
+        return std::make_shared<UbEndpoint>(
+            UbEndpointKey{0, 123, 9, "peer/ub:fake0:eid0"}, context, adapter, 2,
+            rmJettyOptions());
+    };
+    auto make_peer = [](const std::shared_ptr<UbEndpoint>& endpoint,
+                        UbBootstrapDesc& peer) {
+        UbBootstrapDesc local;
+        EXPECT_TRUE(endpoint
+                        ->makeBootstrapDescV2("seg-a", "seg-a/ub:fake0:eid0",
+                                              "seg-b/ub:fake0:eid0", 5, 1, 1,
+                                              local)
+                        .ok());
+        peer = local;
+        peer.segment_name = "seg-b";
+        peer.local_nic_path = "seg-b/ub:fake0:eid0";
+        peer.peer_nic_path = "seg-a/ub:fake0:eid0";
+    };
+
+    // First incarnation leases (creates) two Jettys.
+    auto first = make_endpoint();
+    ASSERT_TRUE(first->prepare().ok());
+    EXPECT_EQ(adapter->createJettyCalls(), 2U);
+    UbBootstrapDesc peer;
+    make_peer(first, peer);
+    ASSERT_TRUE(first->bindRm(peer, expectedForRmPeer(peer)).ok());
+    EXPECT_EQ(first->importedTargetCount(), 2U);
+
+    // A clean retire returns both Jettys to the pool instead of deleting
+    // them; the imported targets are still unimported.
+    ASSERT_TRUE(first->retire().ok());
+    EXPECT_EQ(first->state(), UbEndpoint::State::kDestroyed);
+    EXPECT_EQ(adapter->deleteJettyCalls(), 0U)
+        << "pooled Jettys must not be deleted on retire";
+    EXPECT_EQ(pool->idleCount(), 2U);
+    EXPECT_EQ(first->importedTargetCount(), 0U);
+    EXPECT_EQ(adapter->unimportCalls(), 2U);
+
+    // Second incarnation reuses the pooled Jettys: no new createJetty and
+    // the data-plane pairing (2 targets, 2 Jettys) still validates.
+    auto second = make_endpoint();
+    ASSERT_TRUE(second->prepare().ok());
+    EXPECT_EQ(adapter->createJettyCalls(), 2U)
+        << "the second incarnation must lease from the pool";
+    EXPECT_EQ(pool->idleCount(), 0U);
+    UbBootstrapDesc second_peer;
+    make_peer(second, second_peer);
+    ASSERT_TRUE(second->bindRm(second_peer, expectedForRmPeer(second_peer)).ok());
+    EXPECT_EQ(second->importedTargetCount(), 2U);
+    ASSERT_TRUE(second->retire().ok());
+    EXPECT_EQ(adapter->createJettyCalls(), 2U);
+    EXPECT_EQ(adapter->deleteJettyCalls(), 0U);
+    EXPECT_EQ(pool->idleCount(), 2U);
+
+    // Context shutdown drains the pool: every idle Jetty is deleted before
+    // the JFCs go away.
+    EXPECT_TRUE(context->shutdown().ok());
+    EXPECT_EQ(adapter->deleteJettyCalls(), 2U);
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+// Without an attached pool the legacy behavior is unchanged: prepare creates
+// the Jetty set and retire deletes it.
+TEST(UbRmLegacyTest, SendJettyPoolDisabledCreatesAndDeletes) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(rmCapableDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    auto context = std::make_shared<UbContext>(0, rmCapableDevice(), adapter);
+    ASSERT_TRUE(context->initialize(1, JfcOptions{}).ok());
+    EXPECT_EQ(context->jettyPool(), nullptr);
+    auto endpoint = std::make_shared<UbEndpoint>(
+        UbEndpointKey{0, 123, 9, "peer/ub:fake0:eid0"}, context, adapter, 2,
+        rmJettyOptions());
+    ASSERT_TRUE(endpoint->prepare().ok());
+    EXPECT_EQ(adapter->createJettyCalls(), 2U);
+
+    UbBootstrapDesc local;
+    ASSERT_TRUE(endpoint
+                    ->makeBootstrapDescV2("seg-a", "seg-a/ub:fake0:eid0",
+                                          "seg-b/ub:fake0:eid0", 5, 1, 1,
+                                          local)
+                    .ok());
+    auto peer = local;
+    peer.segment_name = "seg-b";
+    peer.local_nic_path = "seg-b/ub:fake0:eid0";
+    peer.peer_nic_path = "seg-a/ub:fake0:eid0";
+    ASSERT_TRUE(endpoint->bindRm(peer, expectedForRmPeer(peer)).ok());
+
+    ASSERT_TRUE(endpoint->retire().ok());
+    EXPECT_EQ(adapter->deleteJettyCalls(), 2U)
+        << "without a pool the retire path deletes every Jetty";
+
+    EXPECT_TRUE(context->shutdown().ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+// A Jetty whose RESET failed never enters the pool: the failure path
+// deletes it through the audited deleteJetty path instead.
+TEST(UbRmLegacyTest, SendJettyPoolExcludesJettysWhoseResetFailed) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(rmCapableDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    auto context = std::make_shared<UbContext>(0, rmCapableDevice(), adapter);
+    ASSERT_TRUE(context->initialize(1, JfcOptions{}).ok());
+    auto pool = std::make_shared<UbSendJettyPool>(
+        adapter, context->handle(), context->jfcs(), rmJettyOptions());
+    context->attachJettyPool(pool);
+
+    auto endpoint = std::make_shared<UbEndpoint>(
+        UbEndpointKey{0, 123, 9, "peer/ub:fake0:eid0"}, context, adapter, 2,
+        rmJettyOptions());
+    ASSERT_TRUE(endpoint->prepare().ok());
+    EXPECT_EQ(adapter->createJettyCalls(), 2U);
+
+    UbBootstrapDesc local;
+    ASSERT_TRUE(endpoint
+                    ->makeBootstrapDescV2("seg-a", "seg-a/ub:fake0:eid0",
+                                          "seg-b/ub:fake0:eid0", 5, 1, 1,
+                                          local)
+                    .ok());
+    auto peer = local;
+    peer.segment_name = "seg-b";
+    peer.local_nic_path = "seg-b/ub:fake0:eid0";
+    peer.peer_nic_path = "seg-a/ub:fake0:eid0";
+
+    // The import fails while resets are injected to fail: failLocked still
+    // reaches the delete step, and the unproven Jettys must be deleted, not
+    // pooled.
+    adapter->failNextImports(1);
+    adapter->failResets();
+    EXPECT_TRUE(
+        endpoint->bindRm(peer, expectedForRmPeer(peer)).IsRdmaError());
+    EXPECT_EQ(endpoint->state(), UbEndpoint::State::kFailed);
+    EXPECT_EQ(endpoint->importedTargetCount(), 0U);
+    EXPECT_EQ(adapter->deleteJettyCalls(), 2U)
+        << "Jettys whose RESET failed must be deleted, never pooled";
+    EXPECT_EQ(pool->idleCount(), 0U);
+    adapter->allowResets();
+
+    EXPECT_TRUE(context->shutdown().ok());
+    EXPECT_EQ(adapter->deleteJettyCalls(), 2U)
+        << "an empty pool drains nothing at shutdown";
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
 TEST(UbRmLegacyTest, RmJettyBindIsRejectedByTheAdapter) {
     auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
     ASSERT_TRUE(adapter->initialize().ok());
@@ -2151,6 +2313,118 @@ TEST(UbRmLegacyTest, TransportRunsSelfReadWriteWithExplicitRmTargets) {
 
     ASSERT_TRUE(transport.freeSubBatch(batch).ok());
     EXPECT_TRUE(transport.uninstall().ok());
+    EXPECT_GE(adapter->unimportCalls(), adapter->importCalls())
+        << "every imported target must be unimported before uninstall ends";
+}
+
+TEST(UbRmLegacyTest, TransportRunsSelfReadWriteWithPooledJettys) {
+    auto device = rmCapableDevice();
+    auto adapter = std::make_shared<FakeUrmaAdapter>(device);
+    auto topology = fakeTopology(false);
+    auto control = std::make_shared<ControlService>("p2p", "", nullptr);
+    uint16_t port = 0;
+    ASSERT_TRUE(control->start(port).ok());
+    const std::string segment_name =
+        "127.0.0.1:" + std::to_string(static_cast<unsigned>(port));
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        segment.name = segment_name;
+                        segment.rpc_server_addr = segment_name;
+                        segment.machine_id = "fake-machine";
+                        segment.type = SegmentType::Memory;
+                        segment.detail = MemorySegmentDesc{};
+                        std::get<MemorySegmentDesc>(segment.detail).topology =
+                            *topology;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    auto config = std::make_shared<Config>();
+    config->set("transports/ub/enable", true);
+    config->set("transports/ub/runtime_profile", "rm_legacy");
+    config->set("transports/ub/trans_mode", "rm");
+    config->set("transports/ub/worker_count", 1);
+    config->set("transports/ub/poller_count", 1);
+    config->set("transports/ub/jfc_per_context", 1);
+    config->set("transports/ub/jetty_per_endpoint", 2);
+    config->set("transports/ub/max_endpoints", 16);
+    config->set("transports/ub/slice_size", 16);
+    config->set("transports/ub/max_slices_per_task", 8);
+    config->set("transports/ub/max_retries", 1);
+    config->set("transports/ub/slice_timeout_ms", 1000);
+    config->set("transports/ub/endpoint_cooldown_ms", 100);
+    config->set("transports/ub/jetty_reuse/enable", true);
+    setPhysicalOnlyIdentity(*config, device);
+
+    UbTransport transport(adapter);
+    std::string mutable_segment_name = segment_name;
+    ASSERT_TRUE(
+        transport.install(mutable_segment_name, control, topology, config)
+            .ok());
+
+    std::array<char, 64> source{};
+    std::array<char, 64> target{};
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(100 - i);
+    }
+    const auto expected = source;
+    BufferDesc source_desc{};
+    source_desc.addr = reinterpret_cast<uint64_t>(source.data());
+    source_desc.length = source.size();
+    source_desc.location = kWildcardLocation;
+    BufferDesc target_desc{};
+    target_desc.addr = reinterpret_cast<uint64_t>(target.data());
+    target_desc.length = target.size();
+    target_desc.location = kWildcardLocation;
+    MemoryOptions options;
+    options.perm = kGlobalReadWrite;
+    std::vector<BufferDesc> descriptors{source_desc, target_desc};
+    ASSERT_TRUE(transport.addMemoryBuffer(descriptors, options).ok());
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        std::get<MemorySegmentDesc>(segment.detail).buffers =
+                            descriptors;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 2).ok());
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(target.data());
+    request.length = source.size();
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {request}).ok());
+
+    TransferStatus transfer{PENDING, 0};
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (transfer.s == PENDING &&
+           std::chrono::steady_clock::now() < deadline) {
+        ASSERT_TRUE(transport.getTransferStatus(batch, 0, transfer).ok());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(transfer.s, COMPLETED);
+    EXPECT_EQ(transfer.transferred_bytes, source.size());
+    EXPECT_EQ(source, target);
+    EXPECT_GE(adapter->rmPostCalls(), 1U)
+        << "the RM data plane must post with an explicit target";
+    EXPECT_EQ(adapter->bindJettyCalls(), 0U)
+        << "RM Legacy posts must not rely on bound remote Jettys";
+
+    // The pool is attached by install: the two Jettys of the single endpoint
+    // are created exactly once and never deleted while the endpoint lives.
+    EXPECT_EQ(adapter->createJettyCalls(), 2U);
+    EXPECT_EQ(adapter->deleteJettyCalls(), 0U);
+
+    ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+    EXPECT_TRUE(transport.uninstall().ok());
+    // Retire returns the reset Jettys to the pool and context shutdown drains
+    // them, so every created Jetty is finally deleted exactly once.
+    EXPECT_EQ(adapter->createJettyCalls(), 2U);
+    EXPECT_EQ(adapter->deleteJettyCalls(), 2U);
     EXPECT_GE(adapter->unimportCalls(), adapter->importCalls())
         << "every imported target must be unimported before uninstall ends";
 }

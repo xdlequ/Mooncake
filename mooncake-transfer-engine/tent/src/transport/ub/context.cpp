@@ -6,6 +6,9 @@
 #include <algorithm>
 #include <chrono>
 #include <limits>
+#include <utility>
+
+#include "jetty_pool.h"
 
 namespace mooncake::tent::ub {
 namespace {
@@ -115,6 +118,11 @@ Status UbContext::shutdown() {
     return shutdownLocked();
 }
 
+void UbContext::attachJettyPool(std::shared_ptr<UbSendJettyPool> pool) {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    jetty_pool_ = std::move(pool);
+}
+
 Status UbContext::shutdownLocked() {
     auto current = state_.load(std::memory_order_relaxed);
     if (current == State::kClosed) return Status::OK();
@@ -124,7 +132,14 @@ Status UbContext::shutdownLocked() {
     }
     state_.store(State::kDraining, std::memory_order_release);
 
+    // Drain the send-Jetty reuse pool (when attached) before the JFCs are
+    // closed so no idle Jetty outlives its parent JFC. A failed delete keeps
+    // the handle inside the pool for the next shutdown retry.
     Status first_error = Status::OK();
+    if (jetty_pool_) {
+        auto status = jetty_pool_->drain();
+        if (!status.ok()) first_error = std::move(status);
+    }
     for (size_t index = jfcs_.size(); index > 0;) {
         --index;
         auto& jfc = jfcs_[index];

@@ -24,6 +24,8 @@
 #include "tent/transport/ub/bootstrap.h"
 #include "tent/transport/ub/buffers.h"
 #include "tent/transport/ub/context.h"
+
+#include "jetty_pool.h"
 #include "tent/transport/ub/device_selection.h"
 #include "tent/transport/ub/endpoint.h"
 #include "tent/transport/ub/endpoint_store.h"
@@ -367,6 +369,19 @@ struct UbTransport::Impl {
         endpoints = std::make_unique<ub::EndpointStore>(
             adapter, params.max_endpoints, params.jetty_per_endpoint,
             jetty_options);
+        // Simple send-Jetty reuse (RM Legacy only): attach a per-context idle
+        // pool so endpoint incarnations lease Jettys LIFO instead of always
+        // creating and deleting them. RC installs never attach a pool, so the
+        // legacy create/delete path is unchanged.
+        if (runtime_mode == ub::UbRuntimeMode::kRmLegacy &&
+            params.jetty_reuse.enable) {
+            for (auto& context : contexts) {
+                context->attachJettyPool(
+                    std::make_shared<ub::UbSendJettyPool>(
+                        adapter, context->handle(), context->jfcs(),
+                        jetty_options));
+            }
+        }
         ub::RailMonitorConfig rail_config;
         rail_config.cooldown_ns =
             static_cast<uint64_t>(params.endpoint_cooldown_ms) * 1'000'000ULL;

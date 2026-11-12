@@ -183,6 +183,10 @@ class UbEndpoint final : public std::enable_shared_from_this<UbEndpoint> {
     mutable std::mutex lifecycle_mutex_;
     std::vector<JettyPtr> jetties_;
     std::vector<size_t> jfc_indices_;
+    // Recomputed by resetAndUnbindLocked(): which Jettys proved drained
+    // (RESET succeeded). Only Jettys with a fresh true entry may return to
+    // the context send-Jetty pool in deleteJettysLocked().
+    std::vector<bool> jetty_reset_ok_;
     // RM Legacy imported peer targets, positional with jetties_. Owned by
     // this endpoint incarnation from a successful bindRm() until retirement
     // has fenced and deleted every Jetty.

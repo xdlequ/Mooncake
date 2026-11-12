@@ -5,6 +5,8 @@
 
 #include "tent/transport/ub/bootstrap.h"
 
+#include "jetty_pool.h"
+
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -105,18 +107,25 @@ Status UbEndpoint::resetAndUnbindLocked() {
     Status first_error = Status::OK();
     if (!adapter_) return first_error;
 
-    for (auto it = jetties_.rbegin(); it != jetties_.rend(); ++it) {
-        if (!*it) continue;
-        auto reset_status = adapter_->resetJetty(*it);
+    // Recomputed on every pass: jetty_reset_ok_ records which Jettys proved
+    // drained (RESET succeeded), which is the gate for returning a Jetty to
+    // the context send-Jetty pool instead of deleting it.
+    jetty_reset_ok_.assign(jetties_.size(), false);
+    for (size_t index = jetties_.size(); index > 0;) {
+        --index;
+        auto& jetty = jetties_[index];
+        if (!jetty) continue;
+        auto reset_status = adapter_->resetJetty(jetty);
         rememberFirstError(reset_status, first_error);
         // Unimporting a peer before RESET succeeds can sever resources still
         // referenced by hardware. Keep this Jetty intact for a retry.
         if (!reset_status.ok()) continue;
+        jetty_reset_ok_[index] = true;
         // RM Legacy never calls bindJetty/unbindJetty: WRs reference explicit
         // imported targets instead of a bound remote Jetty. RESET remains part
         // of the accepted provider delete contract for this Jetty.
         if (!rmMode()) {
-            rememberFirstError(adapter_->unbindJetty(*it), first_error);
+            rememberFirstError(adapter_->unbindJetty(jetty), first_error);
         }
     }
     return first_error;
@@ -155,16 +164,36 @@ Status UbEndpoint::deleteJettysLocked() {
     // is still busy). Remove only handles whose deletion succeeded. Failed
     // handles and their JFC association remain owned by this endpoint so the
     // next retire()/clear()/uninstall() attempt can retry the exact resource.
+    const auto pool = context_ ? context_->jettyPool() : nullptr;
     std::vector<bool> deleted(jetties_.size(), false);
+    std::vector<JettyPtr> pooled_jetties;
+    std::vector<size_t> pooled_jfc_indices;
     for (size_t index = jetties_.size(); index > 0; --index) {
         auto& jetty = jetties_[index - 1];
         if (!jetty) {
             deleted[index - 1] = true;
             continue;
         }
+        if (pool && index - 1 < jetty_reset_ok_.size() &&
+            jetty_reset_ok_[index - 1]) {
+            // Simple Jetty reuse (RM Legacy only): a Jetty whose RESET
+            // succeeded is proven drained, so it returns to the context pool
+            // instead of being deleted. A future incarnation re-leasing it
+            // posts new WRs with its own imported targets, so the old
+            // targets can still be unimported right after this loop.
+            pooled_jetties.push_back(std::move(jetty));
+            pooled_jfc_indices.push_back(index - 1 < jfc_indices_.size()
+                                             ? jfc_indices_[index - 1]
+                                             : size_t{0});
+            deleted[index - 1] = true;
+            continue;
+        }
         auto status = adapter_->deleteJetty(jetty);
         rememberFirstError(status, first_error);
         deleted[index - 1] = status.ok();
+    }
+    if (pool && !pooled_jetties.empty()) {
+        pool->release(std::move(pooled_jetties), std::move(pooled_jfc_indices));
     }
 
     std::vector<JettyPtr> retained_jetties;
@@ -243,6 +272,18 @@ Status UbEndpoint::prepare() {
                                     "device capability" LOC_MARK));
     }
 
+    // Simple send-Jetty reuse (RM Legacy only): lease the whole set from the
+    // context pool when attached. Acquisition is atomic — on failure this
+    // incarnation holds nothing, so failLocked() has no Jetties to clean up.
+    if (auto pool = context_->jettyPool()) {
+        auto status = pool->acquire(jetty_count_, jetties_, jfc_indices_);
+        if (!status.ok()) return failLocked(std::move(status));
+        jetty_reset_ok_.assign(jetties_.size(), false);
+        lifecycle_status_ = Status::OK();
+        state_.store(State::kPrepared, std::memory_order_release);
+        return Status::OK();
+    }
+
     jetties_.reserve(jetty_count_);
     jfc_indices_.reserve(jetty_count_);
     for (uint32_t index = 0; index < jetty_count_; ++index) {
@@ -280,6 +321,7 @@ Status UbEndpoint::prepare() {
         jetties_.push_back(std::move(jetty));
         jfc_indices_.push_back(jfc_index);
     }
+    jetty_reset_ok_.assign(jetties_.size(), false);
 
     lifecycle_status_ = Status::OK();
     state_.store(State::kPrepared, std::memory_order_release);

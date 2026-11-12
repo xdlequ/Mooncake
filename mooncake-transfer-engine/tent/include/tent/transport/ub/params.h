@@ -57,6 +57,16 @@ struct UbJettyPoolParams {
     bool force_disable = false;
 };
 
+// Simple send-Jetty reuse for RM Legacy: endpoints lease their Jetty set
+// from a per-context idle pool and retired incarnations return drained
+// Jettys to it (LIFO), avoiding createJetty/deleteJetty churn. This is a
+// lightweight reuse switch, distinct from the full rm_pool profile: it never
+// shares a Jetty across concurrent endpoint incarnations and leaves the
+// imported-target ownership model unchanged.
+struct UbJettyReuseParams {
+    bool enable = false;
+};
+
 // Probe keys are schema-complete but dormant until the P4 health scheduler
 // exists. `enabled` only declares resource capability; it never starts a
 // periodic WR on its own.
@@ -156,6 +166,7 @@ struct UbParams {
     UbRuntimeProfile runtime_profile = UbRuntimeProfile::kRcLegacy;
     UbTransportMode trans_mode = UbTransportMode::kRc;
     UbJettyPoolParams jetty_pool;
+    UbJettyReuseParams jetty_reuse;
     UbProbeParams probe;
 
     bool enable_bandwidth_estimation = true;
@@ -231,6 +242,9 @@ struct UbParams {
         CHECK_STATUS(readBool(config, "transports/ub/jetty_pool/force_disable",
                               parsed.jetty_pool.force_disable,
                               parsed.jetty_pool.force_disable));
+        CHECK_STATUS(readBool(config, "transports/ub/jetty_reuse/enable",
+                              parsed.jetty_reuse.enable,
+                              parsed.jetty_reuse.enable));
         CHECK_STATUS(readBool(config, "transports/ub/probe/enabled",
                               parsed.probe.enabled, parsed.probe.enabled));
         CHECK_STATUS(readPositive(config, "transports/ub/probe/interval",
@@ -496,6 +510,7 @@ struct UbParams {
 inline Status resolveUbRuntimeMode(const UbParams& params,
                                    UbRuntimeMode& mode) {
     const bool pool = params.jetty_pool.enable;
+    const bool reuse = params.jetty_reuse.enable;
     const bool probe = params.probe.enabled;
 
     // One snapshot feeds every branch, so a CI failure prints the complete
@@ -507,6 +522,7 @@ inline Status resolveUbRuntimeMode(const UbParams& params,
             << " jetty_pool=" << (pool ? "on" : "off")
             << " force_disable="
             << (params.jetty_pool.force_disable ? "true" : "false")
+            << " jetty_reuse=" << (reuse ? "on" : "off")
             << " probe=" << (probe ? "on" : "off")
             << " physical_only="
             << (params.physical_only ? "true" : "false");
@@ -526,6 +542,10 @@ inline Status resolveUbRuntimeMode(const UbParams& params,
         if (pool) {
             return reject(Status::InvalidArgument(
                 "jetty_pool.enable requires runtime_profile=rm_pool"));
+        }
+        if (reuse) {
+            return reject(Status::InvalidArgument(
+                "jetty_reuse.enable requires runtime_profile=rm_legacy"));
         }
         if (probe) {
             return reject(Status::InvalidArgument(
@@ -568,6 +588,11 @@ inline Status resolveUbRuntimeMode(const UbParams& params,
     if (!pool) {
         return reject(Status::InvalidArgument(
             "runtime_profile=rm_pool requires jetty_pool.enable=true"));
+    }
+    if (reuse) {
+        return reject(Status::InvalidArgument(
+            "jetty_reuse.enable requires runtime_profile=rm_legacy and is "
+            "not part of rm_pool"));
     }
     if (!probe) {
         return reject(Status::InvalidArgument(

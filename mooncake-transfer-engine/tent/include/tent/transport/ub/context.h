@@ -18,6 +18,8 @@
 
 namespace mooncake::tent::ub {
 
+class UbSendJettyPool;
+
 class UbContext final : public std::enable_shared_from_this<UbContext> {
    public:
     enum class State : uint8_t {
@@ -73,6 +75,15 @@ class UbContext final : public std::enable_shared_from_this<UbContext> {
     [[nodiscard]] const std::vector<std::shared_ptr<UbJfc>>& jfcs() const {
         return jfcs_;
     }
+
+    // Simple send-Jetty reuse (RM Legacy only). Null unless the transport
+    // installed a pool for this context; endpoints fall back to per-incarnation
+    // createJetty when absent, so RC behavior is unchanged.
+    void attachJettyPool(std::shared_ptr<UbSendJettyPool> pool);
+    [[nodiscard]] std::shared_ptr<UbSendJettyPool> jettyPool() const {
+        std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+        return jetty_pool_;
+    }
     [[nodiscard]] std::shared_ptr<UbJfc> jfc(size_t index) const;
 
     void addInflight(uint64_t bytes) noexcept;
@@ -100,6 +111,7 @@ class UbContext final : public std::enable_shared_from_this<UbContext> {
     const uint64_t incarnation_;
     ContextPtr handle_;
     std::vector<std::shared_ptr<UbJfc>> jfcs_;
+    std::shared_ptr<UbSendJettyPool> jetty_pool_;
     mutable std::mutex lifecycle_mutex_;
     std::atomic<State> state_{State::kUninitialized};
     std::atomic<uint64_t> inflight_bytes_{0};
