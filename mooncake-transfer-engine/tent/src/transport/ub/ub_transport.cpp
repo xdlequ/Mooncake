@@ -613,7 +613,7 @@ struct UbTransport::Impl {
         if (runtime_mode == ub::UbRuntimeMode::kRmLegacy) {
             status = endpoint->makeBootstrapDescV2(
                 local_segment_name, local_path, peer_path,
-                request.segment_generation, node_incarnation, topology_epoch,
+                currentSegmentGeneration(), topology_epoch,
                 bootstrap);
         } else {
             status = endpoint->makeBootstrapDesc(
