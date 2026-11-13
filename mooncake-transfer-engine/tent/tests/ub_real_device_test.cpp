@@ -45,6 +45,7 @@
 #include "tent/transport/ub/jfc.h"
 #include "tent/transport/ub/topology_attrs.h"
 #include "tent/transport/ub/ub_transport.h"
+#include "tent/transport/ub/jetty_pool.h"
 #include "tent/transport/ub/urma_adapter.h"
 
 namespace mooncake::tent::ub {
@@ -69,9 +70,11 @@ JettyOptions rmJettyOptions() {
 const DeviceInfo* pickRmCapableDevice(const std::vector<DeviceInfo>& devices) {
     for (const auto& device : devices) {
         if (!device.active) continue;
-        if ((device.capabilities.transport_modes & kUrmaTransportModeRm) == 0) {
-            continue;
-        }
+        const auto& caps = device.capabilities;
+
+        if ((caps.transport_modes & kUrmaTransportModeRm) == 0) continue;
+        if ((caps.rm_tp_cap & kUrmaTpTypeRtpMask) == 0) continue;
+        if ((caps.priority_tp_type_masks[kUrmaMaxPriority] & kUrmaTpTypeRtpMask) == 0) continue;
         return &device;
     }
     return nullptr;
@@ -158,9 +161,7 @@ TEST_F(UbRealDeviceTest, RealAdapterInitializesAndDiscoversActiveDevices) {
     // the discovered set to contain such a device, otherwise every RM test
     // would fail for an environmental reason.
     for (const auto& device : discovered_) {
-        if (device.active) {
-            GTEST_SKIP() << "active URMA device found: " << device.native_device_name;
-        }
+        
         fprintf(stderr, "【DBG】device.name: %s, path = %s, kind = %s, mode =  %s, rm_tp_cap = 0x%x,
             prio6_tp = 0x%x, eid = %s, active: %d\n",
              device.native_device_name.c_str(), device.native_device_path.c_str(),
@@ -168,7 +169,7 @@ TEST_F(UbRealDeviceTest, RealAdapterInitializesAndDiscoversActiveDevices) {
              device.capabilities.transport_modes,
              device.capabilities.rm_tp_cap,
              device.capabilities.priority_tp_type_masks[6],
-             device.eid.c_str(), device.active);
+             device.eid.c_str(), (int)device.active);
     }
     size_t active_devices = 0;
     for (const auto& device : discovered_) {
@@ -186,7 +187,8 @@ TEST_F(UbRealDeviceTest, RealAdapterInitializesAndDiscoversActiveDevices) {
 TEST_F(UbRealDeviceTest, RmLegacyJettyLifecycleOverRealUrma) {
     const auto* device = pickRmCapableDevice(discovered_);
     if (!device) {
-        GTEST_SKIP() << "no active RM-capable URMA device on this node";
+        GTEST_SKIP() << "no active RM-RTP-capable URMA device on this node"
+        "(rm_tp_cap or priority tp-type mask lacks RTP)";
     }
 
     auto context = std::make_shared<UbContext>(0, *device, adapter_);
@@ -198,44 +200,10 @@ TEST_F(UbRealDeviceTest, RmLegacyJettyLifecycleOverRealUrma) {
     // (RM transport mode + RTP bind mask) must be accepted by the real
     // provider for an RM-capable device.
     JettyPtr jetty;
-    {
-        auto st = adapter_->createJetty(context->handle(),
+    auto st = adapter_->createJetty(context->handle(),
                                    context->jfcs().front()->handle(),
                                     rmJettyOptions(), jetty);
-        if (!st.ok()) {
-            GTEST_SKIP() << "createJetty failed: " << st.ToString();
-            fprintf(stderr, "[DBG] dev name = %s, eid = %s, path = %s, 
-                kind = %s, mode = %s, active = %d\n",
-             device.native_device_name.c_str(), device.eid.c_str(),
-             device.native_device_path.c_str(), device.kind.c_str(),
-             device.transport_modes.c_str(),
-             (int)device.active);
-            fprintf(stderr, "【DBG】createJetty failed: %s\n", st.ToString().c_str());
-        }
-        {
-            auto ctp = rmJettyOptions();
-            ctp.bind_tp_type_mask = 0x2U;
-            JettyPtr jetty2;
-            auto st2 = adapter_->createJetty(context->handle(),
-                                   context->jfcs().front()->handle(),
-                                   ctp, jetty2);
-            if (!st2.ok()) {
-                GTEST_SKIP() << "createJetty failed: " << st2.ToString();
-                fprintf(stderr, "[DBG] dev name = %s, eid = %s, path = %s, 
-                    kind = %s, mode = %s, active = %d\n",
-             device.native_device_name.c_str(), device.eid.c_str(),
-             device.native_device_path.c_str(), device.kind.c_str(),
-             device.transport_modes.c_str(),
-             (int)device.active);
-                fprintf(stderr, "【DBG】createJetty failed: %s\n", st2.ToString().c_str());
-            }
-            fprintf(stderr, "【DBG】createJetty success: %s\n", st2.ToString().c_str());
-            if(jetty2) {
-                adapter_->deleteJetty(jetty2);
-            }
-        }
-
-    }
+    ASSERT_TRUE(st.ok());
     ASSERT_NE(jetty, nullptr);
 
     // RESET fences in-flight WRs; a fresh Jetty must reset cleanly, and a
@@ -255,7 +223,8 @@ TEST_F(UbRealDeviceTest, RmLegacyJettyLifecycleOverRealUrma) {
 TEST_F(UbRealDeviceTest, RmLegacySelfReadWriteOverRealUrma) {
     const auto* device = pickRmCapableDevice(discovered_);
     if (!device) {
-        GTEST_SKIP() << "no active RM-capable URMA device on this node";
+        GTEST_SKIP() << "no active RM-RTP-capable URMA device on this node"
+        "(rm_tp_cap or priority tp-type mask lacks RTP)";
     }
 
     auto topology = buildSingleDeviceTopology(*device);
@@ -356,6 +325,48 @@ TEST_F(UbRealDeviceTest, RmLegacySelfReadWriteOverRealUrma) {
     ASSERT_TRUE(transport.freeSubBatch(batch).ok());
     EXPECT_TRUE(transport.uninstall().ok());
 }
+TEST_F(UbRealDeviceTest, RmLegacySelfReadWriteOverRealUrmaWithRmLegacyIdentity) {
+    const auto* device = pickRmCapableDevice(discovered_);
+    if (!device) {
+        GTEST_SKIP() << "no active RM-RTP-capable URMA device on this node"
+        "(rm_tp_cap or priority tp-type mask lacks RTP)";
+    }
+    auto context = std::make_shared<UbContext>(0, *device, adapter_);
+    ASSERT_TRUE(context->initialize(1, JfcOptions{}).ok());
+    ASSERT_FALSE(context->jfcs().empty());
+    auto jetty_pool = std::make_shared<JettyPool>(adapter_, context->handle(), context->jfcs(), rmJettyOptions());
+    context->attachJettyPool(jetty_pool);
+
+    std::vector<JettyPtr> first;
+    std::vector<JettyPtr> first_jfcs;
+    ASSERT_TRUE(jetty_pool->acquire(2, first, first_jfcs).ok());
+    ASSERT_EQ(first.size(), 2U);
+    ASSERT_EQ(jetty_pool->createdCount(), 2U);
+    ASSERT_EQ(jetty_pool->idleCount(), 0U);
+    
+    for(auto& jetty : first) {
+        ASSERT_TRUE(adapter_->resetJetty(jetty).ok());
+    }
+    jetty_pool->release(std::move(first), std::move(first_jfcs));
+    EXPECT_EQ(jetty_pool->idleCount(), 2U);
+
+
+    std::vector<JettyPtr> second;
+    std::vector<JettyPtr> second_jfcs;
+    ASSERT_TRUE(jetty_pool->acquire(2, second, second_jfcs).ok());
+    ASSERT_EQ(second.size(), 2U);
+    ASSERT_EQ(jetty_pool->createdCount(), 2U);
+    ASSERT_EQ(jetty_pool->idleCount(), 0U);
+    
+    for(auto& jetty : second) {
+        ASSERT_TRUE(adapter_->resetJetty(jetty).ok());
+    }
+    jetty_pool->release(std::move(second), std::move(second_jfcs));
+    EXPECT_EQ(jetty_pool->idleCount(), 2U);
+
+    EXPECT_TRUE(context->shutdown().ok());
+    EXPECT_EQ(jetty_pool->idleCount(), 0U);
+    EXPECT_TRUE(adapter_->shutdown().ok());
 
 }  // namespace
 }  // namespace mooncake::tent::ub

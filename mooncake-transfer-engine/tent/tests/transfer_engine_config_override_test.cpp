@@ -457,11 +457,11 @@ TEST(TransferEngineConfigOverrideTest, UrmaTransModeSelectsRuntimeModeEndToEnd) 
         Config config;
         ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
 
-        UbParams params;
-        ASSERT_TRUE(UbParams::FromConfig(config, params).ok());
-        UbRuntimeMode resolved = UbRuntimeMode::kRcLegacy;
-        ASSERT_TRUE(resolveUbRuntimeMode(params, resolved).ok());
-        EXPECT_EQ(resolved, UbRuntimeMode::kRmLegacy);
+        ub::UbParams params;
+        ASSERT_TRUE(ub::UbParams::FromConfig(config, params).ok());
+        ub::UbRuntimeMode resolved = ub::UbRuntimeMode::kRcLegacy;
+        ASSERT_TRUE(ub::resolveUbRuntimeMode(params, resolved).ok());
+        EXPECT_EQ(resolved, ub::UbRuntimeMode::kRmLegacy);
     }
     {
         EnvVarGuard conf_guard("MC_TENT_CONF", identities);
@@ -469,11 +469,11 @@ TEST(TransferEngineConfigOverrideTest, UrmaTransModeSelectsRuntimeModeEndToEnd) 
         Config config;
         ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
 
-        UbParams params;
-        ASSERT_TRUE(UbParams::FromConfig(config, params).ok());
-        UbRuntimeMode resolved = UbRuntimeMode::kRmLegacy;
-        ASSERT_TRUE(resolveUbRuntimeMode(params, resolved).ok());
-        EXPECT_EQ(resolved, UbRuntimeMode::kRcLegacy);
+        ub::UbParams params;
+        ASSERT_TRUE(ub::UbParams::FromConfig(config, params).ok());
+        ub::UbRuntimeMode resolved = ub::UbRuntimeMode::kRmLegacy;
+        ASSERT_TRUE(ub::resolveUbRuntimeMode(params, resolved).ok());
+        EXPECT_EQ(resolved, ub::UbRuntimeMode::kRcLegacy);
     }
 }
 

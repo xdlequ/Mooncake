@@ -2219,7 +2219,7 @@ TEST(UbRmLegacyTest, RmInstallWithOnlyBondingDeviceNamesItInFailure) {
     EXPECT_NE(status.ToString().find("skipped by device selection"),
               std::string::npos)
         << "the failure must name the exclusion reason";
-    EXPECT_NE(status.ToString().find(device.topology_name),
+    EXPECT_NE(status.ToString().find(device.native_device_name),
               std::string::npos)
         << "the failure must name the excluded device";
     EXPECT_EQ(adapter->createJettyCalls(), 0U)
