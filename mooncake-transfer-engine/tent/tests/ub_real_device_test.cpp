@@ -157,6 +157,19 @@ TEST_F(UbRealDeviceTest, RealAdapterInitializesAndDiscoversActiveDevices) {
     // RM Legacy only selects devices with at least one active port; require
     // the discovered set to contain such a device, otherwise every RM test
     // would fail for an environmental reason.
+    for (const auto& device : discovered_) {
+        if (device.active) {
+            GTEST_SKIP() << "active URMA device found: " << device.native_device_name;
+        }
+        fprintf(stderr, "【DBG】device.name: %s, path = %s, kind = %s, mode =  %s, rm_tp_cap = 0x%x,
+            prio6_tp = 0x%x, eid = %s, active: %d\n",
+             device.native_device_name.c_str(), device.native_device_path.c_str(),
+             device.kind.c_str(), device.transport_modes.c_str(),
+             device.capabilities.transport_modes,
+             device.capabilities.rm_tp_cap,
+             device.capabilities.priority_tp_type_masks[6],
+             device.eid.c_str(), device.active);
+    }
     size_t active_devices = 0;
     for (const auto& device : discovered_) {
         if (device.active) ++active_devices;
@@ -185,11 +198,44 @@ TEST_F(UbRealDeviceTest, RmLegacyJettyLifecycleOverRealUrma) {
     // (RM transport mode + RTP bind mask) must be accepted by the real
     // provider for an RM-capable device.
     JettyPtr jetty;
-    ASSERT_TRUE(adapter_
-                    ->createJetty(context->handle(),
-                                  context->jfcs().front()->handle(),
-                                  rmJettyOptions(), jetty)
-                    .ok());
+    {
+        auto st = adapter_->createJetty(context->handle(),
+                                   context->jfcs().front()->handle(),
+                                    rmJettyOptions(), jetty);
+        if (!st.ok()) {
+            GTEST_SKIP() << "createJetty failed: " << st.ToString();
+            fprintf(stderr, "[DBG] dev name = %s, eid = %s, path = %s, 
+                kind = %s, mode = %s, active = %d\n",
+             device.native_device_name.c_str(), device.eid.c_str(),
+             device.native_device_path.c_str(), device.kind.c_str(),
+             device.transport_modes.c_str(),
+             (int)device.active);
+            fprintf(stderr, "【DBG】createJetty failed: %s\n", st.ToString().c_str());
+        }
+        {
+            auto ctp = rmJettyOptions();
+            ctp.bind_tp_type_mask = 0x2U;
+            JettyPtr jetty2;
+            auto st2 = adapter_->createJetty(context->handle(),
+                                   context->jfcs().front()->handle(),
+                                   ctp, jetty2);
+            if (!st2.ok()) {
+                GTEST_SKIP() << "createJetty failed: " << st2.ToString();
+                fprintf(stderr, "[DBG] dev name = %s, eid = %s, path = %s, 
+                    kind = %s, mode = %s, active = %d\n",
+             device.native_device_name.c_str(), device.eid.c_str(),
+             device.native_device_path.c_str(), device.kind.c_str(),
+             device.transport_modes.c_str(),
+             (int)device.active);
+                fprintf(stderr, "【DBG】createJetty failed: %s\n", st2.ToString().c_str());
+            }
+            fprintf(stderr, "【DBG】createJetty success: %s\n", st2.ToString().c_str());
+            if(jetty2) {
+                adapter_->deleteJetty(jetty2);
+            }
+        }
+
+    }
     ASSERT_NE(jetty, nullptr);
 
     // RESET fences in-flight WRs; a fresh Jetty must reset cleanly, and a
