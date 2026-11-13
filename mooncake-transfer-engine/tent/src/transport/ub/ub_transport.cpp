@@ -319,8 +319,20 @@ struct UbTransport::Impl {
         }
 
         if (contexts.empty()) {
-            return failInstall(Status::DeviceNotFound(
-                "No UB context initialized successfully" LOC_MARK));
+            // Name the devices that device selection excluded (e.g. bonding
+            // devices under physical-only RM Legacy) so an exhausted-
+            // selection failure is directly attributable instead of a bare
+            // "no context" message.
+            std::string reason = "No UB context initialized successfully";
+            if (!skipped_names.empty()) {
+                reason += "; skipped by device selection:";
+                for (size_t i = 0; i < skipped_names.size(); ++i) {
+                    reason += i == 0 ? " " : ", ";
+                    reason += skipped_names[i];
+                }
+            }
+            return failInstall(
+                Status::DeviceNotFound(reason + LOC_MARK));
         }
 
         size_t safe_slice_size = params.slice_size;

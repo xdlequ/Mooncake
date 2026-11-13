@@ -672,7 +672,8 @@ UbBootstrapDesc makeRmBootstrapV2Request() {
     return desc;
 }
 
-void setPhysicalOnlyIdentity(Config& config, const DeviceInfo& device) {
+void setDeviceIdentity(Config& config, const DeviceInfo& device,
+                       const char* kind) {
     config.set("transports/ub/physical_only", true);
     config.set("transports/ub/device_identities",
                nlohmann::json::array({{{"native_device_name",
@@ -681,9 +682,13 @@ void setPhysicalOnlyIdentity(Config& config, const DeviceInfo& device) {
                                         device.native_device_path},
                                        {"eid_index", device.eid_index},
                                        {"eid", device.eid},
-                                       {"kind", "physical"},
+                                       {"kind", kind},
                                        {"transport_modes",
                                         device.capabilities.transport_modes}}}));
+}
+
+void setPhysicalOnlyIdentity(Config& config, const DeviceInfo& device) {
+    setDeviceIdentity(config, device, "physical");
 }
 
 // Two UB NICs (device ids 0 and 1) both reachable from the wildcard memory
@@ -2183,6 +2188,42 @@ TEST(UbRmLegacyTest, RmInstallGateFailsClosedWithoutRmCapabilities) {
     EXPECT_TRUE(status.IsNotImplemented()) << status.ToString();
     EXPECT_EQ(adapter->createJettyCalls(), 0U)
         << "the capability gate must run before Jetty creation";
+}
+
+TEST(UbRmLegacyTest, RmInstallWithOnlyBondingDeviceNamesItInFailure) {
+    // An honestly labeled bonding device is excluded by physical-only
+    // selection. With no physical device left, install must fail closed and
+    // the failure must name the excluded device instead of a bare
+    // "no context" message, and no Jetty may be created.
+    auto device = rmCapableDevice();
+    device.kind = DeviceKind::BONDING;
+    auto adapter = std::make_shared<FakeUrmaAdapter>(device);
+    auto topology = fakeTopology();
+    auto control = std::make_shared<ControlService>("p2p", "", nullptr);
+    uint16_t port = 0;
+    ASSERT_TRUE(control->start(port).ok());
+    const std::string segment_name =
+        "127.0.0.1:" + std::to_string(static_cast<unsigned>(port));
+
+    auto config = std::make_shared<Config>();
+    config->set("transports/ub/enable", true);
+    config->set("transports/ub/runtime_profile", "rm_legacy");
+    config->set("transports/ub/trans_mode", "rm");
+    setDeviceIdentity(*config, device, "bonding");
+
+    UbTransport transport(adapter);
+    std::string mutable_segment_name = segment_name;
+    const auto status =
+        transport.install(mutable_segment_name, control, topology, config);
+    EXPECT_TRUE(status.IsDeviceNotFound()) << status.ToString();
+    EXPECT_NE(status.ToString().find("skipped by device selection"),
+              std::string::npos)
+        << "the failure must name the exclusion reason";
+    EXPECT_NE(status.ToString().find(device.topology_name),
+              std::string::npos)
+        << "the failure must name the excluded device";
+    EXPECT_EQ(adapter->createJettyCalls(), 0U)
+        << "no Jetty may be created for a skipped device";
 }
 
 TEST(UbRmLegacyTest, TransportRunsSelfReadWriteWithExplicitRmTargets) {

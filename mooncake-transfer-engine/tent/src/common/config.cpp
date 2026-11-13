@@ -200,6 +200,43 @@ Status ConfigHelper::loadFromEnv(Config& config) {
         }
     }
 
+    // UB transport mode override for benchmarks: MC_URMA_TRANS_MODE=rc|rm
+    // (case-insensitive). Applied after MC_TENT_CONF so the env var takes
+    // precedence over the trans_mode hardcoded in the JSON config; an unset
+    // or empty env keeps the JSON value. Invalid values fail fast here with
+    // a clear error instead of surfacing later as a confusing runtime-mode
+    // rejection deep inside install().
+    if (const char* trans_mode = std::getenv("MC_URMA_TRANS_MODE")) {
+        if (*trans_mode != '\0') {
+            std::string mode(trans_mode);
+            std::transform(mode.begin(), mode.end(), mode.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            if (mode != "rc" && mode != "rm") {
+                return Status::InvalidArgument(
+                    "Invalid MC_URMA_TRANS_MODE \"" +
+                    std::string(trans_mode) +
+                    "\": expected \"rc\" or \"rm\"");
+            }
+            config.setFromString("transports/ub/trans_mode", mode);
+            // The env var is the authoritative UB runtime mode selector, so
+            // also align the runtime-profile keys that the
+            // resolveUbRuntimeMode matrix requires to stay consistent with
+            // the selected mode. Without this, MC_URMA_TRANS_MODE=rm over
+            // an RC-oriented config would be rejected by the matrix instead
+            // of switching modes. RM Legacy is physical-only and still
+            // requires device_identities from MC_TENT_CONF; that is
+            // enforced with a clear error by UbParams::FromConfig.
+            if (mode == "rm") {
+                config.setFromString("transports/ub/runtime_profile",
+                                     "rm_legacy");
+                config.set("transports/ub/physical_only", true);
+            } else {
+                config.setFromString("transports/ub/runtime_profile",
+                                     "rc_legacy");
+            }
+        }
+    }
+
     // Legacy keys for backward compatibility (MC_* env vars)
     setConfig(config, "MOONCAKE_LOCAL_HOSTNAME", "rpc_server_hostname");
     if (std::getenv("MC_FORCE_TCP")) {

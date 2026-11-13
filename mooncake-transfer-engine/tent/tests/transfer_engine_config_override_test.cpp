@@ -29,6 +29,7 @@
 #include "tent/common/config.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/transfer_engine.h"
+#include "tent/transport/ub/params.h"
 
 #ifndef _WIN32
 #include <asio.hpp>
@@ -399,6 +400,100 @@ TEST(TransferEngineConfigOverrideTest, LocalHostnameEnvOverridesMcTentConf) {
     // Legacy env must override MC_TENT_CONF, same precedence as
     // MC_RDMA_BIND_ADDRESS (env wins so per-pod injection works).
     EXPECT_EQ(config.get("rpc_server_hostname", ""), "10.0.0.2");
+}
+
+// MC_URMA_TRANS_MODE lets benchmarks switch the UB runtime mode without
+// editing the JSON config. The env var is the authoritative selector: rm
+// aligns the runtime profile to RM Legacy (rm_legacy + physical_only) and rc
+// aligns it to RC Legacy, so a value conflicting with the JSON config
+// switches modes instead of tripping the runtime matrix. device_identities
+// (required by physical_only) still come from MC_TENT_CONF; an unset/empty
+// env keeps the JSON values; an illegal value fails loadFromEnv with a
+// clear error.
+TEST(TransferEngineConfigOverrideTest, UrmaTransModeEnvOverridesMcTentConf) {
+    EnvVarGuard conf_guard(
+        "MC_TENT_CONF", R"({"transports":{"ub":{"trans_mode":"rc"}}})");
+    EnvVarGuard mode_guard("MC_URMA_TRANS_MODE", "RM");
+
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+
+    EXPECT_EQ(config.get("transports/ub/trans_mode", ""), "rm");
+    EXPECT_EQ(config.get("transports/ub/runtime_profile", ""), "rm_legacy");
+    EXPECT_TRUE(config.get("transports/ub/physical_only", false));
+}
+
+TEST(TransferEngineConfigOverrideTest, UrmaTransModeRcFlipsRmLegacyJson) {
+    EnvVarGuard conf_guard(
+        "MC_TENT_CONF",
+        R"({"transports":{"ub":{"runtime_profile":"rm_legacy",)"
+        R"("trans_mode":"rm","physical_only":true}}})");
+    EnvVarGuard mode_guard("MC_URMA_TRANS_MODE", "RC");
+
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+
+    EXPECT_EQ(config.get("transports/ub/trans_mode", ""), "rc");
+    EXPECT_EQ(config.get("transports/ub/runtime_profile", ""), "rc_legacy");
+    // rc keeps the physical-device pinning from the JSON untouched.
+    EXPECT_TRUE(config.get("transports/ub/physical_only", false));
+}
+
+// End-to-end: with only device_identities supplied via MC_TENT_CONF (the
+// one input the env var cannot synthesize), MC_URMA_TRANS_MODE selects a
+// runtime mode that passes the full UbParams::FromConfig +
+// resolveUbRuntimeMode gate in both directions.
+TEST(TransferEngineConfigOverrideTest, UrmaTransModeSelectsRuntimeModeEndToEnd) {
+    const std::string identities =
+        R"({"transports":{"ub":{"device_identities":[{)"
+        R"("native_device_name":"ubma_0",)"
+        R"("native_device_path":"/dev/uburma/0",)"
+        R"("eid":"0001:0002:0003:0004","eid_index":0,)"
+        R"("transport_modes":3,"kind":"physical"}]}}})";
+
+    {
+        EnvVarGuard conf_guard("MC_TENT_CONF", identities);
+        EnvVarGuard mode_guard("MC_URMA_TRANS_MODE", "RM");
+        Config config;
+        ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+
+        UbParams params;
+        ASSERT_TRUE(UbParams::FromConfig(config, params).ok());
+        UbRuntimeMode resolved = UbRuntimeMode::kRcLegacy;
+        ASSERT_TRUE(resolveUbRuntimeMode(params, resolved).ok());
+        EXPECT_EQ(resolved, UbRuntimeMode::kRmLegacy);
+    }
+    {
+        EnvVarGuard conf_guard("MC_TENT_CONF", identities);
+        EnvVarGuard mode_guard("MC_URMA_TRANS_MODE", "rc");
+        Config config;
+        ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+
+        UbParams params;
+        ASSERT_TRUE(UbParams::FromConfig(config, params).ok());
+        UbRuntimeMode resolved = UbRuntimeMode::kRmLegacy;
+        ASSERT_TRUE(resolveUbRuntimeMode(params, resolved).ok());
+        EXPECT_EQ(resolved, UbRuntimeMode::kRcLegacy);
+    }
+}
+
+TEST(TransferEngineConfigOverrideTest, UrmaTransModeUnsetKeepsMcTentConfValue) {
+    EnvVarGuard conf_guard(
+        "MC_TENT_CONF", R"({"transports":{"ub":{"trans_mode":"rc"}}})");
+    // An empty value is treated as unset so the JSON value stays effective.
+    EnvVarGuard mode_guard("MC_URMA_TRANS_MODE", "");
+
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+
+    EXPECT_EQ(config.get("transports/ub/trans_mode", ""), "rc");
+}
+
+TEST(TransferEngineConfigOverrideTest, InvalidUrmaTransModeFailsLoadFromEnv) {
+    EnvVarGuard mode_guard("MC_URMA_TRANS_MODE", "uc");
+
+    Config config;
+    EXPECT_TRUE(ConfigHelper().loadFromEnv(config).IsInvalidArgument());
 }
 
 TEST(TransferEngineConfigOverrideTest,
