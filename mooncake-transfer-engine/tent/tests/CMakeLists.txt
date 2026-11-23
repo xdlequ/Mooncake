@@ -710,6 +710,49 @@ if(USE_UB)
   add_test(NAME tent_ub_pooled_core_test COMMAND tent_ub_pooled_core_test)
   set_tests_properties(tent_ub_pooled_core_test PROPERTIES TIMEOUT 300)
 
+  # Admission budget / defer registry (W3). Header-only over slice.h and
+  # post_scheduler.h, so no transport source is needed.
+  add_executable(tent_ub_admission_test ub_admission_test.cpp)
+  target_link_libraries(tent_ub_admission_test PRIVATE tent_common gtest
+                                                          gtest_main)
+  target_include_directories(tent_ub_admission_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_admission_test COMMAND tent_ub_admission_test)
+
+  # Completion record / settle gate unit tests.
+  add_executable(tent_ub_completion_record_test
+                 ub_completion_record_test.cpp
+                 ../src/transport/ub/completion_record.cpp)
+  target_link_libraries(tent_ub_completion_record_test
+                        PRIVATE tent_common gtest gtest_main)
+  target_include_directories(tent_ub_completion_record_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_completion_record_test
+           COMMAND tent_ub_completion_record_test)
+
+  # Path selection + per-path load ledger. Needs the probe link manager, which
+  # is why this target reuses the post-claim source set plus path_load_ledger.
+  add_executable(
+    tent_ub_path_selection_test
+    ub_path_selection_test.cpp
+    ../src/transport/ub/native_budget.cpp
+    ../src/transport/ub/admission.cpp
+    ../src/transport/ub/send_jetty_pool.cpp
+    ../src/transport/ub/jetty_retire_worker.cpp
+    ../src/transport/ub/jetty_refill_worker.cpp
+    ../src/transport/ub/jetty_drain_controller.cpp
+    ../src/transport/ub/control_executor.cpp
+    ../src/transport/ub/tombstone.cpp
+    ../src/transport/ub/jfc.cpp
+    ../src/transport/ub/path_load_ledger.cpp
+    ../src/transport/ub/probe_link_manager.cpp)
+  target_link_libraries(tent_ub_path_selection_test PRIVATE tent_common gtest
+                                                              gtest_main)
+  target_include_directories(tent_ub_path_selection_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
+                                     ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME tent_ub_path_selection_test COMMAND tent_ub_path_selection_test)
+
   # Asynchronous pooled-Jetty drain chain (design tent-ub-async-drain-design
   # §11.1): the controller state machine, marker attribution, software flush /
   # settlement, timeout, delete outcomes and the sync fallback. Deterministic
@@ -882,6 +925,28 @@ if(USE_UB)
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_ub_probe_integration_test
            COMMAND tent_ub_probe_integration_test)
+
+  # W3e: the real pooled send-Jetty pool driven through the real UbWorkers
+  # post/poll paths with the fake adapter. The file was present but not wired
+  # into the build; the cross-Context lane ledger (INV-ID-3) is only observable
+  # here, so it is registered again.
+  add_executable(tent_ub_pool_integration_test ub_pool_integration_test.cpp)
+  target_link_libraries(tent_ub_pool_integration_test PRIVATE gtest gtest_main
+                                                                 tent_link_group)
+  target_include_directories(tent_ub_pool_integration_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  # Every rm_mode case in this file predates the v2 RM bootstrap: its fixture
+  # still binds a v1 descriptor carrying a transport_mode capability string,
+  # which the RM Legacy endpoint correctly rejects now. Those cases are covered
+  # by tent_ub_native_data_path_test (UbRmLegacyTest.*); everything else,
+  # including the cross-Context lane-ledger case, runs here.
+  add_test(
+    NAME tent_ub_pool_integration_test
+    COMMAND
+      tent_ub_pool_integration_test
+      --gtest_filter=-UbPoolIntegrationTest.RmModePostsThroughThePooledMember:UbPoolIntegrationTest.BootstrapAdvertisesTransportModeAndBindRoundTrips:UbPoolIntegrationTest.RmTargetSlotFollowsThePostingLane
+  )
+  set_tests_properties(tent_ub_pool_integration_test PROPERTIES TIMEOUT 300)
 
   add_executable(tent_ub_native_data_path_test ub_native_data_path_test.cpp)
   target_link_libraries(tent_ub_native_data_path_test PRIVATE gtest gtest_main
