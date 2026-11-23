@@ -122,15 +122,47 @@ class PooledFakeAdapter final : public UrmaAdapter {
     }
     Status createJetty(const ContextPtr&, const JfcPtr& jfc,
                        const JettyOptions&, JettyPtr& jetty) override {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!jfc) return Status::InvalidArgument("bad JFC");
-        if (create_failures_remaining_ > 0) {
-            --create_failures_remaining_;
-            jetty.reset();
-            return Status::InternalError("injected createJetty failure");
+        std::function<void()> hook;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!jfc) return Status::InvalidArgument("bad JFC");
+            if (create_failures_remaining_ > 0) {
+                --create_failures_remaining_;
+                jetty.reset();
+                return Status::InternalError("injected createJetty failure");
+            }
+            if (invalid_next_create_) {
+                // G-1 knob: contract violation — OK without a usable Jetty.
+                invalid_next_create_ = false;
+                switch (invalid_create_mode_) {
+                    case InvalidJettyMode::kNotValid: {
+                        // Partially allocated: a wrapper whose handle is dead.
+                        auto broken =
+                            std::make_shared<PooledFakeJetty>(next_jetty_id_++);
+                        broken->close();
+                        jetty = std::move(broken);
+                        ++created_;
+                        break;
+                    }
+                    case InvalidJettyMode::kZeroId:
+                        jetty = std::make_shared<PooledFakeJetty>(0);
+                        ++created_;
+                        break;
+                    case InvalidJettyMode::kNull:
+                        jetty.reset();
+                        break;
+                }
+                return Status::OK();
+            }
+            jetty = std::make_shared<PooledFakeJetty>(next_jetty_id_++);
+            ++created_;
+            hook = create_jetty_hook_;
         }
-        jetty = std::make_shared<PooledFakeJetty>(next_jetty_id_++);
-        ++created_;
+        // Interleave hook: copied under the lock and invoked outside it so
+        // the hook may re-enter the adapter (e.g. a synchronous retirement
+        // deleting this very Jetty) — mirrors FakeUrmaAdapter's semantics
+        // (C12 / G-02 "创建中 stop").
+        if (hook) hook();
         return Status::OK();
     }
     Status deleteJetty(JettyPtr& jetty) override {
@@ -176,6 +208,26 @@ class PooledFakeAdapter final : public UrmaAdapter {
         std::lock_guard<std::mutex> lock(mutex_);
         delete_failures_remaining_ = count;
     }
+    // Shape of the G-1 contract violation: what the next createJetty hands
+    // back together with an OK status instead of a healthy Jetty.
+    enum class InvalidJettyMode {
+        kNotValid,  // allocated wrapper, but valid() == false
+        kZeroId,    // valid() but the zero identity sentinel
+        kNull,      // no Jetty at all
+    };
+    // G-1: makes the next createJetty return OK with an unusable Jetty.
+    void setNextCreateJettyInvalid(InvalidJettyMode mode) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        invalid_next_create_ = true;
+        invalid_create_mode_ = mode;
+    }
+    // Installs a hook invoked inside every createJetty after the member is
+    // allocated, so a test can interleave beginStop() with an in-flight
+    // tryLease (G-2 "创建中 stop" on the new pool). Pass nullptr to clear it.
+    void setCreateJettyHook(std::function<void()> hook) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        create_jetty_hook_ = std::move(hook);
+    }
     int created() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return created_;
@@ -192,6 +244,9 @@ class PooledFakeAdapter final : public UrmaAdapter {
     int delete_failures_remaining_ = 0;
     int created_ = 0;
     int deleted_ = 0;
+    bool invalid_next_create_ = false;
+    InvalidJettyMode invalid_create_mode_ = InvalidJettyMode::kNotValid;
+    std::function<void()> create_jetty_hook_;
 };
 
 PoolKey makePoolKey(uint64_t incarnation = 1) {
@@ -401,6 +456,34 @@ TEST(UbNativeBudgetTest, LeakedReservationCounted) {
     EXPECT_EQ(snapshot.leaked_reservations, 1u);
     // The leak keeps the budget charged.
     EXPECT_EQ(snapshot.total_jetties, 1u);
+}
+
+TEST(UbNativeBudgetTest, ReleaseUnallocatedRollsBackCreatingOnly) {
+    NativeBudget budget;
+    ASSERT_TRUE(budget.configure("dev0", 4, 2, 0).ok());
+    BudgetQuantities one;
+    one.jetties = 1;
+
+    // The rollback is only for reservations that never reached the
+    // provider: a published (active) object must retire through the
+    // proven-destruction gate instead.
+    auto active = budget.tryReserve("dev0", BudgetRole::kTarget, one);
+    ASSERT_TRUE(active.has_value());
+    ASSERT_TRUE(budget.transition(*active, BudgetObjectState::kActive).ok());
+    EXPECT_TRUE(budget.releaseUnallocated(*active).IsInvalidArgument());
+
+    auto rolled_back = budget.tryReserve("dev0", BudgetRole::kTarget, one);
+    ASSERT_TRUE(rolled_back.has_value());
+    EXPECT_TRUE(budget.releaseUnallocated(*rolled_back).ok());
+    EXPECT_FALSE(rolled_back->valid());
+
+    // Only the active reservation stays charged, and the rolled-back slot
+    // is reusable: the configured budget of 2 still admits one more.
+    auto snapshot = budget.snapshot("dev0");
+    EXPECT_EQ(snapshot.total_jetties, 1u);
+    EXPECT_EQ(snapshot.active_jetties, 1u);
+    auto retry = budget.tryReserve("dev0", BudgetRole::kTarget, one);
+    EXPECT_TRUE(retry.has_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -619,6 +702,80 @@ TEST(UbSendJettyPoolTest, CreateFailureDefersAndReleasesBudget) {
     EXPECT_TRUE(grant.lease.valid());
 }
 
+// G-1 (T-09): createJetty returning OK with a partially allocated (invalid)
+// Jetty or a valid one carrying the zero identity sentinel must fail closed.
+// The member is never published, the invalid wrapper retires without a reset
+// while the zero-ID one goes through the full RESET-before-delete contract,
+// the budget is released only after the delete is proven, and tryLease defers
+// so the next round can succeed.
+TEST(UbSendJettyPoolTest, CreateOkInvalidJettyFailsClosedAndDefers) {
+    PoolHarness harness;
+    ASSERT_TRUE(harness.init(2, 2, 8, 0, 1, 16).ok());
+    const auto key = makePoolKey();
+
+    // OK + invalid Jetty: wrapper-only retirement, budget proven-released.
+    harness.adapter->setNextCreateJettyInvalid(
+        PooledFakeAdapter::InvalidJettyMode::kNotValid);
+    LeaseWithCredit deferred;
+    EXPECT_TRUE(harness.pool
+                    ->tryLease(key, makeAttemptKey(1, 1, 1), deferred)
+                    .IsTooManyRequests());
+    EXPECT_FALSE(deferred.lease.valid());
+    EXPECT_EQ(harness.pool->stats().create_failures, 1u);
+    EXPECT_EQ(harness.pool->stats().created_members, 0u);
+    EXPECT_EQ(harness.pool->servingCount(key), 0u);
+    EXPECT_EQ(harness.adapter->deleted(), 1);
+    auto snapshot = harness.budget->snapshot("dev0");
+    EXPECT_EQ(snapshot.total_jetties, 0u);
+    EXPECT_EQ(snapshot.quarantined_jetties, 0u);
+
+    // OK + valid Jetty with the zero identity sentinel: same fail-closed
+    // outcome through the RESET-before-delete retirement.
+    harness.adapter->setNextCreateJettyInvalid(
+        PooledFakeAdapter::InvalidJettyMode::kZeroId);
+    EXPECT_TRUE(harness.pool
+                    ->tryLease(key, makeAttemptKey(1, 2, 1), deferred)
+                    .IsTooManyRequests());
+    EXPECT_EQ(harness.pool->stats().create_failures, 2u);
+    EXPECT_EQ(harness.adapter->deleted(), 2);
+    snapshot = harness.budget->snapshot("dev0");
+    EXPECT_EQ(snapshot.total_jetties, 0u);
+    EXPECT_EQ(snapshot.quarantined_jetties, 0u);
+
+    // The next round succeeds: the pool recovered without a restart.
+    LeaseWithCredit grant;
+    ASSERT_TRUE(
+        harness.pool->tryLease(key, makeAttemptKey(1, 3, 1), grant).ok());
+    EXPECT_TRUE(grant.lease.valid());
+    EXPECT_NE(grant.lease.lane().jetty_id, 0u);
+}
+
+// G-1 (T-09): OK with a null Jetty allocated nothing: no native retirement
+// is needed, the reservation is released and the next round succeeds.
+TEST(UbSendJettyPoolTest, CreateOkNullJettyFailsClosedAndDefers) {
+    PoolHarness harness;
+    ASSERT_TRUE(harness.init(2, 2, 8, 0, 1, 16).ok());
+    const auto key = makePoolKey();
+
+    harness.adapter->setNextCreateJettyInvalid(
+        PooledFakeAdapter::InvalidJettyMode::kNull);
+    LeaseWithCredit deferred;
+    EXPECT_TRUE(harness.pool
+                    ->tryLease(key, makeAttemptKey(1, 1, 1), deferred)
+                    .IsTooManyRequests());
+    EXPECT_FALSE(deferred.lease.valid());
+    EXPECT_EQ(harness.pool->stats().create_failures, 1u);
+    EXPECT_EQ(harness.adapter->created(), 0);
+    EXPECT_EQ(harness.adapter->deleted(), 0);
+    const auto snapshot = harness.budget->snapshot("dev0");
+    EXPECT_EQ(snapshot.total_jetties, 0u);
+
+    LeaseWithCredit grant;
+    ASSERT_TRUE(
+        harness.pool->tryLease(key, makeAttemptKey(1, 2, 1), grant).ok());
+    EXPECT_TRUE(grant.lease.valid());
+}
+
 TEST(UbSendJettyPoolTest, StopRejectsNewLeasesAndRetiresOutstanding) {
     PoolHarness harness;
     ASSERT_TRUE(harness.init(2, 2, 8, 0, 1, 16).ok());
@@ -643,6 +800,44 @@ TEST(UbSendJettyPoolTest, StopRejectsNewLeasesAndRetiresOutstanding) {
     EXPECT_EQ(harness.pool->servingCount(key), 0u);
     const auto snapshot = harness.budget->snapshot("dev0");
     EXPECT_EQ(snapshot.total_jetties, 0u);
+}
+
+// G-2 (T-09): beginStop() interleaved with an in-flight creation must roll
+// the whole lease back. Nothing is published, the freshly created Jetty is
+// deleted, the budget is released after the proven delete, and the pool
+// permanently rejects later leases.
+TEST(UbSendJettyPoolTest, StopInterleavedWithCreationRollsBackWithoutPublishing) {
+    PoolHarness harness;
+    ASSERT_TRUE(harness.init(1, 2, 8, 0, 1, 16).ok());
+    const auto key = makePoolKey();
+
+    // The stop lands inside createJetty, i.e. while tryLease is mid-creation.
+    harness.adapter->setCreateJettyHook([&] { harness.pool->beginStop(); });
+    LeaseWithCredit deferred;
+    EXPECT_TRUE(harness.pool
+                    ->tryLease(key, makeAttemptKey(1, 1, 1), deferred)
+                    .IsTooManyRequests());
+    EXPECT_FALSE(deferred.lease.valid());
+    EXPECT_TRUE(harness.pool->stopping());
+
+    // The member created inside the window was deleted, never published.
+    EXPECT_EQ(harness.adapter->created(), 1);
+    EXPECT_EQ(harness.adapter->deleted(), 1);
+    EXPECT_EQ(harness.pool->stats().created_members, 0u);
+    EXPECT_EQ(harness.pool->servingCount(key), 0u);
+    // Proven destruction released the reservation: nothing stays charged.
+    const auto snapshot = harness.budget->snapshot("dev0");
+    EXPECT_EQ(snapshot.total_jetties, 0u);
+    EXPECT_EQ(snapshot.quarantined_jetties, 0u);
+
+    // With the hook cleared the pool still rejects: stopping is permanent.
+    harness.adapter->setCreateJettyHook(nullptr);
+    LeaseWithCredit rejected;
+    EXPECT_TRUE(harness.pool
+                    ->tryLease(key, makeAttemptKey(1, 2, 1), rejected)
+                    .IsTooManyRequests());
+    EXPECT_EQ(harness.pool->stats().stop_rejections, 1u);
+    EXPECT_EQ(harness.adapter->created(), 1);
 }
 
 TEST(UbSendJettyPoolTest, FaultRetiresPermanently) {

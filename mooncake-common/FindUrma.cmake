@@ -67,7 +67,7 @@ else()
   FetchContent_Declare(
     urma
     GIT_REPOSITORY https://atomgit.com/openeuler/umdk.git
-    GIT_TAG master)
+    GIT_TAG 8cdca734c2f71113cf3d0d8d6d60157d77cd3d88)
   FetchContent_MakeAvailable(urma)
 
   # UMDK stores the public headers in separate core and bond directories.

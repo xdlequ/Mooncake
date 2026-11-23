@@ -2549,12 +2549,16 @@ void UbWorkers::processPendingPooled(
                 status = Status::InternalError(
                     "UB RM endpoint has no imported target for this "
                     "slot" LOC_MARK);
-            } else {
-                status =
-                    adapter_->post(jetty, {work}, posted_count, acceptance);
             }
-        } else {
-            status = adapter_->post(jetty, {work}, posted_count, acceptance);
+        }
+        if (status.ok() && jetty) {
+            // C02 / T-10: one pooled attempt is exactly one single-WR post.
+            // postOne never splits it into multiple posts and never
+            // substitutes a second target; legacy keeps the vector post.
+            const PostResult posted = adapter_->postOne(jetty, work);
+            status = posted.status;
+            posted_count = posted.posted_count;
+            acceptance = posted.acceptance;
         }
         if (record->pending.task && record->pending.task->traceEnabled()) {
             record->pending.slice->notePostReturned(steadyNowNs());

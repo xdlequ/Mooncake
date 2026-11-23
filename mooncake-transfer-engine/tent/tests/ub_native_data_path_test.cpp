@@ -443,6 +443,11 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     Status post(const JettyPtr& jetty, const std::vector<WorkRequest>& requests,
                 size_t& posted_count) override {
         posted_count = 0;
+        // T-10 diagnostics: every invocation and every WR crossing this
+        // boundary, so a test can prove one post call carries exactly one
+        // WR per pooled attempt.
+        post_calls_.fetch_add(1, std::memory_order_relaxed);
+        posted_wrs_.fetch_add(requests.size(), std::memory_order_relaxed);
         auto fake = std::dynamic_pointer_cast<FakeJetty>(jetty);
         if (!fake || !fake->valid() || (!fake->bound() && !fake->rmMode())) {
             return Status::InvalidArgument("unbound Jetty");
@@ -501,12 +506,22 @@ class FakeUrmaAdapter final : public UrmaAdapter {
                         request.length);
                 }
             }
-            fake->jfc()->push(
-                Completion{category, 0, request.token,
-                           category == CompletionCategory::SUCCESS
-                               ? static_cast<uint32_t>(request.length)
-                               : 0,
-                           fake->id()});
+            Completion completion{
+                category, 0, request.token,
+                category == CompletionCategory::SUCCESS
+                    ? static_cast<uint32_t>(request.length)
+                    : 0,
+                fake->id()};
+            if (hold_completions_.load(std::memory_order_acquire)) {
+                // Parked instead of delivered: the test releases them once
+                // every slice of the task has been dispatched, so rail load
+                // (quota + inflight) stays visible to path selection.
+                std::lock_guard<std::mutex> lock(held_completions_mutex_);
+                held_completions_.emplace_back(fake->jfc(),
+                                               std::move(completion));
+            } else {
+                fake->jfc()->push(std::move(completion));
+            }
             ++posted_count;
         }
         return Status::OK();
@@ -596,6 +611,35 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     uint64_t rmPostCalls() const {
         return rm_post_calls_.load(std::memory_order_relaxed);
     }
+    // T-10: total post invocations and total WRs handed to post(), across
+    // every mode; equal counts prove each call carried exactly one WR.
+    uint64_t postCalls() const {
+        return post_calls_.load(std::memory_order_relaxed);
+    }
+    uint64_t postedWrs() const {
+        return posted_wrs_.load(std::memory_order_relaxed);
+    }
+    // Parks every posted WR's completion instead of delivering it to the
+    // JFC (successful WRITE data still lands at post time). Lets a test
+    // keep rails loaded while the slices of one task dispatch
+    // back-to-back, making device spreading deterministic.
+    void holdAllCompletions() {
+        hold_completions_.store(true, std::memory_order_release);
+    }
+    void releaseHeldCompletions() {
+        hold_completions_.store(false, std::memory_order_release);
+        std::vector<std::pair<std::shared_ptr<FakeJfc>, Completion>> drained;
+        {
+            std::lock_guard<std::mutex> lock(held_completions_mutex_);
+            drained = std::move(held_completions_);
+            held_completions_.clear();
+        }
+        for (auto& entry : drained) {
+            if (entry.first && entry.first->valid()) {
+                entry.first->push(std::move(entry.second));
+            }
+        }
+    }
     uint32_t lastPostedTargetId() const {
         return last_post_target_id_.load(std::memory_order_relaxed);
     }
@@ -616,6 +660,10 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     std::atomic<CompletionCategory> next_completion_{
         CompletionCategory::SUCCESS};
     std::atomic<bool> hold_next_completion_{false};
+    std::atomic<bool> hold_completions_{false};
+    mutable std::mutex held_completions_mutex_;
+    std::vector<std::pair<std::shared_ptr<FakeJfc>, Completion>>
+        held_completions_;
     std::atomic<bool> fail_next_post_{false};
     std::atomic<bool> accept_then_fail_post_{false};
     std::atomic<int> fail_imports_{0};
@@ -640,6 +688,8 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     std::atomic<uint64_t> import_calls_{0};
     std::atomic<uint64_t> unimport_calls_{0};
     std::atomic<uint64_t> rm_post_calls_{0};
+    std::atomic<uint64_t> post_calls_{0};
+    std::atomic<uint64_t> posted_wrs_{0};
     std::atomic<uint32_t> last_post_target_id_{0};
     std::atomic<uint32_t> last_registered_access_{0};
 };
@@ -2105,10 +2155,12 @@ TEST(UbRmLegacyTest, BindRmClassifiesRepeatedBootstrapAgainstIncumbent) {
     EXPECT_TRUE(adapter->shutdown().ok());
 }
 
-// Simple send-Jetty reuse: a cleanly retired incarnation returns its
-// drained Jettys to the per-context pool and the next incarnation re-leases
-// them instead of creating new ones.
-TEST(UbRmLegacyTest, SendJettyPoolReusesDrainedJettys) {
+// Simple send-Jetty pool, fail-closed after use (G-01): a retired
+// incarnation's drained RESET members have no rearm proof, so release
+// deletes them instead of idling them for reuse; the next incarnation
+// always creates fresh members. A provider-supported rearm would be the
+// only way to reintroduce reuse.
+TEST(UbRmLegacyTest, SendJettyPoolRetireDeletesMembersFailClosed) {
     auto adapter = std::make_shared<FakeUrmaAdapter>(rmCapableDevice());
     ASSERT_TRUE(adapter->initialize().ok());
     auto context = std::make_shared<UbContext>(0, rmCapableDevice(), adapter);
@@ -2145,22 +2197,24 @@ TEST(UbRmLegacyTest, SendJettyPoolReusesDrainedJettys) {
     ASSERT_TRUE(first->bindRm(peer, expectedForRmPeer(peer)).ok());
     EXPECT_EQ(first->importedTargetCount(), 2U);
 
-    // A clean retire returns both Jettys to the pool instead of deleting
-    // them; the imported targets are still unimported.
+    // A clean retire releases the members back to the pool, which deletes
+    // them fail-closed (no rearm proof for a RESET member); the imported
+    // targets are still unimported.
     ASSERT_TRUE(first->retire().ok());
     EXPECT_EQ(first->state(), UbEndpoint::State::kDestroyed);
-    EXPECT_EQ(adapter->deleteJettyCalls(), 0U)
-        << "pooled Jettys must not be deleted on retire";
-    EXPECT_EQ(pool->idleCount(), 2U);
+    EXPECT_EQ(adapter->deleteJettyCalls(), 2U)
+        << "used members are deleted, never idled for reuse (G-01)";
+    EXPECT_EQ(pool->idleCount(), 0U);
     EXPECT_EQ(first->importedTargetCount(), 0U);
     EXPECT_EQ(adapter->unimportCalls(), 2U);
 
-    // Second incarnation reuses the pooled Jettys: no new createJetty and
-    // the data-plane pairing (2 targets, 2 Jettys) still validates.
+    // Second incarnation creates fresh members: no reuse without a
+    // provider-supported rearm; the data-plane pairing (2 targets, 2
+    // Jettys) still validates.
     auto second = make_endpoint();
     ASSERT_TRUE(second->prepare().ok());
-    EXPECT_EQ(adapter->createJettyCalls(), 2U)
-        << "the second incarnation must lease from the pool";
+    EXPECT_EQ(adapter->createJettyCalls(), 4U)
+        << "the second incarnation must create fresh members";
     EXPECT_EQ(pool->idleCount(), 0U);
     UbBootstrapDesc second_peer;
     make_peer(second, second_peer);
@@ -2168,14 +2222,13 @@ TEST(UbRmLegacyTest, SendJettyPoolReusesDrainedJettys) {
         second->bindRm(second_peer, expectedForRmPeer(second_peer)).ok());
     EXPECT_EQ(second->importedTargetCount(), 2U);
     ASSERT_TRUE(second->retire().ok());
-    EXPECT_EQ(adapter->createJettyCalls(), 2U);
-    EXPECT_EQ(adapter->deleteJettyCalls(), 0U);
-    EXPECT_EQ(pool->idleCount(), 2U);
+    EXPECT_EQ(adapter->createJettyCalls(), 4U);
+    EXPECT_EQ(adapter->deleteJettyCalls(), 4U);
+    EXPECT_EQ(pool->idleCount(), 0U);
 
-    // Context shutdown drains the pool: every idle Jetty is deleted before
-    // the JFCs go away.
+    // Context shutdown drains the pool: nothing is left pending.
     EXPECT_TRUE(context->shutdown().ok());
-    EXPECT_EQ(adapter->deleteJettyCalls(), 2U);
+    EXPECT_EQ(adapter->deleteJettyCalls(), 4U);
     EXPECT_TRUE(adapter->shutdown().ok());
 }
 
@@ -2854,12 +2907,12 @@ TEST(UbRmPoolTest, TransportRunsSelfReadWriteThroughPooledSendPool) {
     config->set("transports/ub/slice_timeout_ms", 1000);
     config->set("transports/ub/endpoint_cooldown_ms", 100);
     config->set("transports/ub/jetty_pool/enable", true);
-    // pin the pool ceiling so the test observes strict reuse:one endpoint
-    // jetty plus one pooled member is enough for a serial 3-transfer sequence
-    // with the default desired_per_context=6 an in-flight lease triggers a
-    // legal deficit creation,making the createJettyCalls assertion depend on
-    // poller timing.
-    config->set("transports/ub/jetty_pool/business_desired_serving", 2);
+    // Pin the pool ceiling so the test observes strict reuse: one endpoint
+    // Jetty plus one pooled member is enough for a serial 3-transfer sequence.
+    // desired_serving must be 1: any higher ceiling lets a lease that races
+    // the previous return's settlement legally create a deficit member, which
+    // would make the createJettyCalls assertions depend on return timing.
+    config->set("transports/ub/jetty_pool/business_desired_serving", 1);
     // This test pins exact createJettyCalls counters; keep the pool
     // demand-driven so the background refill cannot top up asynchronously.
     config->set("transports/ub/send_pool/background_refill", false);
@@ -2976,6 +3029,357 @@ TEST(UbRmPoolTest, TransportRunsSelfReadWriteThroughPooledSendPool) {
         << "every pooled member and endpoint Jetty is deleted on uninstall";
     EXPECT_GE(adapter->unimportCalls(), adapter->importCalls())
         << "every imported target must be unimported before uninstall ends";
+}
+
+// T-10 / C02: one pooled attempt is exactly one single-WR post. Every post
+// call crossing the adapter boundary carries exactly one WorkRequest (the
+// postOne contract), so the call count and the WR count stay equal however
+// many attempts (slices, retries, probes) run.
+TEST(UbRmPoolTest, PooledAttemptPostsExactlyOneWrPerAttempt) {
+    auto device = rmCapableDevice();
+    auto adapter = std::make_shared<FakeUrmaAdapter>(device);
+    auto topology = fakeTopology(false);
+    auto control = std::make_shared<ControlService>("p2p", "", nullptr);
+    uint16_t port = 0;
+    ASSERT_TRUE(control->start(port).ok());
+    const std::string segment_name =
+        "127.0.0.1:" + std::to_string(static_cast<unsigned>(port));
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        segment.name = segment_name;
+                        segment.rpc_server_addr = segment_name;
+                        segment.machine_id = "fake-machine";
+                        segment.type = SegmentType::Memory;
+                        segment.detail = MemorySegmentDesc{};
+                        std::get<MemorySegmentDesc>(segment.detail).topology =
+                            *topology;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    auto config = std::make_shared<Config>();
+    config->set("transports/ub/enable", true);
+    config->set("transports/ub/runtime_profile", "rm_pool");
+    config->set("transports/ub/trans_mode", "rm");
+    config->set("transports/ub/worker_count", 1);
+    config->set("transports/ub/poller_count", 1);
+    config->set("transports/ub/jfc_per_context", 1);
+    config->set("transports/ub/jetty_per_endpoint", 1);
+    config->set("transports/ub/max_endpoints", 16);
+    config->set("transports/ub/slice_size", 16);
+    config->set("transports/ub/max_slices_per_task", 8);
+    config->set("transports/ub/max_retries", 1);
+    config->set("transports/ub/slice_timeout_ms", 1000);
+    config->set("transports/ub/endpoint_cooldown_ms", 100);
+    config->set("transports/ub/jetty_pool/enable", true);
+    config->set("transports/ub/send_pool/desired_per_context", 2);
+    config->set("transports/ub/send_pool/background_refill", false);
+    setPhysicalOnlyIdentity(*config, device);
+
+    UbTransport transport(adapter);
+    std::string mutable_segment_name = segment_name;
+    ASSERT_TRUE(
+        transport.install(mutable_segment_name, control, topology, config)
+            .ok());
+
+    std::array<char, 64> source{};
+    std::array<char, 64> target{};
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(i);
+    }
+    BufferDesc source_desc{};
+    source_desc.addr = reinterpret_cast<uint64_t>(source.data());
+    source_desc.length = source.size();
+    source_desc.location = kWildcardLocation;
+    BufferDesc target_desc{};
+    target_desc.addr = reinterpret_cast<uint64_t>(target.data());
+    target_desc.length = target.size();
+    target_desc.location = kWildcardLocation;
+    MemoryOptions options;
+    options.perm = kGlobalReadWrite;
+    std::vector<BufferDesc> descriptors{source_desc, target_desc};
+    ASSERT_TRUE(transport.addMemoryBuffer(descriptors, options).ok());
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        std::get<MemorySegmentDesc>(segment.detail).buffers =
+                            descriptors;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 3).ok());
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(target.data());
+    request.length = source.size();
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {request}).ok());
+
+    TransferStatus transfer{PENDING, 0};
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (transfer.s == PENDING &&
+           std::chrono::steady_clock::now() < deadline) {
+        ASSERT_TRUE(transport.getTransferStatus(batch, 0, transfer).ok());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_EQ(transfer.s, COMPLETED);
+    EXPECT_EQ(source, target);
+    // One WR per post call: the 64-byte request is four 16-byte slices, each
+    // posted through its own single-WR postOne call.
+    EXPECT_GE(adapter->postCalls(), 4U);
+    EXPECT_EQ(adapter->postCalls(), adapter->postedWrs())
+        << "every post call must carry exactly one WorkRequest";
+    EXPECT_GE(adapter->rmPostCalls(), 4U)
+        << "each pooled slice posts with an explicit imported target";
+
+    ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+    EXPECT_TRUE(transport.uninstall().ok());
+}
+
+// T-10 / A01: a definitive zero-acceptance post (the WR never crossed the
+// native boundary) unwinds the whole admission chain in reverse order —
+// gate token, JFC credit, lease, Task K permit — so the member returns to
+// the pool, the permit is free again before the retry requeues, and the
+// retry attempt reuses the same member instead of creating a new one.
+TEST(UbRmPoolTest, PooledZeroAcceptRollsBackAdmissionAndRetriesSameMember) {
+    auto device = rmCapableDevice();
+    auto adapter = std::make_shared<FakeUrmaAdapter>(device);
+    auto topology = fakeTopology(false);
+    auto control = std::make_shared<ControlService>("p2p", "", nullptr);
+    uint16_t port = 0;
+    ASSERT_TRUE(control->start(port).ok());
+    const std::string segment_name =
+        "127.0.0.1:" + std::to_string(static_cast<unsigned>(port));
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        segment.name = segment_name;
+                        segment.rpc_server_addr = segment_name;
+                        segment.machine_id = "fake-machine";
+                        segment.type = SegmentType::Memory;
+                        segment.detail = MemorySegmentDesc{};
+                        std::get<MemorySegmentDesc>(segment.detail).topology =
+                            *topology;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    auto config = std::make_shared<Config>();
+    config->set("transports/ub/enable", true);
+    config->set("transports/ub/runtime_profile", "rm_pool");
+    config->set("transports/ub/trans_mode", "rm");
+    config->set("transports/ub/worker_count", 1);
+    config->set("transports/ub/poller_count", 1);
+    config->set("transports/ub/jfc_per_context", 1);
+    config->set("transports/ub/jetty_per_endpoint", 1);
+    config->set("transports/ub/max_endpoints", 16);
+    config->set("transports/ub/slice_size", 16);
+    config->set("transports/ub/max_slices_per_task", 8);
+    config->set("transports/ub/max_retries", 1);
+    config->set("transports/ub/slice_timeout_ms", 1000);
+    config->set("transports/ub/endpoint_cooldown_ms", 100);
+    config->set("transports/ub/jetty_pool/enable", true);
+    config->set("transports/ub/send_pool/desired_per_context", 1);
+    config->set("transports/ub/send_pool/background_refill", false);
+    setPhysicalOnlyIdentity(*config, device);
+
+    UbTransport transport(adapter);
+    std::string mutable_segment_name = segment_name;
+    ASSERT_TRUE(
+        transport.install(mutable_segment_name, control, topology, config)
+            .ok());
+
+    std::array<char, 64> source{};
+    std::array<char, 64> target{};
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(200 - i);
+    }
+    BufferDesc source_desc{};
+    source_desc.addr = reinterpret_cast<uint64_t>(source.data());
+    source_desc.length = source.size();
+    source_desc.location = kWildcardLocation;
+    BufferDesc target_desc{};
+    target_desc.addr = reinterpret_cast<uint64_t>(target.data());
+    target_desc.length = target.size();
+    target_desc.location = kWildcardLocation;
+    MemoryOptions options;
+    options.perm = kGlobalReadWrite;
+    std::vector<BufferDesc> descriptors{source_desc, target_desc};
+    ASSERT_TRUE(transport.addMemoryBuffer(descriptors, options).ok());
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        std::get<MemorySegmentDesc>(segment.detail).buffers =
+                            descriptors;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 3).ok());
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(target.data());
+    request.length = source.size();
+    // The first slice attempt is definitively rejected before the WR crosses
+    // the native boundary (posted_count stays zero).
+    adapter->failNextPostWithoutAccept();
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {request}).ok());
+
+    TransferStatus transfer{PENDING, 0};
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (transfer.s == PENDING &&
+           std::chrono::steady_clock::now() < deadline) {
+        ASSERT_TRUE(transport.getTransferStatus(batch, 0, transfer).ok());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_EQ(transfer.s, COMPLETED);
+    EXPECT_EQ(transfer.transferred_bytes, source.size());
+    EXPECT_EQ(source, target);
+    // One endpoint Jetty, one pool member, and one rebuilt endpoint Jetty:
+    // the zero-accept rollback returned the member (the W3 reject
+    // disposition retires the endpoint incarnation once, not the member),
+    // so the retry (and every later slice) reuses the same pool member
+    // instead of creating a new one.
+    EXPECT_EQ(adapter->createJettyCalls(), 3U);
+    // Four slices: one rejected post, its retry, and three further slices.
+    EXPECT_EQ(adapter->postCalls(), 5U);
+    EXPECT_EQ(adapter->postCalls(), adapter->postedWrs());
+    EXPECT_EQ(adapter->deleteJettyCalls(), 1U)
+        << "only the retired endpoint incarnation's Jetty is deleted; the "
+           "rolled-back member must not be retired before uninstall";
+
+    ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+    EXPECT_TRUE(transport.uninstall().ok());
+    EXPECT_EQ(adapter->deleteJettyCalls(), adapter->createJettyCalls());
+}
+
+// T-10 / A01: a Task K miss is capacity pressure, never a retry or fault.
+// With K=1 and a zero retry budget, the later slices of one task must defer
+// while the first slice is in flight (its completion parked so the permit
+// stays held) and still complete afterwards; a single deferred attempt that
+// consumed retry budget would fail the task permanently.
+TEST(UbRmPoolTest, PooledTaskPermitMissDefersWithoutRetryCharge) {
+    auto device = rmCapableDevice();
+    auto adapter = std::make_shared<FakeUrmaAdapter>(device);
+    auto topology = fakeTopology(false);
+    auto control = std::make_shared<ControlService>("p2p", "", nullptr);
+    uint16_t port = 0;
+    ASSERT_TRUE(control->start(port).ok());
+    const std::string segment_name =
+        "127.0.0.1:" + std::to_string(static_cast<unsigned>(port));
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        segment.name = segment_name;
+                        segment.rpc_server_addr = segment_name;
+                        segment.machine_id = "fake-machine";
+                        segment.type = SegmentType::Memory;
+                        segment.detail = MemorySegmentDesc{};
+                        std::get<MemorySegmentDesc>(segment.detail).topology =
+                            *topology;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    auto config = std::make_shared<Config>();
+    config->set("transports/ub/enable", true);
+    config->set("transports/ub/runtime_profile", "rm_pool");
+    config->set("transports/ub/trans_mode", "rm");
+    config->set("transports/ub/worker_count", 1);
+    config->set("transports/ub/poller_count", 1);
+    config->set("transports/ub/jfc_per_context", 1);
+    config->set("transports/ub/jetty_per_endpoint", 1);
+    config->set("transports/ub/max_endpoints", 16);
+    config->set("transports/ub/slice_size", 16);
+    config->set("transports/ub/max_slices_per_task", 8);
+    // Zero retry budget: any attempt that charges retry (instead of
+    // deferring) fails its slice permanently.
+    config->set("transports/ub/max_retries", 0);
+    config->set("transports/ub/slice_timeout_ms", 1000);
+    config->set("transports/ub/endpoint_cooldown_ms", 100);
+    config->set("transports/ub/jetty_pool/enable", true);
+    config->set("transports/ub/send_pool/desired_per_context", 2);
+    config->set("transports/ub/send_pool/background_refill", false);
+    // K=1: one task may hold exactly one inflight attempt at a time.
+    config->set("transports/ub/task_max_inflight_attempts", 1);
+    setPhysicalOnlyIdentity(*config, device);
+
+    UbTransport transport(adapter);
+    std::string mutable_segment_name = segment_name;
+    ASSERT_TRUE(
+        transport.install(mutable_segment_name, control, topology, config)
+            .ok());
+
+    std::array<char, 64> source{};
+    std::array<char, 64> target{};
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(64 + i);
+    }
+    BufferDesc source_desc{};
+    source_desc.addr = reinterpret_cast<uint64_t>(source.data());
+    source_desc.length = source.size();
+    source_desc.location = kWildcardLocation;
+    BufferDesc target_desc{};
+    target_desc.addr = reinterpret_cast<uint64_t>(target.data());
+    target_desc.length = target.size();
+    target_desc.location = kWildcardLocation;
+    MemoryOptions options;
+    options.perm = kGlobalReadWrite;
+    std::vector<BufferDesc> descriptors{source_desc, target_desc};
+    ASSERT_TRUE(transport.addMemoryBuffer(descriptors, options).ok());
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        std::get<MemorySegmentDesc>(segment.detail).buffers =
+                            descriptors;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 3).ok());
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(target.data());
+    request.length = source.size();
+    // Park every completion: the first slice stays in flight holding the
+    // task's only permit while the worker reaches the later slices.
+    adapter->holdAllCompletions();
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {request}).ok());
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    TransferStatus transfer{PENDING, 0};
+    ASSERT_TRUE(transport.getTransferStatus(batch, 0, transfer).ok());
+    ASSERT_EQ(transfer.s, PENDING)
+        << "the parked completion must keep the task open";
+    // Exactly one slice posted: the K miss deferred every other slice of
+    // this task without posting or failing anything.
+    EXPECT_EQ(adapter->postCalls(), 1U);
+    EXPECT_EQ(adapter->postCalls(), adapter->postedWrs());
+
+    adapter->releaseHeldCompletions();
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (transfer.s == PENDING &&
+           std::chrono::steady_clock::now() < deadline) {
+        ASSERT_TRUE(transport.getTransferStatus(batch, 0, transfer).ok());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    // K=1 with a zero retry budget: completion proves every deferred slice
+    // was re-admitted after the permit freed instead of consuming retries.
+    ASSERT_EQ(transfer.s, COMPLETED);
+    EXPECT_EQ(transfer.transferred_bytes, source.size());
+    EXPECT_EQ(source, target);
+    EXPECT_GE(adapter->postCalls(), 4U);
+    EXPECT_EQ(adapter->postCalls(), adapter->postedWrs());
+
+    ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+    EXPECT_TRUE(transport.uninstall().ok());
 }
 
 // C08 error-retire path: a real error completion (the class native status 9
@@ -3240,6 +3644,7 @@ TEST(UbRmPoolTest, BackgroundRefillTopsUpKnownPoolKey) {
     EXPECT_TRUE(transport.uninstall().ok());
     EXPECT_EQ(adapter->deleteJettyCalls(), adapter->createJettyCalls());
 }
+
 
 }  // namespace
 }  // namespace mooncake::tent::ub

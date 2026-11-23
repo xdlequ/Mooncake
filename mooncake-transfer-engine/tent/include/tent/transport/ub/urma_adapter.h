@@ -510,6 +510,15 @@ inline const char* deleteOutcomeKindName(DeleteOutcome::Kind kind) noexcept {
     return "unknown";
 }
 
+// Result of one single-WR post (C02). The Status and the acceptance
+// classification are separated so a caller can distinguish "the call failed"
+// from "the WR may still have crossed the native boundary".
+struct PostResult {
+    Status status;
+    PostAcceptance acceptance = PostAcceptance::kNotAccepted;
+    size_t posted_count = 0;
+};
+
 // Pure, injectable URMA boundary. It deliberately does not know about TENT
 // Request, SubBatch, UbTask, UbSlice, scheduling, retry, or rail health.
 //
@@ -731,6 +740,19 @@ class UrmaAdapter {
         }
         acceptance = classifyPostAcceptance(status, posted_count, 1);
         return status;
+    }
+
+    // C02 single-WR post: one pooled attempt posts exactly one WR. The
+    // default routes through the vector post so existing adapters keep their
+    // semantics; an implementation must never split one request into
+    // multiple posts and must never substitute a second target.
+    virtual PostResult postOne(const JettyPtr& jetty,
+                               const WorkRequest& request) {
+        PostResult result;
+        const std::vector<WorkRequest> single{request};
+        result.status =
+            post(jetty, single, result.posted_count, result.acceptance);
+        return result;
     }
 
     virtual Status poll(const JfcPtr& jfc, size_t max_completions,

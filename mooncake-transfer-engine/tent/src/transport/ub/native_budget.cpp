@@ -185,6 +185,33 @@ Status NativeBudget::releaseAfterProvenDestruction(
     return Status::OK();
 }
 
+Status NativeBudget::releaseUnallocated(BudgetReservation& reservation) {
+    if (!reservation.valid()) {
+        return Status::InvalidArgument(
+            "UB budget rollback requires a valid reservation" LOC_MARK);
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto device = devices_.find(reservation.device_key);
+    if (device == devices_.end()) {
+        return Status::InvalidArgument(
+            "UB budget reservation references an unknown device" LOC_MARK);
+    }
+    auto entry = device->second.entries.find(reservation.reservation_id);
+    if (entry == device->second.entries.end()) {
+        return Status::InvalidArgument(
+            "UB budget reservation was already released" LOC_MARK);
+    }
+    if (entry->second.state != BudgetObjectState::kCreating) {
+        return Status::InvalidArgument(
+            "UB budget rollback requires a creating reservation; a published "
+            "object must be retired and proven destroyed instead" LOC_MARK);
+    }
+    device->second.entries.erase(entry);
+    reservation_device_.erase(reservation.reservation_id);
+    reservation.reservation_id = 0;
+    return Status::OK();
+}
+
 void NativeBudget::recordLeakedReservation(
     const BudgetReservation& reservation) {
     if (!reservation.valid()) return;

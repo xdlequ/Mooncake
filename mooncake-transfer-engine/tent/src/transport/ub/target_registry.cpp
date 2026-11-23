@@ -684,22 +684,34 @@ Status validateUbLocalPortTargetDesc(const UbLocalPortTargetDesc& desc) {
 Status UbLocalPortTargetRegistry::create(
     std::shared_ptr<NodeTargetQuota> quota,
     std::shared_ptr<UbLocalPortTargetFactory> factory,
-    std::shared_ptr<UbLocalPortTargetRegistry>& out) {
+    std::shared_ptr<UbLocalPortTargetRegistry>& out,
+    std::shared_ptr<NativeBudget> budget,
+    const std::string& budget_device_key) {
     if (!quota) {
         return invalidRegistryArg("node target quota must not be null");
     }
     if (!factory) {
         return invalidRegistryArg("local target factory must not be null");
     }
+    if (budget && budget_device_key.empty()) {
+        return invalidRegistryArg(
+            "a wired device budget requires a non-empty device key");
+    }
     out = std::shared_ptr<UbLocalPortTargetRegistry>(
-        new UbLocalPortTargetRegistry(std::move(quota), std::move(factory)));
+        new UbLocalPortTargetRegistry(std::move(quota), std::move(factory),
+                                       std::move(budget),
+                                       budget_device_key));
     return Status::OK();
 }
 
 UbLocalPortTargetRegistry::UbLocalPortTargetRegistry(
     std::shared_ptr<NodeTargetQuota> quota,
-    std::shared_ptr<UbLocalPortTargetFactory> factory)
-    : quota_(std::move(quota)), factory_(std::move(factory)) {}
+    std::shared_ptr<UbLocalPortTargetFactory> factory,
+    std::shared_ptr<NativeBudget> budget, std::string budget_device_key)
+    : quota_(std::move(quota)),
+      factory_(std::move(factory)),
+      budget_(std::move(budget)),
+      budget_device_key_(std::move(budget_device_key)) {}
 
 Status UbLocalPortTargetRegistry::acquire(
     const UbLocalPortTargetDesc& desc, UbTargetReferenceRole role,
@@ -770,9 +782,34 @@ Status UbLocalPortTargetRegistry::acquire(
         return Status::OK();
     }
 
+    // C05.1 joint admission: the physical device budget (kTarget role) is
+    // reserved before the provider is called. Either ledger may defer; the
+    // other reservation is rolled back as proven-never-allocated, so a
+    // capacity miss never leaks budget and never reaches the provider.
+    std::optional<BudgetReservation> budget_reservation;
+    if (budget_) {
+        BudgetQuantities quantities;
+        quantities.jetties = 1;
+        budget_reservation =
+            budget_->tryReserve(budget_device_key_, BudgetRole::kTarget,
+                                quantities);
+        if (!budget_reservation.has_value()) {
+            const Status rollback = quota_->releaseUnallocated(*ticket);
+            if (!rollback.ok()) {
+                quota_->transition(*ticket,
+                                   TargetObjectState::kQuarantinedUnproven);
+            }
+            disposition = UbTargetAcquireDisposition::kCapacity;
+            return Status::OK();
+        }
+    }
+
     Entry& entry = entries_[port_epoch];
     entry.desc = desc;
     entry.ticket = std::move(*ticket);
+    if (budget_reservation.has_value()) {
+        entry.budget = std::move(*budget_reservation);
+    }
     entry.in_flight = true;
     lock.unlock();
 
@@ -784,7 +821,8 @@ Status UbLocalPortTargetRegistry::acquire(
     if (!create_status.ok()) {
         if (it != entries_.end()) {
             // Proven-never-allocated rollback path: creation failed before
-            // any native handle was published.
+            // any native handle was published (the factory contract fully
+            // cleans up partial handles on failure).
             Status release_status =
                 quota_->releaseUnallocated(it->second.ticket);
             if (!release_status.ok()) {
@@ -792,6 +830,14 @@ Status UbLocalPortTargetRegistry::acquire(
                 // double-releasing quota.
                 quota_->transition(it->second.ticket,
                                    TargetObjectState::kQuarantinedUnproven);
+            }
+            if (budget_ && it->second.budget.valid()) {
+                const Status budget_release =
+                    budget_->releaseUnallocated(it->second.budget);
+                if (!budget_release.ok()) {
+                    budget_->transition(it->second.budget,
+                                        BudgetObjectState::kQuarantined);
+                }
             }
             entries_.erase(it);
         }
@@ -807,6 +853,26 @@ Status UbLocalPortTargetRegistry::acquire(
     published.role_references[ubTargetReferenceRoleIndex(role)] = 1;
     ++successful_creations_;
     quota_->transition(published.ticket, TargetObjectState::kActive);
+    if (budget_ && published.budget.valid()) {
+        const Status activated = budget_->transition(
+            published.budget, BudgetObjectState::kActive);
+        if (!activated.ok()) {
+            // Bookkeeping inconsistency: never publish a target whose
+            // device budget cannot be activated. Destroy it now and keep
+            // both ledgers quarantined until destruction is proven.
+            --successful_creations_;
+            ++failed_creations_;
+            ReclaimWork doomed{std::move(published.jetty),
+                               std::move(published.ticket),
+                               std::move(published.budget)};
+            entries_.erase(it);
+            lock.unlock();
+            std::vector<ReclaimWork> doomed_work;
+            doomed_work.push_back(std::move(doomed));
+            reclaimOutsideLock(std::move(doomed_work));
+            return activated;
+        }
+    }
 
     uint64_t& watermark = watermarks_[desc.port_id];
     if (desc.target_epoch > watermark) {
@@ -840,7 +906,8 @@ Status UbLocalPortTargetRegistry::retirePortTarget(const std::string& port_id,
     entry.retired = true;
     if (entry.references > 0) return Status::OK();
     std::vector<ReclaimWork> pending;
-    pending.push_back(ReclaimWork{entry.jetty, std::move(entry.ticket)});
+    pending.push_back(ReclaimWork{entry.jetty, std::move(entry.ticket),
+                                  std::move(entry.budget)});
     entries_.erase(it);
     lock.unlock();
     reclaimOutsideLock(std::move(pending));
@@ -895,7 +962,8 @@ void UbLocalPortTargetRegistry::releaseReference(
     }
     if (entry.references > 0 || !entry.retired) return;
     std::vector<ReclaimWork> pending;
-    pending.push_back(ReclaimWork{entry.jetty, std::move(entry.ticket)});
+    pending.push_back(ReclaimWork{entry.jetty, std::move(entry.ticket),
+                                  std::move(entry.budget)});
     entries_.erase(it);
     lock.unlock();
     reclaimOutsideLock(std::move(pending));
@@ -914,7 +982,8 @@ UbLocalPortTargetRegistry::supersedeLocked(const std::string& port_id,
         }
         entry.retired = true;
         if (entry.references == 0) {
-            work.push_back(ReclaimWork{entry.jetty, std::move(entry.ticket)});
+            work.push_back(ReclaimWork{entry.jetty, std::move(entry.ticket),
+                                       std::move(entry.budget)});
             it = entries_.erase(it);
             continue;
         }
@@ -927,24 +996,40 @@ void UbLocalPortTargetRegistry::reclaimOutsideLock(
     std::vector<ReclaimWork> work) {
     for (auto& item : work) {
         if (!item.jetty) continue;
+        if (budget_ && item.budget.valid()) {
+            // kActive -> kRetiring at the destruction linearization point;
+            // an unproven result quarantines the reservation below so the
+            // device budget stays charged.
+            budget_->transition(item.budget, BudgetObjectState::kRetiring);
+        }
         bool destruction_proven = false;
         const Status destroy_status =
             factory_->destroyTarget(item.jetty, destruction_proven);
         if (destroy_status.ok() && destruction_proven) {
             quota_->transition(item.ticket,
                                TargetObjectState::kRetiringDeleting);
-            if (quota_
-                    ->releaseAfterProvenDestruction(item.ticket, true)
-                    .ok()) {
+            const bool quota_released =
+                quota_->releaseAfterProvenDestruction(item.ticket, true).ok();
+            bool budget_released = true;
+            if (budget_ && item.budget.valid()) {
+                budget_released =
+                    budget_
+                        ->releaseAfterProvenDestruction(item.budget, true)
+                        .ok();
+            }
+            if (quota_released && budget_released) {
                 std::lock_guard<std::mutex> lock(mutex_);
                 ++proven_destructions_;
                 continue;
             }
         }
-        // Unproven or failed destruction keeps the quota slot charged
+        // Unproven or failed destruction keeps both ledgers charged
         // (quarantine); the recovery owner (T-14) retries later.
         quota_->transition(item.ticket,
                            TargetObjectState::kQuarantinedUnproven);
+        if (budget_ && item.budget.valid()) {
+            budget_->transition(item.budget, BudgetObjectState::kQuarantined);
+        }
         std::lock_guard<std::mutex> lock(mutex_);
         ++quarantined_destructions_;
     }

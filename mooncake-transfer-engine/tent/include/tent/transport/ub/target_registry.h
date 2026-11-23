@@ -33,6 +33,7 @@
 #include "tent/transport/ub/bootstrap.h"
 #include "tent/transport/ub/bootstrap_types.h"
 #include "tent/transport/ub/device_selection.h"
+#include "tent/transport/ub/native_budget.h"
 #include "tent/transport/ub/node_target_quota.h"
 #include "tent/transport/ub/urma_adapter.h"
 
@@ -397,16 +398,25 @@ class UbImportedTargetRegistry final
 // One LocalPortTarget per configured port, referenced by many peers,
 // endpoints, business attempts and probes. Every initial creation and every
 // epoch replacement reserves a ticket from the node-authoritative
-// NodeTargetQuota (never per peer / Context / Engine / process). Referencing
-// an existing published target never touches the quota, so a shared
-// handshake is never rejected because the quota is full, and a capacity
-// error never retires a healthy incumbent. Destruction of a retired target
-// happens only after its last reference drops and must be proven before the
-// quota slot is released.
+// NodeTargetQuota (never per peer / Context / Engine / process) AND one
+// kTarget reservation from the physical device NativeBudget (C05.1 joint
+// admission: both must succeed before the provider is called; neither ledger
+// may be bypassed). Referencing an existing published target never touches
+// either ledger, so a shared handshake is never rejected because a ledger is
+// full, and a capacity error never retires a healthy incumbent. Destruction
+// of a retired target happens only after its last reference drops and must
+// be proven before the quota slot and the device budget are released.
 //
-// Lock order (T-15): registry mutex -> NodeTargetQuota mutex. The quota
-// ledger never calls back into the registry, so the order is
-// one-directional and deadlock-free.
+// The optional device budget keeps the registry testable without one: when
+// no budget is wired, the registry accounts only the node quota (send-pool
+// side and later production assembly own the budget install). One registry
+// instance with a device budget serves the ports of one physical device;
+// nodes with several devices share one NodeTargetQuota across per-device
+// registries.
+//
+// Lock order (T-15): registry mutex -> NodeTargetQuota mutex and
+// registry mutex -> NativeBudget mutex, both one-directional; neither
+// ledger ever calls back into the registry.
 // ---------------------------------------------------------------------------
 
 // Descriptor of one receive-side shared target generation.
@@ -513,14 +523,17 @@ class UbLocalPortTargetRegistry final
     static Status create(
         std::shared_ptr<NodeTargetQuota> quota,
         std::shared_ptr<UbLocalPortTargetFactory> factory,
-        std::shared_ptr<UbLocalPortTargetRegistry>& out);
+        std::shared_ptr<UbLocalPortTargetRegistry>& out,
+        std::shared_ptr<NativeBudget> budget = nullptr,
+        const std::string& budget_device_key = "");
 
     // Acquires a reference on the shared target of one configured port. If
     // a published target exists at the same epoch with the same content the
     // reference is granted without touching the node quota (shared
     // handshake never blocked by capacity). Otherwise a new generation is
-    // created single-flight after reserving a node quota ticket; a full
-    // quota defers with kCapacity and keeps every healthy incumbent.
+    // created single-flight after reserving a node quota ticket AND a
+    // kTarget device budget reservation (when a budget is wired); a full
+    // ledger defers with kCapacity and keeps every healthy incumbent.
     Status acquire(const UbLocalPortTargetDesc& desc,
                    UbTargetReferenceRole role, UbLocalPortTargetRef& out,
                    UbTargetAcquireDisposition& disposition);
@@ -537,7 +550,9 @@ class UbLocalPortTargetRegistry final
    private:
     explicit UbLocalPortTargetRegistry(
         std::shared_ptr<NodeTargetQuota> quota,
-        std::shared_ptr<UbLocalPortTargetFactory> factory);
+        std::shared_ptr<UbLocalPortTargetFactory> factory,
+        std::shared_ptr<NativeBudget> budget,
+        std::string budget_device_key);
 
     struct PortEpochKey {
         std::string port_id;
@@ -557,6 +572,7 @@ class UbLocalPortTargetRegistry final
         UbLocalPortTargetDesc desc;
         JettyPtr jetty;
         TargetQuotaTicket ticket;
+        BudgetReservation budget;
         uint64_t references = 0;
         uint64_t role_references[3] = {0, 0, 0};
         bool in_flight = false;
@@ -566,6 +582,7 @@ class UbLocalPortTargetRegistry final
     struct ReclaimWork {
         JettyPtr jetty;
         TargetQuotaTicket ticket;
+        BudgetReservation budget;
     };
 
     friend class UbLocalPortTargetRef;
@@ -581,6 +598,10 @@ class UbLocalPortTargetRegistry final
 
     const std::shared_ptr<NodeTargetQuota> quota_;
     const std::shared_ptr<UbLocalPortTargetFactory> factory_;
+    // Optional physical device budget (C05.1 joint admission). Null in
+    // tests and assemblies that only account the node quota.
+    const std::shared_ptr<NativeBudget> budget_;
+    const std::string budget_device_key_;
     mutable std::mutex mutex_;
     std::unordered_map<PortEpochKey, Entry, PortEpochKeyHash> entries_;
     std::unordered_map<std::string, uint64_t> watermarks_;

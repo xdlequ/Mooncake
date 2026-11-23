@@ -412,6 +412,26 @@ Status SendJettyPool::createAndPublish(const PoolKey& pool_key) {
         return created;
     }
 
+    // Publish-time re-verification (T-09 step 3: OPEN/generation/profile/ID).
+    // A provider returning OK without a usable Jetty is a contract violation
+    // and fails closed exactly like the legacy endpoint check: a null Jetty
+    // allocated nothing, while an invalid or zero-ID one may still hold
+    // partially allocated native resources, so it retires unpublished
+    // (RESET-before-delete only when valid) and the budget is released only
+    // once destruction is proven. tryLease then defers this round.
+    if (!jetty || !jetty->valid() || jetty->id() == 0) {
+        retireUnpublished(std::move(jetty), std::move(*reservation),
+                          pool_key);
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto bucket = buckets_.find(pool_key);
+        if (bucket != buckets_.end() && bucket->second.creating > 0) {
+            --bucket->second.creating;
+        }
+        ++create_failures_;
+        return Status::InternalError(
+            "URMA adapter returned an invalid Jetty" LOC_MARK);
+    }
+
     // Re-check under the lock: publish only when the pool is still
     // accepting; otherwise the fresh Jetty is retired (stopped result).
     std::shared_ptr<PoolMember> member;

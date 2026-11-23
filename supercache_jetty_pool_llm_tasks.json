@@ -1,0 +1,1491 @@
+{
+  "schema_version": 1,
+  "kind": "llm_implementation_task_graph",
+  "language": "zh-CN",
+  "scope": "Mooncake physical UB RM/CTP complete Jetty pooling",
+  "reference_baseline": {
+    "branch": "tent/tent_rm",
+    "commit": "00546197",
+    "rule": "inspect_current_tree_before_editing"
+  },
+  "calendar_constraints": null,
+  "authority_order": [
+    "current_user_instructions",
+    "blocking_decision_register.final_decision",
+    "design_v5.target_contracts",
+    "this_document.engineering_mapping"
+  ],
+  "module_catalog": {
+    "M00": {
+      "name": "构建与基线",
+      "paths": [
+        "mooncake-common/FindUrma.cmake",
+        "mooncake-transfer-engine/tent/tests/CMakeLists.txt"
+      ],
+      "owns": [
+        "可复现构建、CTP测试基线、provider版本锁定"
+      ]
+    },
+    "M01": {
+      "name": "配置、物理身份、profile",
+      "paths": [
+        "mooncake-transfer-engine/tent/include/tent/transport/ub/params.h",
+        "mooncake-transfer-engine/tent/include/tent/transport/ub/device_selection.h",
+        "mooncake-transfer-engine/tent/src/transport/ub/ub_transport.cpp"
+      ],
+      "owns": [
+        "按Context保存的LocalSendProfile",
+        "冻结的可信inventory和配置"
+      ]
+    },
+    "M02": {
+      "name": "native adapter与legacy修复",
+      "paths": [
+        "mooncake-transfer-engine/tent/include/tent/transport/ub/urma_adapter.h",
+        "mooncake-transfer-engine/tent/src/transport/ub/urma_adapter.cpp",
+        "mooncake-transfer-engine/tent/src/transport/ub/context.cpp",
+        "mooncake-transfer-engine/tent/src/transport/ub/jetty_pool.cpp"
+      ],
+      "owns": [
+        "native句柄封装、版本化ProviderContract",
+        "旧整组reuse生命周期"
+      ]
+    },
+    "M03": {
+      "name": "v3控制面与共享target",
+      "paths": [
+        "mooncake-transfer-engine/tent/include/tent/transport/ub/bootstrap_types.h",
+        "mooncake-transfer-engine/tent/src/transport/ub/bootstrap.cpp",
+        "mooncake-transfer-engine/tent/src/transport/ub/endpoint.cpp",
+        "mooncake-transfer-engine/tent/src/transport/ub/ub_transport.cpp",
+        "新增port_target/target_registry模块"
+      ],
+      "owns": [
+        "LocalPortTarget",
+        "ImportedTargetRegistry",
+        "握手候选与watermark"
+      ]
+    },
+    "M04": {
+      "name": "路径与负载",
+      "paths": [
+        "mooncake-transfer-engine/tent/src/transport/ub/workers.cpp",
+        "新增path_registry模块"
+      ],
+      "owns": [
+        "PathVersion、资格、路径计数",
+        "按ImportedTargetKey聚合负载"
+      ]
+    },
+    "M05": {
+      "name": "预算、业务池与准入",
+      "paths": [
+        "mooncake-transfer-engine/tent/include/tent/transport/ub/slice.h",
+        "mooncake-transfer-engine/tent/src/transport/ub/workers.cpp",
+        "新增native_budget/send_jetty_pool模块"
+      ],
+      "owns": [
+        "设备级全角色NativeBudget",
+        "PoolKey级LIFO、move-only lease",
+        "Task K和JFC credit票据"
+      ]
+    },
+    "M06": {
+      "name": "完成门、结果与重试",
+      "paths": [
+        "mooncake-transfer-engine/tent/src/transport/ub/workers.cpp",
+        "mooncake-transfer-engine/tent/include/tent/transport/ub/slice.h",
+        "新增attempt_gate/result_sidecar模块"
+      ],
+      "owns": [
+        "Inflight、CompletionToken",
+        "一次结算与lease归还门",
+        "LogicalState/ExecutionOutcome/ResourceSafety"
+      ]
+    },
+    "M07": {
+      "name": "异步退役、删除、补池",
+      "paths": [
+        "mooncake-transfer-engine/tent/src/transport/ub/jfc.cpp",
+        "mooncake-transfer-engine/tent/src/transport/ub/context.cpp",
+        "新增recovery_registry/delete_queue/refill_controller模块"
+      ],
+      "owns": [
+        "退役资源唯一owner",
+        "JFC排他lease、pending、quarantine、tombstone"
+      ]
+    },
+    "M08": {
+      "name": "并发探测与健康恢复",
+      "paths": [
+        "新增probe_resource/probe_slots/path_health/peer_campaign模块"
+      ],
+      "owns": [
+        "每口专用ProbeResource",
+        "逐WR槽位、token、pin",
+        "peer campaign、路径fault_epoch及有序证据"
+      ]
+    },
+    "M09": {
+      "name": "Runtime与SDK生命周期",
+      "paths": [
+        "mooncake-transfer-engine/tent/src/runtime/transfer_engine_impl.cpp",
+        "mooncake-transfer-engine/tent/src/runtime/proxy_manager.cpp"
+      ],
+      "owns": [
+        "TransferLifetimeOwner",
+        "free_requested与延迟回收责任",
+        "PRE/CROSS/POST/H2D staging pin"
+      ]
+    },
+    "M10": {
+      "name": "Store集成",
+      "paths": [
+        "mooncake-store/src/transfer_task.cpp",
+        "mooncake-store/include/transfer_task.h",
+        "mooncake-store/src/client_buffer.cpp",
+        "mooncake-store/include/client_buffer.h"
+      ],
+      "owns": [
+        "BufferHandle实际backing owner链",
+        "网络结果sidecar及UB资格反馈"
+      ]
+    },
+    "M11": {
+      "name": "装配、gate、观测与关闭",
+      "paths": [
+        "mooncake-transfer-engine/tent/src/transport/ub/ub_transport.cpp",
+        "mooncake-transfer-engine/tent/src/transport/ub/context.cpp",
+        "UbEngine目标装配层"
+      ],
+      "owns": [
+        "Engine生命周期、统一dispatcher",
+        "测试域/生产域能力gate、关闭和回滚控制"
+      ]
+    },
+    "M12": {
+      "name": "验证工具与发布产物",
+      "paths": [
+        "mooncake-transfer-engine/tent/tests/ub_core_test.cpp",
+        "mooncake-transfer-engine/tent/tests/ub_native_data_path_test.cpp",
+        "mooncake-transfer-engine/tent/tests/ub_teardown_test.cpp",
+        "mooncake-transfer-engine/tent/tests/ub_real_device_test.cpp",
+        "新增benchmark/verification工具"
+      ],
+      "owns": [
+        "UT/fake/interposer/实机证据",
+        "benchmark及发布/回滚runbook"
+      ]
+    }
+  },
+  "task_schema": {
+    "required": [
+      "id",
+      "module_ids",
+      "depends_on",
+      "external_prerequisites",
+      "contract_ids",
+      "description",
+      "steps",
+      "deliverables",
+      "acceptance_criteria",
+      "status",
+      "evidence",
+      "source_decision_ids",
+      "source_gap_ids"
+    ],
+    "status_enum": [
+      "NOT_STARTED",
+      "IN_PROGRESS",
+      "PASS",
+      "FAIL",
+      "BLOCKED_EXTERNAL"
+    ]
+  },
+  "tasks": [
+    {
+      "id": "T-01",
+      "module_ids": [
+        "M00"
+      ],
+      "depends_on": [],
+      "external_prerequisites": [],
+      "contract_ids": [
+        "C00"
+      ],
+      "description": "归档当前 UT 命令、SHA、参数、过滤器、日志与二进制 hash；核对 G-10 和旧 cache",
+      "steps": [
+        "记录工作树和源码/二进制SHA、CMakeCache、测试枚举及过滤器。",
+        "将qule已有UT通过记录与当前构建对应；G-10若已修复只补验证，不重复修改。"
+      ],
+      "deliverables": [
+        "可复现基线包，区分历史 PASS 与新增覆盖"
+      ],
+      "acceptance_criteria": [
+        "干净 USE_UB=ON；枚举实际 UB 用例，不用 USE_UB=OFF cache"
+      ],
+      "status": "PASS",
+      "evidence": [
+        "supercache_jetty_pool_ut_baseline_T-01.md",
+        "source_sha=0a68814614886820982f2c967e970c7b66fcf99d",
+        "configuration_hash=9892136e7c1fb24609f2ae09ed41c0414f6358dc",
+        "ctest -R tent_ub_: 5/5 PASS, 182 cases (core47/pooled73/teardown15/native35/autoimport12)",
+        "G-10 verified present (ub_core_test.cpp L413/L419, ub_native_data_path_test.cpp L323-327); fixed earlier, verification only",
+        "native_gate_result=NOT_RUN (no liburma, TENT_HAS_REAL_URMA undefined, real branch not compiled)"
+      ],
+      "source_decision_ids": [
+        "B-10"
+      ],
+      "source_gap_ids": [
+        "G-10"
+      ]
+    },
+    {
+      "id": "T-02",
+      "module_ids": [
+        "M00",
+        "M02",
+        "M12"
+      ],
+      "depends_on": [
+        "T-01"
+      ],
+      "external_prerequisites": [],
+      "contract_ids": [
+        "C00",
+        "C02"
+      ],
+      "description": "统一fake/负例CTP；修复opt-in测试API/作用域/类型；冻结UMDK SHA；隔离BONDP编译依赖，物理模式仅需标准头/库",
+      "steps": [
+        "统一生产、fake、正负例的RM/JETTY/CTP定义，不删除负例断言。",
+        "修复opt-in源文件接口/类型/作用域；隔离BONDP头和初始化依赖，冻结依赖SHA。",
+        "分别构建UB UT与real opt-in目标，保持RC/bonding既有回归。"
+      ],
+      "deliverables": [
+        "三UB UT+selector及opt-in编译结果；G-06/G-10、D-22"
+      ],
+      "acceptance_criteria": [
+        "CTP正例/RTP负例、无设备SKIP；real分支static_assert编译；仅标准URMA头/库可构建physical路径，既有bonding/RC回归；不删断言绕过"
+      ],
+      "status": "BLOCKED_EXTERNAL",
+      "evidence": [
+        "supercache_jetty_pool_ut_evidence_T-02_T-03.md（§5 改动明细/§7 execution_result/§8 BLOCKED 清单）",
+        "source_sha=0a68814614886820982f2c967e970c7b66fcf99d; configuration_hash=d53ff708dac2ea8565f4ed37891bab96e1be7062; 工作树含未提交增量",
+        "G-06 修复：opt-in 源文件 include/类型/作用域/CTP 对齐（B-01），未删除断言；G-10 复验维持",
+        "D-22：BONDP 隔离（TENT_UB_BONDP 默认 OFF，physical 仅标准 URMA 头/库，bonding fail-closed）；FindUrma GIT_TAG 冻结 8cdca734c2f71113cf3d0d8d6d60157d77cd3d88",
+        "ctest -R tent_ub_: 6/6 Passed；fake UT 186 用例全绿（core47/pooled73/teardown15/native39/autoimport12）；回归门禁 livelock 修复 --gtest_repeat=100 全过",
+        "tent_ub_real_device_test 4 用例 SKIP（无 /sys/class/ubcore，SKIP≠PASS）",
+        "native_gate_result=BLOCKED_EXTERNAL（无 UB 硬件、URMA_LIBRARY=NOTFOUND）"
+      ],
+      "source_decision_ids": [
+        "B-01",
+        "B-10"
+      ],
+      "source_gap_ids": [
+        "G-06",
+        "G-10"
+      ]
+    },
+    {
+      "id": "T-03",
+      "module_ids": [
+        "M01",
+        "M02"
+      ],
+      "depends_on": [
+        "T-01"
+      ],
+      "external_prerequisites": [],
+      "contract_ids": [
+        "C01",
+        "C02",
+        "C12"
+      ],
+      "description": "修复 legacy reset/rearm 和关闭引用；停止 acquire/create/release 发布；按 Context 保存 profile",
+      "steps": [
+        "按Context保存profile/JettyOptions，移除设备遍历最后值覆盖。",
+        "legacy RESET后仅在版本契约证明可rearm时复用，否则退役并安全创建替代成员。",
+        "实现STOPPING/创建交接/租约交接，detach池持有的Context/JFC依赖后再close。"
+      ],
+      "deliverables": [
+        "G-01/G-02/G-03 修复及状态/依赖图"
+      ],
+      "acceptance_criteria": [
+        "二代真实 wrapper post、外持 pool shutdown、创建中 stop、异构 priority/乱序发现"
+      ],
+      "status": "BLOCKED_EXTERNAL",
+      "evidence": [
+        "supercache_jetty_pool_ut_evidence_T-02_T-03.md（§6 改动明细/§7 execution_result）",
+        "source_sha=0a68814614886820982f2c967e970c7b66fcf99d; configuration_hash=d53ff708dac2ea8565f4ed37891bab96e1be7062; 工作树含未提交增量",
+        "G-01 fail-closed：RESET 成员退役删除不复用、acquire 恒新建、stopping 复查命中回滚；新增 beginStop/drain/detach 生命周期 API",
+        "G-02 关闭顺序：beginStop→drain（失败阻止 close）→detach→关 JFC→closeContext；外部 holder 持 pool shared_ptr 不阻塞关闭",
+        "G-03 逐 Context profile：context jetty_options_/setJettyOptions、ub_transport rm_profiles_by_topology、endpoint_store 改用 context->jettyOptions()",
+        "新增 4 用例 4/4 PASSED（native_data_path 35→39）；ctest -R tent_ub_ 6/6；fake UT 186 全绿",
+        "native_gate_result=BLOCKED_EXTERNAL（真实 reset/rearm/stop/delete 证据需 UB 硬件 + liburma）"
+      ],
+      "source_decision_ids": [
+        "B-01",
+        "B-04"
+      ],
+      "source_gap_ids": [
+        "G-01",
+        "G-02",
+        "G-03"
+      ]
+    },
+    {
+      "id": "T-04",
+      "module_ids": [
+        "M01",
+        "M03"
+      ],
+      "depends_on": [
+        "T-01"
+      ],
+      "external_prerequisites": [],
+      "contract_ids": [
+        "C01",
+        "C03"
+      ],
+      "description": "定义 pooled v3 严格 DTO、可信 inventory、拓扑校验及配置 namespace",
+      "steps": [
+        "定义v3 DTO和严格解析器、可信inventory/拓扑/配置schema。",
+        "保留v1/v2解析和资源语义；建立v3 golden及非法输入fixture。",
+        "新增transports/ub/max_target_jetties_per_node，默认8，严格1..UINT32_MAX整数校验；拓扑所需target数和设备全角色预算闭合。"
+      ],
+      "deliverables": [
+        "版本 golden/字段表/4口6口非对称配置 fixture"
+      ],
+      "acceptance_criteria": [
+        "v1/v2 golden 不变；字段缺失/溢出/未知/重复/跨 Context 拒绝",
+        "默认8/显式覆盖及0、负数、bool、字符串、浮点、null、溢出均有fixture；9口配默认8在native创建前拒绝。"
+      ],
+      "status": "PASS",
+      "evidence": [
+        "tent_rm_p0_p5_execution_checklist.md T-04 行；source_sha=0a688146（工作树未提交增量）",
+        "v3 严格 DTO+allowlist 解码（bootstrap_types.h pooled targets/probe_target_map/probe_regions）、SHA-256 inventory checksum（FIPS golden 向量）、重复 JSON key DOM 前拒绝、ports/targets 一一对应与跨 Context 唯一性、4/6/9 口+非对称邻接 fixture",
+        "changed_files: bootstrap_types.h、bootstrap.cpp（validateUbBootstrapV3/decodeUbBootstrapV3Strict/computePooledInventoryChecksum）、新增 sha256.{h,cpp}、tests/CMakeLists.txt、ub_core_test.cpp",
+        "tent_ub_core_test 52/52 PASS（新增 5 例，47→52）；v1/v2 golden 无回归",
+        "native_gate_result=NOT_RUN（真实 provider 契约属 E 项，待实机）"
+      ],
+      "source_decision_ids": [
+        "B-02",
+        "B-05",
+        "B-11"
+      ],
+      "source_gap_ids": []
+    },
+    {
+      "id": "T-05",
+      "module_ids": [
+        "M03"
+      ],
+      "depends_on": [
+        "T-04"
+      ],
+      "external_prerequisites": [],
+      "contract_ids": [
+        "C03"
+      ],
+      "description": "v3 producer/consumer、代次 compare/commit；修复外层误退役 incumbent",
+      "steps": [
+        "接通v3 producer/consumer；expected身份来自独立可信inventory。",
+        "使用分类结果处理duplicate/stale/conflict/newer；候选失败不推进watermark或销毁incumbent。"
+      ],
+      "deliverables": [
+        "G-07/G-08、乱序握手事务与独立可信锚点"
+      ],
+      "acceptance_criteria": [
+        "duplicate/stale/conflict/newer RPC 级回归；导入失败不推进 watermark"
+      ],
+      "status": "PASS",
+      "evidence": [
+        "tent_rm_p0_p5_execution_checklist.md T-05 行；source_sha=0a688146（工作树未提交增量）",
+        "compareUbBootstrapV3 四分类：父代 node/context incarnation+topology_epoch，叶子 per-port target_epoch+endpoint/segment generation；同代次内容差异=conflict 保留 incumbent",
+        "validateUbBootstrapV3PeerIdentity 独立可信锚点（checksum/descriptor ABI/全身份字段）；gateUbBootstrapForMode 新增 kPooledRm（混合版本 unsupported）",
+        "tent_ub_core_test 55/55 PASS（新增 3 例，52→55，RPC 级 duplicate/stale/conflict/newer 回归）",
+        "watermark 推进与 import 失败回滚已在 T-06 Registry 层闭环；producer 真实 owner 接入待 T-06/T-24；native_gate_result=NOT_RUN"
+      ],
+      "source_decision_ids": [
+        "B-02",
+        "B-05"
+      ],
+      "source_gap_ids": [
+        "G-07",
+        "G-08"
+      ]
+    },
+    {
+      "id": "T-06",
+      "module_ids": [
+        "M03"
+      ],
+      "depends_on": [
+        "T-04",
+        "T-05"
+      ],
+      "external_prerequisites": [],
+      "contract_ids": [
+        "C03",
+        "C04"
+      ],
+      "description": "每端口 LocalPortTarget 和 Context import 去重，生命周期与撤销引用分离",
+      "steps": [
+        "每配置端口创建一个LocalPortTarget；Context Registry按完整key单flight导入。",
+        "引用分配给endpoint、业务和probe；撤销/入站fence/旧引用归零后才回收。",
+        "多发送机器复用同一批本地共享target；所有初建/换代入口向接收端节点权威额度owner取得ticket，不按peer、Context、Engine或进程分别给8。"
+      ],
+      "deliverables": [
+        "共享目标 owner/Registry"
+      ],
+      "acceptance_criteria": [
+        "多 endpoint+probe 并发仅一次 import；淘汰一个不影响其他引用",
+        "多peer并发引用不增target；已有target共享握手不因额度满被拒绝，容量错误不退役健康incumbent。"
+      ],
+      "status": "PASS",
+      "evidence": [
+        "tent_rm_p0_p5_execution_checklist.md T-06 行；source_sha=0a688146（工作树未提交增量）",
+        "新增 target_registry.{h,cpp}：UbImportedTargetRegistry（ImportedTargetKey 完整键、同 key 单飞导入、等待者非阻塞 kDeferred、watermark 仅发布线性化点推进、旧 import 保留至引用归零才 unimport、retireImport 后拒新引用）；UbLocalPortTargetRegistry（每端口 LocalPortTarget、初建/换代向 NodeTargetQuota 取 ticket、已有 target 共享握手不触额度、额度满 kCapacity 不退役健康 incumbent、换代双 ticket、unproven 销毁 quarantine 保留额度）；锁序 registry→quota 单向",
+        "tent_ub_pooled_core_test 89/89 PASS（新增 16 例：单飞导入、watermark 失败不推进、引用/撤销分离、换代双 ticket、创建失败回滚 ticket、unproven 销毁隔离）；tent_ub_ 6 目标全绿",
+        "附带修复 tent_ub_teardown_test 缺 sha256.cpp 链接失败（T-04 遗留）",
+        "真实 adapter broker/factory 接线待 T-13/T-24；入站 fence/Recovery owner 待 T-14；native_gate_result=NOT_RUN"
+      ],
+      "source_decision_ids": [
+        "B-02",
+        "B-11"
+      ],
+      "source_gap_ids": []
+    },
+    {
+      "id": "T-07",
+      "module_ids": [
+        "M04"
+      ],
+      "depends_on": [
+        "T-05",
+        "T-06"
+      ],
+      "external_prerequisites": [],
+      "contract_ids": [
+        "C04"
+      ],
+      "description": "路径资格/epoch、target 聚合负载；冷握手异步控制执行器",
+      "steps": [
+        "建立不可变PathVersion快照和目标聚合负载，保留健康/拓扑/负载评分顺序。",
+        "冷路径准备交控制执行器；post worker缺ready target时defer，不持lease做RPC。"
+      ],
+      "deliverables": [
+        "路径快照和异步 ready"
+      ],
+      "acceptance_criteria": [
+        "无 lease 持有 RPC；非对称路径数、旧 epoch 不覆盖、target 重建暂停引用路径"
+      ],
+      "status": "PASS",
+      "evidence": [
+        "tent_rm_p0_p5_execution_checklist.md T-07 行；source_sha=0a688146（工作树未提交增量）",
+        "新增 path_registry.{h,cpp}：UbPathVersion（PathKey=PoolKey+peer_incarnation+remote_port_id+profile，+topology_epoch+target_epoch，不可变快照，幂等刷新保留负载计数器）；同 ImportedTargetKey 的 WR/字节聚合到共享 UbTargetLoadCell（拓扑换代/endpoint 视图切换不重置）；snapshotEligible 保留 C04 分层（quota/带宽/retry_order 留调用方，T-10 接线闭环）",
+        "冷路径异步 ready：tryCharge 缺 ready target 返回 kDeferred 不持 charge/lease，单飞合并入有界控制执行器（UbPathControlExecutor 接口+线程实现），prepare 仅在执行器线程运行（无锁、无 lease）；旧 epoch kStale 不覆盖、同代异内容 kConflict、pauseForTargetRebuild 按目标 scope 暂停引用路径；UbPathLoadCharge move-only 无锁释放",
+        "tent_ub_pooled_core_test 105/105 PASS（新增 16 例 UbPathRegistryTest：无 lease 持有 RPC、非对称路径数、旧 epoch 不覆盖、target 重建暂停引用路径、并发 charge churn）",
+        "ctest -R tent_ub_ 6/6 Passed（2026-11-21 复验）；workers.cpp 选路接线待 T-10；真实 preparer 接线待 T-13/T-24；native_gate_result=NOT_RUN"
+      ],
+      "source_decision_ids": [
+        "B-05"
+      ],
+      "source_gap_ids": []
+    },
+    {
+      "id": "T-08",
+      "module_ids": [
+        "M01",
+        "M05"
+      ],
+      "depends_on": [
+        "T-04"
+      ],
+      "external_prerequisites": [],
+      "contract_ids": [
+        "C05"
+      ],
+      "description": "静态 DesiredServing、跨 EID 全角色账本、节点target上限默认8、JFC控制额度与队列上限",
+      "steps": [
+        "定义跨EID/Context代次的物理设备全角色账本及move-only预留票据。",
+        "实现创建前原子预留、角色状态转账和确证销毁后释放；验证容量乘加溢出。",
+        "实现节点target额度TargetOccupied=CreatingReserved+Active+RetiringDeleting+QuarantinedUnproven；默认上限8，与物理设备预算联合非阻塞预留。"
+      ],
+      "deliverables": [
+        "预算公式/预留回滚/API"
+      ],
+      "acceptance_criteria": [
+        "全 IN_USE Deficit=0；creating/retiring/quarantine/legacy 计入，无上限穿透",
+        "跨Context/Engine/进程和旧代合计不超过配置值（默认8，显式覆盖按有效配置）；默认8时并发第8/9预留只有合法额度成功；Unknown/未证实销毁不减额，replacement reserve不绕过节点限额。"
+      ],
+      "status": "PASS",
+      "evidence": [
+        "tent_rm_p0_p5_execution_checklist.md T-08 行；source_sha=edf6f9e8（工作树未提交增量）",
+        "C05.1 联合准入：UbLocalPortTargetRegistry::create 可选接入 NativeBudget+device_key，初建/换代在 provider 调用前同时预留节点 ticket 与物理设备 kTarget 预算；任一账本满额 kCapacity defer 且另一预留 proven-never-allocated 回滚（不泄漏、不触 provider）；创建失败双账本回滚、watermark 不推进；销毁 proof 同时门控两账本，unproven 双双 quarantine 保留占额",
+        "NativeBudget 新增 releaseUnallocated（仅 kCreating 可回滚，已发布对象必须走 proven-destruction 门，镜像 NodeTargetQuota::releaseUnallocated 语义）",
+        "既有件复验：DesiredServing（business_desired_serving+refill Deficit=max(0,Desired-Serving-Creating)）、跨 EID 全角色账本（角色/状态集合互斥/乘加溢出拒绝/leak 计数）、节点 target 上限默认 8（进程级冻结+1..UINT32_MAX 严格解析+8/9 边界+并发预留线性化）、JFC credit（jfc_credit_reserve+JfcCreditLedger 非阻塞预留）",
+        "changed_files: native_budget.h/.cpp、target_registry.h/.cpp、tests/ub_pooled_core_test.cpp",
+        "tent_ub_pooled_core_test 110/110 PASS（新增 5 例：ReleaseUnallocatedRollsBackCreatingOnly、WiredBudgetRequiresDeviceKey、JointAdmissionDefersWhenDeviceBudgetFull、CreateFailureRollsBackTicketAndDeviceBudget、DestructionProofGatesBothLedgers）；core 55/55、teardown 15/15、autoimport 12/12；native_data_path 39/39（原 38/39，唯一失败 PerContextProfilesKeepHeterogeneousPriorityAndMask 为存量偶发——根因是 fake 内联完成+选路 topology_rank 优先导致 4 个 slice 全压 dev0，非补池时限；2026-11-23 测试侧修复：FakeUrmaAdapter 挂起完成 + max_jetty_depth=2 路径配额使 2+2 分流确定化，tent_ub_ 5 目标 100% PASS）",
+        "kLegacy 生产接线（legacy endpoint Jetty 计入设备账本）与 queue/quarantine/tombstone budget 强制执行分别随 T-24 装配/T-10 pooled scheduler 落位；native_gate_result=NOT_RUN"
+      ],
+      "source_decision_ids": [
+        "B-06",
+        "B-11"
+      ],
+      "source_gap_ids": [
+        "G-09"
+      ]
+    },
+    {
+      "id": "T-09",
+      "module_ids": [
+        "M05"
+      ],
+      "depends_on": [
+        "T-03",
+        "T-06",
+        "T-08"
+      ],
+      "external_prerequisites": [],
+      "contract_ids": [
+        "C05",
+        "C06"
+      ],
+      "description": "LIFO 每 attempt 独占 lease；匹配 JFC credit；锁外 create，创建后复核 OPEN",
+      "steps": [
+        "新建SendJettyPool，保留独立UbSendJettyPool legacy实现。",
+        "统一LIFO维护IDLE→IN_USE原子转移及匹配JFC credit；正常归还走完成门。",
+        "锁外create，发布前复核OPEN/代次/profile/ID；stopping结果转退役。"
+      ],
+      "deliverables": [
+        "pool/lease/credit 状态机；G-09 第一部分"
+      ],
+      "acceptance_criteria": [
+        "唯一租约、最近归还优先、空池 defer、stop/release/create 交错、跨 peer 顺序复用"
+      ],
+      "status": "PASS",
+      "evidence": [
+        "T-09 执行结果（2026-11-23，PASS）：C06 第一部分 pool/lease/credit 状态机软件侧完成，source_sha=edf6f9e8+本轮工作区未提交增量（send_jetty_pool.cpp 发布前 ID 复核、ub_pooled_core_test.cpp fake 旋钮/hook+3 用例；主体 SendJettyPool 实现已在此前提交中）。step1：SendJettyPool（send_jetty_pool.h/.cpp，per-attempt 独占 move-only SliceJettyLease + LeaseWithCredit 携 JFC credit token，weak_from_this 防 pool 先亡 UAF RC-04），legacy UbSendJettyPool（jetty_pool.cpp）独立保留、本轮零改动（git status 核实）。step2：LIFO 维护（归还 push_front、租约 front 扫描、新建 append 尾）；IDLE→IN_USE 在 pool 锁内原子转移（状态+bucket.in_use+total_leases_）；JFC credit 在 LIFO 顺序内非阻塞匹配（credits_->tryReserve，额度耗尽跳过该成员继续 LIFO）；正常归还走完成门——returnOnce(lease, completion_gate_passed) 由 AttemptGate settlement 驱动（return_to_pool/rollback_return/retire，pool_open 参与判定），UbAttemptGateTest.NormalSuccessReturnsToPool/GateFailedReturnRetiresMember 覆盖。step3：create 全程锁外（预算预留→provider createJetty→锁内发布）；发布前复核 OPEN（锁内 stopping_）、代次（pool per-Context，PoolKey.context_incarnation 不可变）、profile（const options_ 不可变）、ID（G-1 修复：!jetty/!valid/id==0 fail-closed → retireUnpublished，null 无需退役、invalid 仅 deleteJetty、valid+零 ID 走 RESET-before-delete，预算按 proven 释放，tryLease defer）；stopping/无效结果均转退役（G-2 确定性用例）。",
+        "T-09 验收标准逐项证据（均在 tent_ub_pooled_core_test）：唯一租约=唯一 lane 集合断言+DoubleReturnRejected+DroppedLeaseQuarantinesAndKeepsBudget+NonEmptyOutputRejectedWithoutClobber+HammerLeaseReturnKeepsInvariants 并发不变量；最近归还优先=ReturnThenLeaseReusesLifoOrder+JfcCreditMatchingSkipsExhaustedMember；空池 defer=LeaseCreatesUpToDesiredServing 满额 defer+BudgetExhaustionDefersWithoutCreation+CreateFailureDefersAndReleasesBudget+CreateOkInvalidJettyFailsClosedAndDefers+CreateOkNullJettyFailsClosedAndDefers（G-1 新增）；stop/release/create 交错=StopRejectsNewLeasesAndRetiresOutstanding+StopInterleavedWithCreationRollsBackWithoutPublishing（G-2 新池确定性）+HammerWithStopDrainsSafely+GateFailedReturnRetiresMember；跨 peer 顺序复用=PoolKey 无 peer 维度（peer 归选路层，T-07/T-10），跨 attempt 复用由 LIFO 用例覆盖。测试：tent_ub_pooled_core_test 113/113 PASS（110+新增 3：G-1 两例+G-2 一例）；core 55/55、native_data_path 39/39、teardown 15/15、autoimport 12/12；native_gate=NOT_RUN（无真实 provider）。",
+        "T-09 备注（2026-11-23 只读盘点，G-1 代码缺口）：createAndPublish 的 createJetty OK 成功路径未复核 ID——send_jetty_pool.cpp:255-270 直接以 jetty->id() 构造 lane，缺 !jetty || !jetty->valid() || jetty->id()==0 检查（jetty 为空时还会解引用）；对照 legacy endpoint.cpp:309-320 的完整检查（含部分分配 handle 采纳）与 RM 矛盾结果 fail-closed。契约其余维度已满足：OPEN（stopping_ 复查）、代次（pool per-context，incarnation 不可变）、profile（options_ 不可变）。修复方案：无效 handle 走 retireUnpublished（不 reset，仅释放 wrapper，预算按 proven 释放）并返回错误使 tryLease defer；测试侧 ub_pooled_core_test 的 PooledFakeAdapter 需新增 OK+无效 jetty 旋钮（如 setNextCreateJettyInvalid()）并补确定性用例；不改头文件接口。",
+        "G-1 已修复（2026-11-23）：send_jetty_pool.cpp createAndPublish 在 createJetty OK 后新增发布前复核（现 send_jetty_pool.cpp:245-263）——!jetty || !jetty->valid() || jetty->id()==0 即 fail-closed：retireUnpublished（null 无需退役、invalid 仅 deleteJetty、valid+零 ID 走 RESET-before-delete，预算均按 proven 释放）+ 回滚 creating 计数 + ++create_failures_ + 返回 InternalError 使 tryLease defer。PooledFakeAdapter 新增 setNextCreateJettyInvalid(InvalidJettyMode{kNotValid,kZeroId,kNull}) 旋钮；新用例 CreateOkInvalidJettyFailsClosedAndDefers（kNotValid+kZeroId，断言不发布、wrapper/零 ID 均被删、预算 total/quarantined 归零、下轮成功恢复）与 CreateOkNullJettyFailsClosedAndDefers（null 无分配无删除、预算归零、下轮成功）。changed_files: send_jetty_pool.cpp、tests/ub_pooled_core_test.cpp。",
+        "T-09 备注（2026-11-23 只读盘点，G-2 测试缺口）：新 SendJettyPool 的 stop×create 确定性交错未覆盖——ub_native_data_path_test.cpp:2332 StopInterleavedWithCreationRollsBackWithoutPublishing 驱动的是 legacy UbSendJettyPool（C12/G-02），新池仅由 HammerWithStopDrainsSafely 的概率窗口覆盖（beginStop 落 kRounds/2 时成员已建好，命中 creating 窗口不确定）。修复方案：ub_pooled_core_test 给 PooledFakeAdapter::createJetty 增加 hook（该 fake 当前仅有 create_failures_remaining_，无 setCreateJettyHook），hook 内调用 pooled_pool->beginStop()，断言创建中 stop 不发布、已建 jetty 全删、预算按 proven 释放、池永久拒绝后续 lease；不改头文件接口。",
+        "G-2 已修复（2026-11-23）：PooledFakeAdapter::createJetty 新增 setCreateJettyHook（镜像 FakeUrmaAdapter 语义：锁内拷贝、锁外调用，允许 hook 重入 adapter）；新用例 UbSendJettyPoolTest.StopInterleavedWithCreationRollsBackWithoutPublishing——hook 在 createJetty 内调用 beginStop()，断言 tryLease defer 且不发布（created_members=0、servingCount=0）、窗口内创建的 jetty 被删（created=deleted=1）、预算按 proven 释放（total/quarantined=0）、清除 hook 后永久拒绝（stop_rejections=1）。tent_ub_pooled_core_test 113/113 PASS（原 110 + 新增 3 例）；回归：core 55/55、native_data_path 39/39、teardown 15/15、autoimport 12/12；pre-commit/clang-format 在本机与容器均不可用，风格沿用周边代码。changed_files: tests/ub_pooled_core_test.cpp。",
+        "T-09 盘点确认无需补项：唯一租约（DoubleReturnRejected、DroppedLeaseQuarantinesAndKeepsBudget、NonEmptyOutputRejectedWithoutClobber、并发不变量 storm）、LIFO（ReturnThenLeaseReusesLifoOrder、JfcCreditMatchingSkipsExhaustedMember）、空池 defer（LeaseCreatesUpToDesiredServing、BudgetExhaustionDefersWithoutCreation、CreateFailureDefersAndReleasesBudget）、stop/release 交错（StopRejectsNewLeasesAndRetiresOutstanding、HammerWithStopDrainsSafely、GateFailedReturnRetiresMember）、归还走完成门（UbAttemptGateTest.NormalSuccessReturnsToPool）、legacy 独立保留（UbSendJettyPool 与 SendJettyPool 分离）。跨 peer 顺序复用经 PoolKey 无 peer 维度（peer 归选路层）判定。",
+        "T-09 reliable_dev 线复验（2026-11-23，PASS）：G-1 发布前 ID 复核（send_jetty_pool.cpp createAndPublish）与 G-2 新池 stop×create 确定性用例（PooledFakeAdapter setNextCreateJettyInvalid/setCreateJettyHook）随 stash 'jetty t08-t09' 并入 reliable_dev/442e6c39，干净合并无冲突（staged 直接落地）；T-09 三例（CreateOkInvalidJettyFailsClosedAndDefers/CreateOkNullJettyFailsClosedAndDefers/StopInterleavedWithCreationRollsBackWithoutPublishing）与 UbNativeBudgetTest.ReleaseUnallocatedRollsBackCreatingOnly（T-08）在 reliable_dev 构建下全部在场并通过（tent_ub_pooled_core_test 53/53 PASS）。本线 SendJettyPool 语义与 tent 线一致（per-attempt 独占 lease+完成门归还+锁外 create+发布前复核）；legacy UbSendJettyPool 在本线按 G-01 裁决 fail-closed（release 删除不复用 RESET 成员），存量断言复用语义的 SendJettyPoolReusesDrainedJettys（HEAD 上即失败，非本轮引入）已按登记册口径重写为 SendJettyPoolRetireDeletesMembersFailClosed。已提交：reliable_dev/5b52b63d（commit 'Merge T-08~T-10 jetty pool increments'，16 文件 +2538/-70），提交后 HEAD 复验 UbSendJettyPoolTest.*+UbSendJettyPoolConcurrencyTest.*+NormalSuccessReturnsToPool+ReleaseUnallocatedRollsBackCreatingOnly 21/21 PASS。"
+      ],
+      "source_decision_ids": [
+        "B-06"
+      ],
+      "source_gap_ids": [
+        "G-09"
+      ]
+    },
+    {
+      "id": "T-10",
+      "module_ids": [
+        "M04",
+        "M05"
+      ],
+      "depends_on": [
+        "T-07",
+        "T-09"
+      ],
+      "external_prerequisites": [],
+      "contract_ids": [
+        "C04",
+        "C06"
+      ],
+      "description": "独立 Task K；选路→非阻塞资源预留→最终复核→单 WR post",
+      "steps": [
+        "按A01执行选路、K/quota、pool/credit、owner/token、最终post认领。",
+        "pooled仅调用postOne一次；每次输入一条WR；所有未post失败逆序回滚。"
+      ],
+      "deliverables": [
+        "pooled scheduler/postOne 准入"
+      ],
+      "acceptance_criteria": [
+        "每 attempt 一次 native post/一 WR；quota/credit/owner 逆序回滚；miss 不增 retry/fault"
+      ],
+      "status": "PASS",
+      "evidence": [
+        "T-10 执行结果（2026-11-23，PASS）：pooled scheduler/postOne 准入软件侧完成，source_sha=edf6f9e8+本轮工作区未提交增量。step1（A01 序列，workers.cpp processPending pooled 分支）：选路沿用 C04 分层评分（betterUbPathScore：可准入→拓扑等级→归一化在途→端点压力→带宽→retry_order/稳定 ID）+ QuotaManager 路径/设备配额；Task K 修正为独立 per-task 语义——TaskPermitLedger::tryAcquire(task_id)（C06 '网络UbTask跨Context的K'；原先进程级合计实现不符合契约，本轮修正为按 task 计数，K 身份与 AttemptKey 一致）；pool/credit（SendJettyPool::tryLease 携 JFC credit）；owner/token（AttemptGate registerAttempt + 单调 completion_token inflight 登记）；最终复核认领（tryCommitPost 与取消竞争，零 post 回滚）。step2：pooled 分支改走 UrmaAdapter::postOne——C02 新增 PostResult{status,acceptance,posted_count} 与 virtual postOne（默认经 4 参 post 单元素 vector，现有一切 adapter 零改动继承；不可内部拆分成多次 post），每 attempt 恰一次 native post/一 WR。",
+        "T-10 逆序回滚与 miss 语义：全部未 post 失败路径改为严格逆序回滚（取得顺序 quota→outstanding→attempt→permit→credit/lease→gate→commit，释放顺序相反）——K/lease miss：permit 先显式释放→deferAttempt（不耗 retry 预算）→releaseOutstanding→quota，defer 重排；硬 lease 错误：permit→attempt resolve→outstanding→quota 后才 retry 重排；commit 取消：gate discard→credit 释放→lease returnOnce→permit→outstanding→quota；零接受（posted_count==0 且 kNotAccepted）：settlePooledAttempt 先于 releaseInflight（gate 事件/结算→lease return/退役→discard→credit→permit 显式释放，permit 不再等 Inflight 析构，K 槽先于 retry 重排释放）→outstanding/quota→attempt resolve。settlePooledAttempt 尾部新增 permit 显式释放覆盖成功/错误/fence 全部结算路径。",
+        "T-10 测试证据：tent_ub_pooled_core_test 114/114 PASS（113+新增 UbAdmissionTest.TaskPermitKIsPerTask——两 task 各持独立 K、释放只重开本 task 额度；TaskPermitEnforcesK/TaskPermitZeroKIsFailClosed 适配 per-task 签名）；tent_ub_native_data_path_test 42/42（39+新增 3 例：PooledAttemptPostsExactlyOneWrPerAttempt——postCalls==postedWrs 证明每次 post 恰 1 WR；PooledZeroAcceptRollsBackAdmissionAndRetriesSameMember——failNextPostWithoutAccept 注入后 createJettyCalls 固定 2（成员回池、retry 复用同成员）、postCalls=5、成员不在卸载前退役；PooledTaskPermitMissDefersWithoutRetryCharge——K=1+holdAllCompletions+max_retries=0：hold 期仅 1 post 且任务 PENDING（其余 slice 全部 K miss defer）、释放后全部 COMPLETED 证明 defer 未消耗 retry）；core 55/55、teardown 15/15、autoimport 12/12。FakeUrmaAdapter 新增 postCalls/postedWrs 计数（post 入口统计）。changed_files: include urma_adapter.h（PostResult+postOne）、admission.h/.cpp（per-task K）、src workers.cpp（A01 顺序/逆序回滚/postOne/settle 释放 permit）、tests ub_pooled_core_test.cpp、ub_native_data_path_test.cpp。遗留边界：PathRegistry 生产选路接线依赖 v3 peer/target 身份（T-13/T-24 装配，本任务验收标准不含）；A02/CQE 竞争门与结果分类细化归 T-11/T-12；native_gate=NOT_RUN（无真实 provider）。",
+        "T-10 reliable_dev 线复验（2026-11-23，PASS）：stash 'jetty t08-t09' 并入 reliable_dev/442e6c39 后按契约逐项复核。架构裁定以 W3 移植实现为准：per-task K 由 UbTask::tryAcquireAttemptSlot 承担（D-6，等效 C06 契约的 TaskPermit.tryAcquire(UbTask,K)）；最终复核认领由 claimPost 承担（A01 步骤5 PostGate 协议）；A01 步骤6 落地为 processPendingPooled ⑩ 改走 UrmaAdapter::postOne（C02 PostResult，默认经 4 参 post 单元素 vector），legacy 保留 vector post；严格逆序回滚由 W3 既有 claim 拒绝/commit 取消路径覆盖（credit→lease→outstanding→quota→K→defer），miss 一律 defer 不计 retry/fault。测试适配：配置键改用 transports/ub/task_max_inflight_attempts（W3 更名，旧键 send_pool/task_max_inflight_attempts 警告并忽略）；T-10 三例（单 WR post/零接受回滚复用同成员/K miss 不耗 retry）与 T-09 G-1/G-2、T-08 releaseUnallocated 全部在场通过；零接受回滚在本线附带退役 endpoint incarnation（W2 kReject 处置），池成员仍按 INV07 回池复用（断言适配 createJettyCalls=3/deleteJettyCalls=1 并注明语义）。验证：ctest -R tent_ub_ 25/25 目标 100% PASS（core 59/pooled_core 53/native_data_path 35/teardown 17/autoimport 11/completion_gate 23/post_claim 11/drain_controller 27/edge_invalid_tracker 3/tombstone 7/probe* 全绿，native_data_path 5 连跑稳定）。遗留偏差：G-03 逐 Context profile 未移植到本线（install 单一 jetty_options 末值覆盖，P0 偏差维持登记，其确定性用例随 T-03 移植落地，未并入本轮）。已提交：reliable_dev/5b52b63d，提交后 HEAD 复验 T-10 三例（PooledAttemptPostsExactlyOneWrPerAttempt/PooledZeroAcceptRollsBackAdmissionAndRetriesSameMember/PooledTaskPermitMissDefersWithoutRetryCharge）全部 PASS。"
+      ],
+      "source_decision_ids": [
+        "B-06"
+      ],
+      "source_gap_ids": []
+    },
+    {
+      "id": "T-11",
+      "module_ids": [
+        "M02",
+        "M06"
+      ],
+      "depends_on": [
+        "T-10"
+      ],
+      "external_prerequisites": [],
+      "contract_ids": [
+        "C02",
+        "C07"
+      ],
+      "description": "完整 post_returned/acceptance/handler_refs/lease_return 门；验证完成长度",
+      "steps": [
+        "实现D04与A02，post返回/CQE/handler退出共同推进同一完成门。",
+        "通过ProviderContract归一化长度并严格比较；post零接受与真实CQE冲突隔离。"
+      ],
+      "deliverables": [
+        "G-04 与早到完成门"
+      ],
+      "acceptance_criteria": [
+        "CQE先于post返回、零接受与CQE冲突、短/超长完成、重复CQE、handler延迟；一次结算"
+      ],
+      "status": "NOT_STARTED",
+      "evidence": [],
+      "source_decision_ids": [
+        "B-03",
+        "B-07"
+      ],
+      "source_gap_ids": [
+        "G-04"
+      ]
+    },
+    {
+      "id": "T-12",
+      "module_ids": [
+        "M06"
+      ],
+      "depends_on": [
+        "T-10",
+        "T-11"
+      ],
+      "external_prerequisites": [],
+      "contract_ids": [
+        "C07",
+        "C11"
+      ],
+      "description": "保存 opcode/acceptance/ExecutionOutcome/ResourceSafety；Unknown WRITE 禁止透明重放",
+      "steps": [
+        "保存opcode、acceptance及三层结果，替换timeout fence后无条件retryable=true。",
+        "确定未接受可重试；Unknown WRITE不透明重放；READ旧DMA安全后按统一预算创建新attempt。"
+      ],
+      "deliverables": [
+        "G-05 与重试/结果分类表"
+      ],
+      "acceptance_criteria": [
+        "Unknown→成功fence仍Unknown；READ旧DMA安全后按策略新attempt；取消/超时不提前释放"
+      ],
+      "status": "NOT_STARTED",
+      "evidence": [],
+      "source_decision_ids": [
+        "B-07"
+      ],
+      "source_gap_ids": [
+        "G-05"
+      ]
+    },
+    {
+      "id": "T-13",
+      "module_ids": [
+        "M02",
+        "M07"
+      ],
+      "depends_on": [
+        "T-04"
+      ],
+      "external_prerequisites": [],
+      "contract_ids": [
+        "C02",
+        "C08"
+      ],
+      "description": "异步 beginError、marker 分类、software flush，统一 dispatcher",
+      "steps": [
+        "新增独立异步adapter契约，legacy同步quiesce保持兼容。",
+        "区分真实WR、marker、software flush及AE，所有记录经统一dispatcher。"
+      ],
+      "deliverables": [
+        "版本隔离的 adapter 能力接口/注入器"
+      ],
+      "acceptance_criteria": [
+        "marker无WR credit、WR_UNHANDLED一次结算、recv/send JFC区分、poll有界"
+      ],
+      "status": "NOT_STARTED",
+      "evidence": [],
+      "source_decision_ids": [
+        "B-03"
+      ],
+      "source_gap_ids": []
+    },
+    {
+      "id": "T-14",
+      "module_ids": [
+        "M06",
+        "M07"
+      ],
+      "depends_on": [
+        "T-11",
+        "T-13"
+      ],
+      "external_prerequisites": [],
+      "contract_ids": [
+        "C07",
+        "C08"
+      ],
+      "description": "FAULTED→DRAINING→DELETE_READY；首次错误永久退役；handler/post/WR/owner屏障",
+      "steps": [
+        "实现每lane一次fault/ERROR认领及DELETE_READY谓词。",
+        "活动post退出后推进ERROR；缺marker或其他屏障时隔离；poll不等待。"
+      ],
+      "deliverables": [
+        "Recovery owner与严格 deleteReady predicate"
+      ],
+      "acceptance_criteria": [
+        "marker早到/丢失/重复、ERROR失败、超时隔离；poll线程无等待循环"
+      ],
+      "status": "NOT_STARTED",
+      "evidence": [],
+      "source_decision_ids": [
+        "B-03"
+      ],
+      "source_gap_ids": [
+        "G-09"
+      ]
+    },
+    {
+      "id": "T-15",
+      "module_ids": [
+        "M02",
+        "M07"
+      ],
+      "depends_on": [
+        "T-14"
+      ],
+      "external_prerequisites": [],
+      "contract_ids": [
+        "C08",
+        "C09"
+      ],
+      "description": "JFC 排他 lease；poll/flush/clean/delete 协调、AE归属和ACK规则",
+      "steps": [
+        "为相关JFC实现poll暂停确认/排他lease/恢复协议，按稳定ID协调多JFC。",
+        "flush有限批次且记录回dispatcher，ACK/事件归属按版本契约执行。"
+      ],
+      "deliverables": [
+        "无死锁的锁顺序/对象归属表"
+      ],
+      "acceptance_criteria": [
+        "其他Jetty的CQE不丢；共享JFC并发退役/关闭；未知归属不误路由"
+      ],
+      "status": "NOT_STARTED",
+      "evidence": [],
+      "source_decision_ids": [
+        "B-04"
+      ],
+      "source_gap_ids": []
+    },
+    {
+      "id": "T-16",
+      "module_ids": [
+        "M07"
+      ],
+      "depends_on": [
+        "T-14",
+        "T-15"
+      ],
+      "external_prerequisites": [],
+      "contract_ids": [
+        "C09"
+      ],
+      "description": "唯一队列领取、retained/consumed/unknown、限次退避与隔离",
+      "steps": [
+        "以资源强owner入有界MPSC删除队列，唯一领取；满时pending位合并。",
+        "解析删除三态，禁用不安全重试/析构；未证实销毁保留预算。"
+      ],
+      "deliverables": [
+        "删除三态表、pending责任保留"
+      ],
+      "acceptance_criteria": [
+        "队列满不丢owner；仅明确retained重试；consumed不碰handle；Unknown保留账本"
+      ],
+      "status": "NOT_STARTED",
+      "evidence": [],
+      "source_decision_ids": [
+        "B-04"
+      ],
+      "source_gap_ids": [
+        "G-09"
+      ]
+    },
+    {
+      "id": "T-17",
+      "module_ids": [
+        "M05",
+        "M07"
+      ],
+      "depends_on": [
+        "T-08",
+        "T-09",
+        "T-16"
+      ],
+      "external_prerequisites": [],
+      "contract_ids": [
+        "C05",
+        "C06",
+        "C09"
+      ],
+      "description": "事件+周期扫描补静态Serving，创建前预留、锁外provider，失败退避",
+      "steps": [
+        "Deficit按DesiredServing-IDLE-IN_USE-Creating计算。",
+        "预留预算后锁外创建；失败清理按真实归属，退避；发布再次检查OPEN。",
+        "target补建遵守节点额度；满额时有界背压或按入站撤销屏障安全释放旧target后再建，不能临时超额。"
+      ],
+      "deliverables": [
+        "有界补池/全角色补建"
+      ],
+      "acceptance_criteria": [
+        "全部IN_USE不扩池；quarantine耗尽不超建；stop/create交错不发布",
+        "删除失败、满额换代、创建partial/Unknown、stop和重启交错不提前归还节点ticket，不忙循环或误判物理故障。"
+      ],
+      "status": "NOT_STARTED",
+      "evidence": [],
+      "source_decision_ids": [
+        "B-06",
+        "B-11"
+      ],
+      "source_gap_ids": [
+        "G-09"
+      ]
+    },
+    {
+      "id": "T-18",
+      "module_ids": [
+        "M07",
+        "M11"
+      ],
+      "depends_on": [
+        "T-15",
+        "T-16"
+      ],
+      "external_prerequisites": [],
+      "contract_ids": [
+        "C09",
+        "C12"
+      ],
+      "description": "tombstone、native ID/事件ABA、未排空owner移交、重复close",
+      "steps": [
+        "建立native实体Registry和tombstone，保留歧义ID/迟到事件责任。",
+        "STOPPING期间关闭create/publish/lease；未安全责任转长寿命owner，重复close幂等。"
+      ],
+      "deliverables": [
+        "G-09生命周期部分和安全关闭协议"
+      ],
+      "acceptance_criteria": [
+        "ID重用/迟到CQE/AE、删除未知、JFC未安全不销毁、外部引用保留"
+      ],
+      "status": "NOT_STARTED",
+      "evidence": [],
+      "source_decision_ids": [
+        "B-04"
+      ],
+      "source_gap_ids": [
+        "G-09"
+      ]
+    },
+    {
+      "id": "T-19",
+      "module_ids": [
+        "M05",
+        "M08"
+      ],
+      "depends_on": [
+        "T-06",
+        "T-08"
+      ],
+      "external_prerequisites": [],
+      "contract_ids": [
+        "C05",
+        "C10"
+      ],
+      "description": "每口专用发送Jetty与独立MR授权槽；max_inflight_per_port显式配置",
+      "steps": [
+        "按口创建专用probe Jetty、独立注册区与peer授权槽。",
+        "实现max_inflight_per_port、peer_budget、JFC credit和逐WRslot/pin票据；支持同path及跨peer并发。"
+      ],
+      "deliverables": [
+        "并发探测资源与预算"
+      ],
+      "acceptance_criteria": [
+        "并发2和部署最大值；同path与跨peer乱序；每WR不同token/槽/pin；Unknown占额到安全结束；peer公平"
+      ],
+      "status": "NOT_STARTED",
+      "evidence": [],
+      "source_decision_ids": [
+        "B-08"
+      ],
+      "source_gap_ids": []
+    },
+    {
+      "id": "T-20",
+      "module_ids": [
+        "M04",
+        "M08"
+      ],
+      "depends_on": [
+        "T-07",
+        "T-19"
+      ],
+      "external_prerequisites": [],
+      "contract_ids": [
+        "C04",
+        "C10"
+      ],
+      "description": "故障触发首轮核验、fault_epoch/sequence、退避、阈值、恢复停timer、REVALIDATE",
+      "steps": [
+        "实现业务错误trigger/merge campaign、路径首轮核验和逐路径退避。",
+        "并发结果按probe_sequence有序提交；fault_epoch拒绝旧证据；阈值达到并满足其他gate才恢复/停timer。",
+        "实现force_disable期间显式REVALIDATE路径，不等待新业务错误。"
+      ],
+      "deliverables": [
+        "路径级健康状态机"
+      ],
+      "acceptance_criteria": [
+        "旧成功不覆盖新故障；无业务仍可恢复；未出错路径不批量BAD；取消不丢新任务"
+      ],
+      "status": "NOT_STARTED",
+      "evidence": [],
+      "source_decision_ids": [
+        "B-08"
+      ],
+      "source_gap_ids": []
+    },
+    {
+      "id": "T-21",
+      "module_ids": [
+        "M07",
+        "M08"
+      ],
+      "depends_on": [
+        "T-14",
+        "T-15",
+        "T-16",
+        "T-17",
+        "T-18",
+        "T-19",
+        "T-20"
+      ],
+      "external_prerequisites": [],
+      "contract_ids": [
+        "C08",
+        "C10"
+      ],
+      "description": "共享probe Jetty故障排空所有并发WR，连带flush仅Pending/Unknown",
+      "steps": [
+        "复用异步回收框架排空probe Jetty全部并发WR。",
+        "真实归因错误仅影响相应路径；被动flush为Pending/Unknown，不批量BAD或提前复用slot。"
+      ],
+      "deliverables": [
+        "业务/probe故障联调报告"
+      ],
+      "acceptance_criteria": [
+        "多个peer/path并发，局部故障/marker/timeout/stale，已post旧责任安全结束后复用槽"
+      ],
+      "status": "NOT_STARTED",
+      "evidence": [],
+      "source_decision_ids": [
+        "B-03",
+        "B-08"
+      ],
+      "source_gap_ids": []
+    },
+    {
+      "id": "T-22",
+      "module_ids": [
+        "M06",
+        "M09"
+      ],
+      "depends_on": [
+        "T-12"
+      ],
+      "external_prerequisites": [],
+      "contract_ids": [
+        "C07",
+        "C11"
+      ],
+      "description": "实际MemoryOwner与结果sidecar接入submit/status/wait/cancel/drain/freeBatch",
+      "steps": [
+        "在submit阶段获得真实MemoryOwner/pin，结果通过兼容sidecar传递。",
+        "将wait/cancel/freeBatch/drain连接实际资源安全门，保留free_requested/deferred teardown。"
+      ],
+      "deliverables": [
+        "兼容API和真实owner传递"
+      ],
+      "acceptance_criteria": [
+        "free_requested/取消/WaitExpired/析构不解除pin；Borrowed调用者契约明确"
+      ],
+      "status": "NOT_STARTED",
+      "evidence": [],
+      "source_decision_ids": [
+        "B-07"
+      ],
+      "source_gap_ids": []
+    },
+    {
+      "id": "T-23",
+      "module_ids": [
+        "M09",
+        "M10"
+      ],
+      "depends_on": [
+        "T-22"
+      ],
+      "external_prerequisites": [],
+      "contract_ids": [
+        "C11"
+      ],
+      "description": "接入BufferHandle与PRE/CROSS/POST/H2D pin，网络lease与staging释放分层",
+      "steps": [
+        "把Store state、BufferHandle和staging槽位实际owner接入TransferLifetimeOwner。",
+        "跨PRE/CROSS/POST/H2D分层释放；网络lease归还不等于staging可复用。"
+      ],
+      "deliverables": [
+        "Store/staging owner链与集成fake"
+      ],
+      "acceptance_criteria": [
+        "网络完成后H2D仍读staging；freeBatch/Store析构/shutdown交错无UAF"
+      ],
+      "status": "NOT_STARTED",
+      "evidence": [],
+      "source_decision_ids": [
+        "B-07"
+      ],
+      "source_gap_ids": []
+    },
+    {
+      "id": "T-24",
+      "module_ids": [
+        "M11"
+      ],
+      "depends_on": [
+        "T-18",
+        "T-21",
+        "T-23"
+      ],
+      "external_prerequisites": [],
+      "contract_ids": [
+        "C12"
+      ],
+      "description": "入口gate、force_disable、指标、回调有界、回滚安全关闭",
+      "steps": [
+        "装配共享core、transfer、health组件和线程，TENT只作adapter。",
+        "实现C12 gate、force_disable、观测及有界回调；模拟能力不计生产PASS。",
+        "装配节点target权威额度owner和node_target_quota gate，安装冻结配置；多进程无协调不得各自启用独立生产pooled接收端；导出limit/occupied/拒绝/等待指标。"
+      ],
+      "deliverables": [
+        "端到端软件候选与部署配置模板"
+      ],
+      "acceptance_criteria": [
+        "缺gate无native创建；默认legacy不变；stop后新业务post=0，旧责任安全移交",
+        "同节点配置一致，节点身份/旧代/重启不拆账；运行时满额TooManyRequests且保留健康服务，静态容量不合法InvalidArgument，无生产上限穿透。"
+      ],
+      "status": "NOT_STARTED",
+      "evidence": [],
+      "source_decision_ids": [
+        "B-01",
+        "B-06",
+        "B-08",
+        "B-11"
+      ],
+      "source_gap_ids": []
+    },
+    {
+      "id": "T-25",
+      "module_ids": [
+        "M12"
+      ],
+      "depends_on": [
+        "T-02",
+        "T-03",
+        "T-04",
+        "T-05",
+        "T-06",
+        "T-07",
+        "T-08",
+        "T-09",
+        "T-10",
+        "T-11",
+        "T-12",
+        "T-13",
+        "T-14",
+        "T-15",
+        "T-16",
+        "T-17",
+        "T-18",
+        "T-19",
+        "T-20",
+        "T-21",
+        "T-22",
+        "T-23",
+        "T-24"
+      ],
+      "external_prerequisites": [],
+      "contract_ids": [
+        "C00",
+        "C13"
+      ],
+      "description": "干净构建、定向回归、UT/fake端到端、sanitizer可用项与证据归档",
+      "steps": [
+        "按C13构建/枚举/运行强制软件矩阵，执行确定性交错及可用sanitizer。",
+        "输出需求→契约→任务→用例→日志映射；保留失败与复验记录。",
+        "增加默认8、严格输入、8/9边界、多sender共享、跨Context/Engine/进程并发和旧代/Unknown保留额度的确定性软件测试。"
+      ],
+      "deliverables": [
+        "软件准出包、需求→任务→用例→日志映射"
+      ],
+      "acceptance_criteria": [
+        "强制软件场景全PASS，无编译失败/漏跑；所有G项有修复或明确未交付，不虚填PASS",
+        "节点target额度强制软件矩阵PASS，容量不足不扣网络attempt重试、不重放Unknown WRITE；无节点协调的多进程拒绝启用有测试。"
+      ],
+      "status": "NOT_STARTED",
+      "evidence": [],
+      "source_decision_ids": [
+        "B-10",
+        "B-11"
+      ],
+      "source_gap_ids": []
+    },
+    {
+      "id": "T-26",
+      "module_ids": [
+        "M12"
+      ],
+      "depends_on": [
+        "T-25"
+      ],
+      "external_prerequisites": [],
+      "contract_ids": [
+        "C13"
+      ],
+      "description": "冻结性能protocol、真实环境采集模板、实机/灰度/回滚runbook",
+      "steps": [
+        "实现参数化benchmark入口及environment/capability/manifest采集格式。",
+        "生成native/压测/灰度/回滚可执行runbook和证据模板，不预写PASS。"
+      ],
+      "deliverables": [
+        "可执行验收方案和软件验收记录"
+      ],
+      "acceptance_criteria": [
+        "门槛/样本/流量映射清楚；硬件项NOT_RUN明示；qule验收软件边界"
+      ],
+      "status": "NOT_STARTED",
+      "evidence": [],
+      "source_decision_ids": [
+        "B-09"
+      ],
+      "source_gap_ids": []
+    },
+    {
+      "id": "T-27",
+      "module_ids": [
+        "M02",
+        "M12"
+      ],
+      "depends_on": [
+        "T-25",
+        "T-26"
+      ],
+      "external_prerequisites": [
+        "complete hardware environment",
+        "frozen provider version"
+      ],
+      "contract_ids": [
+        "C02",
+        "C08",
+        "C09",
+        "C13"
+      ],
+      "description": "执行E-01～E-04；真实RM基线、共享目标、flush/delete/ABA/owner",
+      "steps": [
+        "环境齐备后冻结版本并执行E-01～E-04；环境缺失则记录NOT_RUN而继续独立软件任务。",
+        "证据必须穿过真实wrapper/provider；失败保持production gate关闭。"
+      ],
+      "deliverables": [
+        "版本契约和双端报告"
+      ],
+      "acceptance_criteria": [
+        "所有强制native契约PASS；否则维持pool gate关闭"
+      ],
+      "status": "NOT_STARTED",
+      "evidence": [],
+      "source_decision_ids": [
+        "B-01",
+        "B-02",
+        "B-03",
+        "B-04"
+      ],
+      "source_gap_ids": []
+    },
+    {
+      "id": "T-28",
+      "module_ids": [
+        "M12"
+      ],
+      "depends_on": [
+        "T-27"
+      ],
+      "external_prerequisites": [],
+      "contract_ids": [
+        "C13"
+      ],
+      "description": "执行E-05、READ/WRITE、故障恢复、饱和/静默恢复、两类soak",
+      "steps": [
+        "对同预算RM legacy与pooled执行C13负载矩阵、故障脚本和soak。",
+        "逐测试单元输出原始数据和门槛结论；无效样本/缺设备不计PASS。",
+        "增加多台发送机器同时向同一目标机器的汇聚压力/故障恢复测试，归档有效target上限、占额分布以及独立WR/JFC/授权槽负载。"
+      ],
+      "deliverables": [
+        "原始数据、资源趋势、SLO报告"
+      ],
+      "acceptance_criteria": [
+        "吞吐≥95%、p99/CPU≤110%、正确性零容忍、失败率≤对照",
+        "汇聚压力下目标节点target总占额不超过配置值（默认8），无越限/提前释放；不得将target限额误报为全局WR限流或单独的防过载证明。"
+      ],
+      "status": "NOT_STARTED",
+      "evidence": [],
+      "source_decision_ids": [
+        "B-09",
+        "B-11"
+      ],
+      "source_gap_ids": []
+    },
+    {
+      "id": "T-29",
+      "module_ids": [
+        "M11",
+        "M12"
+      ],
+      "depends_on": [
+        "T-28"
+      ],
+      "external_prerequisites": [
+        "E-01 PASS",
+        "E-02 PASS",
+        "E-03 PASS",
+        "E-04 PASS",
+        "E-05 PASS",
+        "explicit deployment authorization"
+      ],
+      "contract_ids": [
+        "C12",
+        "C13"
+      ],
+      "description": "实现并在外部授权后执行分级灰度、指标判断及安全回滚；观察时长按C13。",
+      "steps": [
+        "仅在E-01～E-05均PASS且用户授权部署后执行灰度，编码任务本身不自动部署。",
+        "逐级评估指标并演练安全回滚；未排空/Unknown责任保持owner。"
+      ],
+      "deliverables": [
+        "E-06每级证据/流量映射/回滚报告"
+      ],
+      "acceptance_criteria": [
+        "每级全部指标合格、无owner/预算泄漏；失败关闭准入并安全回滚"
+      ],
+      "status": "NOT_STARTED",
+      "evidence": [],
+      "source_decision_ids": [
+        "B-09"
+      ],
+      "source_gap_ids": []
+    },
+    {
+      "id": "T-30",
+      "module_ids": [
+        "M12"
+      ],
+      "depends_on": [
+        "T-29"
+      ],
+      "external_prerequisites": [],
+      "contract_ids": [
+        "C13"
+      ],
+      "description": "归档最终版本、实际容量、缺陷关闭、操作手册及交接记录。",
+      "steps": [
+        "归档版本、实际容量/配置、所有G/E项处置和操作手册。",
+        "分别记录software_complete/native_validated/release_ready，不合并为虚假全完成。"
+      ],
+      "deliverables": [
+        "正式上线基线与完整追踪表"
+      ],
+      "acceptance_criteria": [
+        "qule确认所有E项PASS和遗留风险，无强制项NOT_RUN"
+      ],
+      "status": "NOT_STARTED",
+      "evidence": [],
+      "source_decision_ids": [
+        "B-09",
+        "B-10"
+      ],
+      "source_gap_ids": []
+    }
+  ],
+  "completion_states": {
+    "software_complete": {
+      "required_task_ids": [
+        "T-01",
+        "T-02",
+        "T-03",
+        "T-04",
+        "T-05",
+        "T-06",
+        "T-07",
+        "T-08",
+        "T-09",
+        "T-10",
+        "T-11",
+        "T-12",
+        "T-13",
+        "T-14",
+        "T-15",
+        "T-16",
+        "T-17",
+        "T-18",
+        "T-19",
+        "T-20",
+        "T-21",
+        "T-22",
+        "T-23",
+        "T-24",
+        "T-25",
+        "T-26"
+      ],
+      "required_status": "PASS"
+    },
+    "native_validated": {
+      "requires_state": "software_complete",
+      "required_task_ids": [
+        "T-27",
+        "T-28"
+      ],
+      "required_gate_ids": [
+        "E-01",
+        "E-02",
+        "E-03",
+        "E-04",
+        "E-05"
+      ],
+      "required_status": "PASS"
+    },
+    "release_ready": {
+      "requires_state": "native_validated",
+      "required_task_ids": [
+        "T-29",
+        "T-30"
+      ],
+      "required_gate_ids": [
+        "E-06"
+      ],
+      "requires_deployment_authorization": true,
+      "required_status": "PASS"
+    }
+  },
+  "execution_result_schema": {
+    "task_id": "T-NN",
+    "status": "task_schema.status_enum",
+    "source_sha": "string",
+    "configuration_hash": "string",
+    "changed_files": [
+      "path"
+    ],
+    "commands": [
+      "literal command"
+    ],
+    "tests": [
+      {
+        "name": "string",
+        "result": "PASS|FAIL|SKIP|NOT_RUN",
+        "log": "path"
+      }
+    ],
+    "remaining_issues": [
+      "string"
+    ],
+    "native_gate_result": "PASS|FAIL|NOT_RUN"
+  },
+  "contract_catalog": {
+    "C00": {
+      "document": "supercache_jetty_pool_llm_implementation.md",
+      "section": "C00",
+      "title": "构建、基线与证据"
+    },
+    "C01": {
+      "document": "supercache_jetty_pool_llm_implementation.md",
+      "section": "C01",
+      "title": "配置、拓扑与profile"
+    },
+    "C02": {
+      "document": "supercache_jetty_pool_llm_implementation.md",
+      "section": "C02",
+      "title": "native adapter"
+    },
+    "C03": {
+      "document": "supercache_jetty_pool_llm_implementation.md",
+      "section": "C03",
+      "title": "bootstrap v3与事务"
+    },
+    "C04": {
+      "document": "supercache_jetty_pool_llm_implementation.md",
+      "section": "C04",
+      "title": "共享target、Registry与路径"
+    },
+    "C05": {
+      "document": "supercache_jetty_pool_llm_implementation.md",
+      "section": "C05",
+      "title": "NativeBudget与credit"
+    },
+    "C06": {
+      "document": "supercache_jetty_pool_llm_implementation.md",
+      "section": "C06",
+      "title": "pool与准入接口"
+    },
+    "C07": {
+      "document": "supercache_jetty_pool_llm_implementation.md",
+      "section": "C07",
+      "title": "完成、重试与结果"
+    },
+    "C08": {
+      "document": "supercache_jetty_pool_llm_implementation.md",
+      "section": "C08",
+      "title": "异步recovery与事件分发"
+    },
+    "C09": {
+      "document": "supercache_jetty_pool_llm_implementation.md",
+      "section": "C09",
+      "title": "删除、补池、JFC协调与ABA"
+    },
+    "C10": {
+      "document": "supercache_jetty_pool_llm_implementation.md",
+      "section": "C10",
+      "title": "并发probe与健康状态机"
+    },
+    "C11": {
+      "document": "supercache_jetty_pool_llm_implementation.md",
+      "section": "C11",
+      "title": "Runtime、Store与实际owner"
+    },
+    "C12": {
+      "document": "supercache_jetty_pool_llm_implementation.md",
+      "section": "C12",
+      "title": "装配、并发、启停与生产gate"
+    },
+    "C13": {
+      "document": "supercache_jetty_pool_llm_implementation.md",
+      "section": "C13",
+      "title": "测试、性能与上线证据"
+    }
+  }
+}

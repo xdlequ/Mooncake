@@ -204,6 +204,13 @@ class NativeBudget final {
     // rejected as InvalidArgument and leaves the ledger unchanged.
     Status transition(BudgetReservation& reservation, BudgetObjectState next);
 
+    // Releases a reservation that provably never allocated a native object
+    // (the provider call was never made, or the frozen provider contract
+    // proves the failure left no handle). Only kCreating reservations may
+    // use this rollback path; a partial or Unknown create must transition
+    // to kQuarantined and keep the budget charged instead (C05.1).
+    Status releaseUnallocated(BudgetReservation& reservation);
+
     // Releases budget after the native destruction has been proven. proof
     // must be true; an unproven destruction keeps the reservation charged
     // (callers quarantine it instead). Only kRetiring and kQuarantined
