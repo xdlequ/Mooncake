@@ -593,6 +593,9 @@ std::shared_ptr<ProbeRecord> ProbeLinkManager::beginPost(
     record->core.topology_epoch = key.version.topology_epoch;
     record->core.target_epoch = key.version.target_epoch;
     record->core.fault_epoch = key.fault_epoch;
+    // T-12 / C07: a probe WR is the standard one-byte WRITE, so the record's
+    // three-layer sidecar reports a write opcode.
+    record->core.opcode = RequestOpCode::kWrite;
     record->key = key;
     record->peer = runtime->peer;
     record->posted_ns = now;

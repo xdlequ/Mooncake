@@ -63,6 +63,12 @@ class FakeJfc final : public Jfc {
             completions_.pop_front();
         }
     }
+    // Test seam for the T-11 contradiction injection: lets a post call that
+    // pushed a completion wait until a poller has drained it.
+    size_t pendingCount() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return completions_.size();
+    }
     void close() { valid_ = false; }
 
    private:
@@ -478,6 +484,51 @@ class FakeUrmaAdapter final : public UrmaAdapter {
             }
             return Status::RdmaError("injected post error after acceptance");
         }
+        if (not_accept_but_complete_.exchange(false,
+                                              std::memory_order_acq_rel)) {
+            // Mirrors the T-11/C07 contradiction: the post reports a
+            // definite zero acceptance (posted_count stays zero), yet the
+            // hardware executed the WR and a real success CQE is delivered
+            // for its token.
+            for (const auto& request : requests) {
+                if (request.operation == Operation::WRITE) {
+                    std::memcpy(
+                        reinterpret_cast<void*>(request.remote_address),
+                        reinterpret_cast<const void*>(request.local_address),
+                        request.length);
+                }
+                Completion completion{
+                    CompletionCategory::SUCCESS, 0, request.token,
+                    static_cast<uint32_t>(request.length), fake->id()};
+                if (hold_completions_.load(std::memory_order_acquire)) {
+                    std::lock_guard<std::mutex> lock(held_completions_mutex_);
+                    held_completions_.emplace_back(fake->jfc(),
+                                                   std::move(completion));
+                } else {
+                    fake->jfc()->push(std::move(completion));
+                }
+            }
+            if (!hold_completions_.load(std::memory_order_acquire)) {
+                // Deterministic early-CQE window: hold this contradictory
+                // post until the poller has drained the CQE (and, with the
+                // extra margin, dispatched it into the completion gate), so
+                // the zero-acceptance fact always lands on a record that
+                // already carries the real completion. Without this, the
+                // gate may legally take the clean reject exit before the
+                // CQE becomes visible, which is a different (also legal)
+                // timing, not the contradiction this test targets.
+                const auto wait_until =
+                    std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(500);
+                while (fake->jfc()->pendingCount() != 0 &&
+                       std::chrono::steady_clock::now() < wait_until) {
+                    std::this_thread::sleep_for(
+                        std::chrono::microseconds(50));
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            return Status::RdmaError("injected zero acceptance with execution");
+        }
         for (const auto& request : requests) {
             if (rm_mode) {
                 last_post_target_id_.store(request.target->id(),
@@ -506,12 +557,20 @@ class FakeUrmaAdapter final : public UrmaAdapter {
                         request.length);
                 }
             }
-            Completion completion{
-                category, 0, request.token,
-                category == CompletionCategory::SUCCESS
-                    ? static_cast<uint32_t>(request.length)
-                    : 0,
-                fake->id()};
+            uint32_t reported_bytes = category == CompletionCategory::SUCCESS
+                                          ? static_cast<uint32_t>(request.length)
+                                          : 0;
+            const int32_t length_delta = mismatch_next_completion_bytes_
+                .exchange(0, std::memory_order_acq_rel);
+            if (length_delta != 0 &&
+                category == CompletionCategory::SUCCESS) {
+                // T-11 / G-04: a success CQE that reports a byte count
+                // different from the submitted WR length.
+                reported_bytes = static_cast<uint32_t>(
+                    static_cast<int64_t>(reported_bytes) + length_delta);
+            }
+            Completion completion{category, 0, request.token, reported_bytes,
+                                  fake->id()};
             if (hold_completions_.load(std::memory_order_acquire)) {
                 // Parked instead of delivered: the test releases them once
                 // every slice of the task has been dispatched, so rail load
@@ -538,6 +597,28 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     void failNextCompletion(CompletionCategory category) {
         next_completion_.store(category, std::memory_order_release);
     }
+    // T-13 / C02: the capability injector. Tests may pin any contract (e.g.
+    // strip a capability to make the production pool gate fail closed, or
+    // declare kStrictMatch length semantics); the default reports the full
+    // fake capability set so the async drain chain stays verifiable.
+    ProviderContract contract_;
+    [[nodiscard]] ProviderContract providerContract() const override {
+        if (!contract_.provider_id.empty()) return contract_;
+        ProviderContract full;
+        full.provider_id = "fake-urma";
+        full.native_api_version = 1;
+        full.abi_size = 64;
+        full.software_flush = true;
+        full.marker_flush = true;
+        full.delete_tristate = true;
+        full.async_drain = true;
+        full.event_barrier = true;
+        full.length_semantics = LengthSemantics::kZeroIsUnreported;
+        return full;
+    }
+    void injectProviderContract(const ProviderContract& contract) {
+        contract_ = contract;
+    }
     // Reject the next post before accepting any WR: posted_count stays zero,
     // which exercises the synchronous rollback path.
     void failNextPostWithoutAccept() {
@@ -547,6 +628,17 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     // the status fails, which the RM classifier must treat as Unknown.
     void failNextPostAfterAccept() {
         accept_then_fail_post_.store(true, std::memory_order_release);
+    }
+    // T-11 / C07: the next post reports a definite zero acceptance while the
+    // fake still executes the WR and delivers a real success CQE for it.
+    void failNextPostWithoutAcceptButComplete() {
+        not_accept_but_complete_.store(true, std::memory_order_release);
+    }
+    // T-11 / G-04: the next success completion reports a byte count that
+    // differs from the submitted WR length by `delta` (short or overlong).
+    void reportNextCompletionLengthDelta(int32_t delta) {
+        mismatch_next_completion_bytes_.store(delta,
+                                             std::memory_order_release);
     }
     void failNextImports(int count) {
         fail_imports_.store(count, std::memory_order_release);
@@ -666,6 +758,10 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         held_completions_;
     std::atomic<bool> fail_next_post_{false};
     std::atomic<bool> accept_then_fail_post_{false};
+    // T-11 injections: zero acceptance with real execution, and success
+    // completions whose reported byte count contradicts the WR length.
+    std::atomic<bool> not_accept_but_complete_{false};
+    std::atomic<int32_t> mismatch_next_completion_bytes_{0};
     std::atomic<int> fail_imports_{0};
     std::atomic<bool> partial_import_on_failure_{false};
     std::atomic<int> fail_unimports_{0};
@@ -917,9 +1013,10 @@ class SingleSliceHarness {
         return workers->start().ok();
     }
 
-    UbTask::Ptr submit(uint32_t slice_max_retries) {
+    UbTask::Ptr submit(uint32_t slice_max_retries,
+                       Request::OpCode opcode = Request::WRITE) {
         Request request{};
-        request.opcode = Request::WRITE;
+        request.opcode = opcode;
         request.source = source.data();
         request.target_id = LOCAL_SEGMENT_ID;
         request.target_offset = reinterpret_cast<uint64_t>(target.data());
@@ -1025,7 +1122,7 @@ TEST(UbNativeDataPathTest, LocalBuffersRequestProviderLocalOnlyAccess) {
 }
 
 TEST(UbNativeDataPathTest,
-     MissingCompletionIsFencedBeforeRetryAndEventuallyCompletes) {
+     MissingCompletionIsFencedAndUnknownWriteFailsClosed) {
     auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
     ASSERT_TRUE(adapter->initialize().ok());
     auto context = std::make_shared<UbContext>(0, fakeDevice(), adapter);
@@ -1122,9 +1219,11 @@ TEST(UbNativeDataPathTest,
            std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    EXPECT_EQ(task->transferStatus().s, COMPLETED);
-    EXPECT_EQ(task->transferStatus().transferred_bytes, source.size());
-    EXPECT_EQ(source, target);
+    // T-12 / G-05: the lost-completion WRITE is fenced (resource safety is
+    // proven), but its execution outcome stays Unknown, so the slice must
+    // take the terminal TIMEOUT sidecar instead of a transparent replay
+    // (C07: a WRITE that may already have taken effect is never replayed).
+    EXPECT_EQ(task->transferStatus().s, TIMEOUT);
     EXPECT_GT(rails.aggregateBandwidth(), 0.0);
     EXPECT_GE(rails.stats(UbPostPath{0, LOCAL_SEGMENT_ID, 0, 1}).timeouts, 1U);
     EXPECT_EQ(adapter->pendingCount(), 0U);
@@ -1244,12 +1343,16 @@ TEST(UbNativeDataPathTest,
            std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    EXPECT_EQ(task->transferStatus().s, COMPLETED);
-    EXPECT_EQ(task->transferStatus().transferred_bytes, source.size());
-    EXPECT_EQ(source, target);
+    // T-12 / G-05: the fence proves resource safety, never that the WRITE
+    // did not take effect, so the first task fails closed with the terminal
+    // TIMEOUT sidecar instead of replaying the Unknown WRITE.
+    EXPECT_EQ(task->transferStatus().s, TIMEOUT);
     EXPECT_GE(rails.stats(UbPostPath{0, LOCAL_SEGMENT_ID, 0, 1}).timeouts, 1U);
     EXPECT_GE(adapter->quiesceCalls(), 1U);
 
+    // The fence still reclaimed every owner exactly once: the timeout never
+    // releases early, and after responsibility converged the endpoint is
+    // healthy again for fresh work (C11: no early release, safe reuse).
     EXPECT_EQ(workers.inflightCount(), 0U);
     EXPECT_EQ(quota.activeReservationCount(), 0U);
     ASSERT_NE(fenced_endpoint, nullptr);
@@ -1368,13 +1471,59 @@ TEST(UbNativeDataPathTest, SingleWrTimeoutFenceReclaimsInflightOnce) {
     }
 
     // The provider drops the WR and the flush cannot return it. The successful
-    // fence is the only proof that the old DMA is gone, so the timed-out token
-    // must be reclaimed before the retry is posted.
+    // fence is the only proof that the old DMA is gone. T-12 / G-05: a WRITE
+    // whose execution outcome stays Unknown must never be transparently
+    // replayed: the fence proves resource safety only (INV13), so the slice
+    // takes the terminal TIMEOUT sidecar instead of a retry, and the token is
+    // reclaimed exactly once.
     harness.adapter->holdNextCompletion();
     harness.adapter->dropQuiesceCompletions();
     auto task = harness.submit(1);
     ASSERT_NE(task, nullptr)
         << "failed to submit the single-WR task; " << harness.diagnostics();
+    ASSERT_TRUE(
+        SingleSliceHarness::waitForTerminal(task, std::chrono::seconds(2)))
+        << "timeout fence never reached a terminal state; "
+        << SingleSliceHarness::describeTask(task) << " "
+        << harness.diagnostics();
+    const auto snapshot = [&] {
+        return SingleSliceHarness::describeTask(task) + " " +
+               harness.diagnostics();
+    };
+    EXPECT_EQ(task->transferStatus().s, TIMEOUT)
+        << "an Unknown WRITE must not be replayed after a proven fence"
+        << snapshot();
+    EXPECT_EQ(task->transferStatus().transferred_bytes, 0U) << snapshot();
+    const auto timeout_stats =
+        harness.rails.stats(UbPostPath{0, LOCAL_SEGMENT_ID, 0, 1});
+    EXPECT_GE(timeout_stats.timeouts, 1U)
+        << "timeout was never recorded on the rail; rail_timeouts="
+        << timeout_stats.timeouts << " rail_pauses=" << timeout_stats.pauses
+        << " " << snapshot();
+    EXPECT_GE(harness.adapter->quiesceCalls(), 1U)
+        << "provider-lost WR was never fenced; " << snapshot();
+
+    EXPECT_EQ(harness.workers->inflightCount(), 0U) << snapshot();
+    EXPECT_EQ(harness.context->outstandingWrs(), 0U) << snapshot();
+    EXPECT_EQ(harness.context->inflightBytes(), 0U) << snapshot();
+    EXPECT_EQ(harness.quota.activeReservationCount(), 0U) << snapshot();
+}
+
+// T-12 / C07: the READ side of the timeout rule. A fence that proves the old
+// DMA stopped touching the destination makes a fresh READ attempt safe under
+// the unified retry budget, so the same injected loss must end COMPLETED.
+TEST(UbNativeDataPathTest, SingleWrReadTimeoutFenceRetriesUnderBudget) {
+    SingleSliceHarness harness;
+    ASSERT_TRUE(harness.start(/*slice_timeout_ms=*/10));
+    for (size_t i = 0; i < harness.target.size(); ++i) {
+        harness.target[i] = static_cast<char>(i + 1);
+    }
+
+    harness.adapter->holdNextCompletion();
+    harness.adapter->dropQuiesceCompletions();
+    auto task = harness.submit(1, Request::READ);
+    ASSERT_NE(task, nullptr)
+        << "failed to submit the single-READ task; " << harness.diagnostics();
     ASSERT_TRUE(
         SingleSliceHarness::waitForTerminal(task, std::chrono::seconds(2)))
         << "timeout retry never reached a terminal state; "
@@ -1384,18 +1533,13 @@ TEST(UbNativeDataPathTest, SingleWrTimeoutFenceReclaimsInflightOnce) {
         return SingleSliceHarness::describeTask(task) + " " +
                harness.diagnostics();
     };
-    EXPECT_EQ(task->transferStatus().s, COMPLETED) << snapshot();
+    EXPECT_EQ(task->transferStatus().s, COMPLETED)
+        << "a fenced READ must retry under the unified budget" << snapshot();
     EXPECT_EQ(task->transferStatus().transferred_bytes,
               SingleSliceHarness::kSliceBytes)
         << snapshot();
     EXPECT_EQ(harness.source, harness.target)
-        << "payload mismatch after timeout retry; " << snapshot();
-    const auto timeout_stats =
-        harness.rails.stats(UbPostPath{0, LOCAL_SEGMENT_ID, 0, 1});
-    EXPECT_GE(timeout_stats.timeouts, 1U)
-        << "timeout was never recorded on the rail; rail_timeouts="
-        << timeout_stats.timeouts << " rail_pauses=" << timeout_stats.pauses
-        << " " << snapshot();
+        << "payload mismatch after the READ timeout retry; " << snapshot();
     EXPECT_GE(harness.adapter->quiesceCalls(), 1U)
         << "provider-lost WR was never fenced; " << snapshot();
 
@@ -3514,6 +3658,471 @@ TEST(UbRmPoolTest, PooledMemberRetiresAfterCqeError) {
     EXPECT_GE(adapter->createJettyCalls(), 3U)
         << "the retry must lease a freshly created member after the errored "
            "one was retired";
+
+    ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+    EXPECT_TRUE(transport.uninstall().ok());
+    EXPECT_EQ(adapter->deleteJettyCalls(), adapter->createJettyCalls());
+}
+
+// T-11 / G-04: a success CQE whose byte count contradicts the submitted WR
+// length must fail the attempt closed (never settle as a full success) and
+// retire the pool member permanently. `delta` is applied to the reported
+// length of the next success completion: negative models a short completion,
+// positive an overlong one. The fake still performs the data copy, so the
+// bytes may have landed: that is exactly why the result must be FAILED
+// instead of a fabricated success (no length is ever "normalized" up to the
+// requested length without a versioned provider contract).
+static void runPooledLengthMismatchCase(int32_t delta) {
+    auto device = rmCapableDevice();
+    auto adapter = std::make_shared<FakeUrmaAdapter>(device);
+    auto topology = fakeTopology(false);
+    auto control = std::make_shared<ControlService>("p2p", "", nullptr);
+    uint16_t port = 0;
+    ASSERT_TRUE(control->start(port).ok());
+    const std::string segment_name =
+        "127.0.0.1:" + std::to_string(static_cast<unsigned>(port));
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        segment.name = segment_name;
+                        segment.rpc_server_addr = segment_name;
+                        segment.machine_id = "fake-machine";
+                        segment.type = SegmentType::Memory;
+                        segment.detail = MemorySegmentDesc{};
+                        std::get<MemorySegmentDesc>(segment.detail).topology =
+                            *topology;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    auto config = std::make_shared<Config>();
+    config->set("transports/ub/enable", true);
+    config->set("transports/ub/runtime_profile", "rm_pool");
+    config->set("transports/ub/trans_mode", "rm");
+    config->set("transports/ub/worker_count", 1);
+    config->set("transports/ub/poller_count", 1);
+    config->set("transports/ub/jfc_per_context", 1);
+    config->set("transports/ub/jetty_per_endpoint", 1);
+    config->set("transports/ub/max_endpoints", 16);
+    config->set("transports/ub/slice_size", 64);
+    config->set("transports/ub/max_slices_per_task", 4);
+    config->set("transports/ub/max_retries", 0);
+    config->set("transports/ub/slice_timeout_ms", 1000);
+    config->set("transports/ub/endpoint_cooldown_ms", 100);
+    config->set("transports/ub/jetty_pool/enable", true);
+    config->set("transports/ub/jetty_pool/business_desired_serving", 1);
+    setPhysicalOnlyIdentity(*config, device);
+
+    UbTransport transport(adapter);
+    std::string mutable_segment_name = segment_name;
+    const auto install_status =
+        transport.install(mutable_segment_name, control, topology, config);
+    ASSERT_TRUE(install_status.ok()) << install_status.ToString();
+
+    std::array<char, 64> source{};
+    std::array<char, 64> target{};
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(77 - i);
+    }
+    BufferDesc source_desc{};
+    source_desc.addr = reinterpret_cast<uint64_t>(source.data());
+    source_desc.length = source.size();
+    source_desc.location = kWildcardLocation;
+    BufferDesc target_desc{};
+    target_desc.addr = reinterpret_cast<uint64_t>(target.data());
+    target_desc.length = target.size();
+    target_desc.location = kWildcardLocation;
+    MemoryOptions options;
+    options.perm = kGlobalReadWrite;
+    std::vector<BufferDesc> descriptors{source_desc, target_desc};
+    ASSERT_TRUE(transport.addMemoryBuffer(descriptors, options).ok());
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        std::get<MemorySegmentDesc>(segment.detail).buffers =
+                            descriptors;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(target.data());
+    request.length = source.size();
+    adapter->reportNextCompletionLengthDelta(delta);
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {request}).ok());
+
+    TransferStatus transfer{PENDING, 0};
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (transfer.s == PENDING &&
+           std::chrono::steady_clock::now() < deadline) {
+        ASSERT_TRUE(transport.getTransferStatus(batch, 0, transfer).ok());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(transfer.s, FAILED)
+        << "a contradicting byte count must never settle as a success";
+    EXPECT_EQ(transfer.transferred_bytes, 0U);
+    // Exactly one WR for the single slice of the single attempt.
+    EXPECT_EQ(adapter->postCalls(), 1U);
+    EXPECT_EQ(adapter->postCalls(), adapter->postedWrs());
+    // The member is retired (INV07) and eventually reset+deleted; it never
+    // returns to the LIFO stack for reuse.
+    const auto delete_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (adapter->deleteJettyCalls() == 0 &&
+           std::chrono::steady_clock::now() < delete_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_GE(adapter->deleteJettyCalls(), 1U)
+        << "the length-mismatch member must be retired and deleted, never "
+           "reused";
+    // One endpoint Jetty plus one pool member, and no replacement member:
+    // the length mismatch is permanent and not retryable, so nothing new is
+    // created on this hot path.
+    EXPECT_EQ(adapter->createJettyCalls(), 2U);
+
+    ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+    EXPECT_TRUE(transport.uninstall().ok());
+    EXPECT_EQ(adapter->deleteJettyCalls(), adapter->createJettyCalls());
+}
+
+TEST(UbRmPoolTest, PooledShortCompletionFailsClosedAndRetiresMember) {
+    runPooledLengthMismatchCase(-8);
+}
+
+TEST(UbRmPoolTest, PooledOverlongCompletionFailsClosedAndRetiresMember) {
+    runPooledLengthMismatchCase(+8);
+}
+
+// T-13 / B-03: a zero reported length carries no versioned meaning under the
+// default contract (kZeroIsUnreported): it is never padded up to the request
+// and never judged as a mismatch, so the attempt settles on the success
+// category alone.
+static void runPooledZeroLengthReportCase(bool strict_contract) {
+    auto device = rmCapableDevice();
+    auto adapter = std::make_shared<FakeUrmaAdapter>(device);
+    if (strict_contract) {
+        ProviderContract strict;
+        strict.provider_id = "fake-urma-strict";
+        strict.native_api_version = 1;
+        strict.software_flush = true;
+        strict.marker_flush = true;
+        strict.delete_tristate = true;
+        strict.async_drain = true;
+        strict.event_barrier = true;
+        strict.length_semantics = LengthSemantics::kStrictMatch;
+        adapter->injectProviderContract(strict);
+    }
+    auto topology = fakeTopology(false);
+    auto control = std::make_shared<ControlService>("p2p", "", nullptr);
+    uint16_t port = 0;
+    ASSERT_TRUE(control->start(port).ok());
+    const std::string segment_name =
+        "127.0.0.1:" + std::to_string(static_cast<unsigned>(port));
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        segment.name = segment_name;
+                        segment.rpc_server_addr = segment_name;
+                        segment.machine_id = "fake-machine";
+                        segment.type = SegmentType::Memory;
+                        segment.detail = MemorySegmentDesc{};
+                        std::get<MemorySegmentDesc>(segment.detail).topology =
+                            *topology;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    auto config = std::make_shared<Config>();
+    config->set("transports/ub/enable", true);
+    config->set("transports/ub/runtime_profile", "rm_pool");
+    config->set("transports/ub/trans_mode", "rm");
+    config->set("transports/ub/worker_count", 1);
+    config->set("transports/ub/poller_count", 1);
+    config->set("transports/ub/jfc_per_context", 1);
+    config->set("transports/ub/jetty_per_endpoint", 1);
+    config->set("transports/ub/max_endpoints", 16);
+    config->set("transports/ub/slice_size", 64);
+    config->set("transports/ub/max_slices_per_task", 4);
+    config->set("transports/ub/max_retries", 0);
+    config->set("transports/ub/slice_timeout_ms", 1000);
+    config->set("transports/ub/endpoint_cooldown_ms", 100);
+    config->set("transports/ub/jetty_pool/enable", true);
+    config->set("transports/ub/jetty_pool/business_desired_serving", 1);
+    setPhysicalOnlyIdentity(*config, device);
+
+    UbTransport transport(adapter);
+    std::string mutable_segment_name = segment_name;
+    const auto install_status =
+        transport.install(mutable_segment_name, control, topology, config);
+    ASSERT_TRUE(install_status.ok()) << install_status.ToString();
+
+    std::array<char, 64> source{};
+    std::array<char, 64> target{};
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(55 - i);
+    }
+    BufferDesc source_desc{};
+    source_desc.addr = reinterpret_cast<uint64_t>(source.data());
+    source_desc.length = source.size();
+    source_desc.location = kWildcardLocation;
+    BufferDesc target_desc{};
+    target_desc.addr = reinterpret_cast<uint64_t>(target.data());
+    target_desc.length = target.size();
+    target_desc.location = kWildcardLocation;
+    MemoryOptions options;
+    options.perm = kGlobalReadWrite;
+    std::vector<BufferDesc> descriptors{source_desc, target_desc};
+    ASSERT_TRUE(transport.addMemoryBuffer(descriptors, options).ok());
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        std::get<MemorySegmentDesc>(segment.detail).buffers =
+                            descriptors;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(target.data());
+    request.length = source.size();
+    // A success CQE that reports zero bytes for a 64-byte request.
+    adapter->reportNextCompletionLengthDelta(
+        -static_cast<int32_t>(source.size()));
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {request}).ok());
+
+    TransferStatus transfer{PENDING, 0};
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (transfer.s == PENDING &&
+           std::chrono::steady_clock::now() < deadline) {
+        ASSERT_TRUE(transport.getTransferStatus(batch, 0, transfer).ok());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (strict_contract) {
+        // The versioned contract declares every SUCCESS length exact, so a
+        // zero report on a non-empty request is a contradiction: fail closed.
+        EXPECT_EQ(transfer.s, FAILED)
+            << "kStrictMatch must judge a zero report as a mismatch";
+        EXPECT_EQ(transfer.transferred_bytes, 0U);
+    } else {
+        // B-03: zero stays unreported - no padding, no mismatch verdict.
+        EXPECT_EQ(transfer.s, COMPLETED)
+            << "kZeroIsUnreported must not judge a zero report";
+        EXPECT_EQ(transfer.transferred_bytes, source.size());
+        EXPECT_EQ(source, target);
+    }
+    EXPECT_EQ(adapter->postCalls(), 1U);
+
+    ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+    EXPECT_TRUE(transport.uninstall().ok());
+    EXPECT_EQ(adapter->deleteJettyCalls(), adapter->createJettyCalls());
+}
+
+TEST(UbRmPoolTest, PooledZeroReportedLengthStaysUnjudgedByDefault) {
+    runPooledZeroLengthReportCase(/*strict_contract=*/false);
+}
+
+TEST(UbRmPoolTest, PooledStrictContractJudgesZeroReportedLength) {
+    runPooledZeroLengthReportCase(/*strict_contract=*/true);
+}
+
+// T-13 / C08: the production pool gate. The asynchronous drain chain may only
+// be armed when the adapter verifies the capabilities the chain depends on;
+// an injected contract that strips one capability must fail the installation
+// instead of silently falling back to the synchronous quiesce.
+TEST(UbRmPoolTest, PooledInstallFailsClosedWithoutVerifiableAsyncDrain) {
+    auto device = rmCapableDevice();
+    auto adapter = std::make_shared<FakeUrmaAdapter>(device);
+    ProviderContract degraded;
+    degraded.provider_id = "fake-urma-degraded";
+    degraded.native_api_version = 1;
+    degraded.software_flush = true;
+    degraded.marker_flush = true;
+    degraded.delete_tristate = true;
+    degraded.async_drain = false;  // the capability the gate requires
+    degraded.event_barrier = true;
+    adapter->injectProviderContract(degraded);
+    // The injector itself must round-trip the versioned statement.
+    EXPECT_EQ(adapter->providerContract().provider_id,
+              degraded.provider_id);
+    EXPECT_FALSE(adapter->providerContract().async_drain);
+
+    auto topology = fakeTopology(false);
+    auto control = std::make_shared<ControlService>("p2p", "", nullptr);
+    uint16_t port = 0;
+    ASSERT_TRUE(control->start(port).ok());
+    const std::string segment_name =
+        "127.0.0.1:" + std::to_string(static_cast<unsigned>(port));
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        segment.name = segment_name;
+                        segment.rpc_server_addr = segment_name;
+                        segment.machine_id = "fake-machine";
+                        segment.type = SegmentType::Memory;
+                        segment.detail = MemorySegmentDesc{};
+                        std::get<MemorySegmentDesc>(segment.detail).topology =
+                            *topology;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    auto config = std::make_shared<Config>();
+    config->set("transports/ub/enable", true);
+    config->set("transports/ub/runtime_profile", "rm_pool");
+    config->set("transports/ub/trans_mode", "rm");
+    config->set("transports/ub/worker_count", 1);
+    config->set("transports/ub/poller_count", 1);
+    config->set("transports/ub/jfc_per_context", 1);
+    config->set("transports/ub/jetty_per_endpoint", 1);
+    config->set("transports/ub/max_endpoints", 16);
+    config->set("transports/ub/slice_size", 64);
+    config->set("transports/ub/max_slices_per_task", 4);
+    config->set("transports/ub/max_retries", 0);
+    config->set("transports/ub/slice_timeout_ms", 1000);
+    config->set("transports/ub/endpoint_cooldown_ms", 100);
+    config->set("transports/ub/jetty_pool/enable", true);
+    config->set("transports/ub/jetty_pool/business_desired_serving", 1);
+    setPhysicalOnlyIdentity(*config, device);
+
+    UbTransport transport(adapter);
+    std::string mutable_segment_name = segment_name;
+    const auto install_status =
+        transport.install(mutable_segment_name, control, topology, config);
+    ASSERT_FALSE(install_status.ok())
+        << "an unverifiable async drain contract must fail the install";
+    EXPECT_NE(install_status.ToString().find(
+                  "verifiable asynchronous drain"),
+              std::string::npos)
+        << install_status.ToString();
+}
+
+// T-11 / C07: a post that reports definite zero acceptance contradicted by a
+// real success CQE is an isolation case. The WR provably crossed the native
+// boundary (the data may even have landed), so neither the clean rollback
+// (member recycled as "never posted") nor a fabricated success applies: the
+// attempt fails closed and the member is retired permanently.
+TEST(UbRmPoolTest, PooledZeroAcceptContradictedByRealCqeRetiresMember) {
+    auto device = rmCapableDevice();
+    auto adapter = std::make_shared<FakeUrmaAdapter>(device);
+    auto topology = fakeTopology(false);
+    auto control = std::make_shared<ControlService>("p2p", "", nullptr);
+    uint16_t port = 0;
+    ASSERT_TRUE(control->start(port).ok());
+    const std::string segment_name =
+        "127.0.0.1:" + std::to_string(static_cast<unsigned>(port));
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        segment.name = segment_name;
+                        segment.rpc_server_addr = segment_name;
+                        segment.machine_id = "fake-machine";
+                        segment.type = SegmentType::Memory;
+                        segment.detail = MemorySegmentDesc{};
+                        std::get<MemorySegmentDesc>(segment.detail).topology =
+                            *topology;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    auto config = std::make_shared<Config>();
+    config->set("transports/ub/enable", true);
+    config->set("transports/ub/runtime_profile", "rm_pool");
+    config->set("transports/ub/trans_mode", "rm");
+    config->set("transports/ub/worker_count", 1);
+    config->set("transports/ub/poller_count", 1);
+    config->set("transports/ub/jfc_per_context", 1);
+    config->set("transports/ub/jetty_per_endpoint", 1);
+    config->set("transports/ub/max_endpoints", 16);
+    config->set("transports/ub/slice_size", 64);
+    config->set("transports/ub/max_slices_per_task", 4);
+    config->set("transports/ub/max_retries", 0);
+    config->set("transports/ub/slice_timeout_ms", 1000);
+    config->set("transports/ub/endpoint_cooldown_ms", 100);
+    config->set("transports/ub/jetty_pool/enable", true);
+    config->set("transports/ub/jetty_pool/business_desired_serving", 1);
+    setPhysicalOnlyIdentity(*config, device);
+
+    UbTransport transport(adapter);
+    std::string mutable_segment_name = segment_name;
+    const auto install_status =
+        transport.install(mutable_segment_name, control, topology, config);
+    ASSERT_TRUE(install_status.ok()) << install_status.ToString();
+
+    std::array<char, 64> source{};
+    std::array<char, 64> target{};
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(33 - i);
+    }
+    BufferDesc source_desc{};
+    source_desc.addr = reinterpret_cast<uint64_t>(source.data());
+    source_desc.length = source.size();
+    source_desc.location = kWildcardLocation;
+    BufferDesc target_desc{};
+    target_desc.addr = reinterpret_cast<uint64_t>(target.data());
+    target_desc.length = target.size();
+    target_desc.location = kWildcardLocation;
+    MemoryOptions options;
+    options.perm = kGlobalReadWrite;
+    std::vector<BufferDesc> descriptors{source_desc, target_desc};
+    ASSERT_TRUE(transport.addMemoryBuffer(descriptors, options).ok());
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        std::get<MemorySegmentDesc>(segment.detail).buffers =
+                            descriptors;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(target.data());
+    request.length = source.size();
+    // The post returns a definite zero acceptance (posted_count stays zero),
+    // yet the fake executes the WR and delivers a real success CQE.
+    adapter->failNextPostWithoutAcceptButComplete();
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {request}).ok());
+
+    TransferStatus transfer{PENDING, 0};
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (transfer.s == PENDING &&
+           std::chrono::steady_clock::now() < deadline) {
+        ASSERT_TRUE(transport.getTransferStatus(batch, 0, transfer).ok());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    // The CQE proves the WR crossed the native boundary, so the attempt can
+    // be neither "definitely not executed" nor completed: fail closed.
+    EXPECT_EQ(transfer.s, FAILED);
+    EXPECT_EQ(transfer.transferred_bytes, 0U);
+    // The fake executed the WRITE: the contradiction is real, which is why
+    // transparent replay or a fabricated success are both forbidden.
+    EXPECT_EQ(source, target);
+    EXPECT_EQ(adapter->postCalls(), 1U);
+    EXPECT_EQ(adapter->postCalls(), adapter->postedWrs());
+    // Isolation: the member served a real completion, so it is retired and
+    // deleted instead of returning to the LIFO stack.
+    const auto delete_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (adapter->deleteJettyCalls() == 0 &&
+           std::chrono::steady_clock().now() < delete_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_GE(adapter->deleteJettyCalls(), 1U)
+        << "the contradicted member must be isolated and deleted, never "
+           "recycled";
+    EXPECT_EQ(adapter->createJettyCalls(), 2U)
+        << "no replacement member: the contradiction is not a retryable "
+           "capacity miss";
 
     ASSERT_TRUE(transport.freeSubBatch(batch).ok());
     EXPECT_TRUE(transport.uninstall().ok());

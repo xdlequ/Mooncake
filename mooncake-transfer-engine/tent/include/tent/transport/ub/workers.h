@@ -494,7 +494,15 @@ class UbWorkers final : public gate::Sink {
     void drainPendingControlJobs();
     void startControlExecutor();
     void stopControlExecutor();
-    static WrFacts makeWrFacts(const Completion& completion);
+    // Builds the gate facts from a raw completion. `record` enables the
+    // T-11/G-04 strict length check: a SUCCESS completion whose byte count
+    // differs from the submitted slice length is flipped to kLengthMismatch
+    // (fail closed, member retired). Null for records without a slice spec.
+    // T-13: the check itself is delegated to
+    // UrmaAdapter::normalizeCompletionLength so the semantics come from the
+    // versioned ProviderContract (B-03), not from an inline rule.
+    WrFacts makeWrFacts(const Completion& completion,
+                        const BusinessRecord* record = nullptr);
     [[nodiscard]] std::shared_ptr<BusinessRecord> findRecord(
         uint64_t token) const;
     void releaseOwnerResources(BusinessRecord& record,

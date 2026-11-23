@@ -114,10 +114,30 @@ bool logicalRetryable(const CompletionRecord& record, LogicalOutcome outcome,
         case LogicalOutcome::kCompleted:
             return false;
         case LogicalOutcome::kTimeout:
-            // Baseline resolves every timeout as retryable. F6d makes the one
-            // non-obvious case explicit: WRITE replay is only allowed while the
-            // deployment keeps write replay enabled.
-            return !(record.write_opcode && !retry_timeout_write);
+            // T-12 / C07 / G-05 + F6d combined policy. A WRITE is identified
+            // by either annotation: `opcode == kWrite` (probe records) or
+            // `write_opcode` (business records, F6d). For a WRITE, a timeout
+            // is retryable only when a replay cannot re-execute a WRITE that
+            // may already have taken effect AND the deployment keeps write
+            // replay enabled (F6d switch: it may only tighten, never loosen,
+            // the C07 rule).
+            //   WRITE: every path into the timeout verdict either has no real
+            //   completion (execution outcome kUnknown: the fence proved
+            //   resource safety, never non-execution, INV13) or carries a
+            //   late completion (kSucceeded/kFailed: execution is proven).
+            //   Both forbid a transparent replay, so only the defensive
+            //   kNotExecuted case stays retryable.
+            //   READ: the fence proved the old DMA stopped touching the
+            //   destination, so a fresh attempt under the unified retry
+            //   budget is exactly the C07 rule. Records without a known
+            //   opcode and without the F6d write mark (probe without an
+            //   annotated write) keep the baseline behavior.
+            if (record.opcode == RequestOpCode::kWrite || record.write_opcode) {
+                return record.executionOutcome() ==
+                           ExecutionOutcomeKind::kNotExecuted &&
+                       record.post_retryable && retry_timeout_write;
+            }
+            return true;
         case LogicalOutcome::kCanceled:
             // A post that provably did not cross the native boundary may be
             // retried as the legacy rollback allowed.
@@ -133,6 +153,10 @@ bool logicalRetryable(const CompletionRecord& record, LogicalOutcome outcome,
                 case CompletionOutcome::kUnknownError:
                 case CompletionOutcome::kSuccess:
                 case CompletionOutcome::kTimeout:
+                // T-11 / G-04: a broken provider length contract is permanent
+                // for this member; recycling it under a retry would hide the
+                // violation (C07 permanent-error rule).
+                case CompletionOutcome::kLengthMismatch:
                     return false;
             }
             return false;
@@ -152,6 +176,30 @@ const char* recordKindName(RecordKind kind) {
             return "probe";
     }
     return "unknown";
+}
+
+const char* executionOutcomeKindName(ExecutionOutcomeKind kind) {
+    switch (kind) {
+        case ExecutionOutcomeKind::kNotExecuted:
+            return "not_executed";
+        case ExecutionOutcomeKind::kSucceeded:
+            return "succeeded";
+        case ExecutionOutcomeKind::kFailed:
+            return "failed";
+        case ExecutionOutcomeKind::kUnknown:
+            return "unknown";
+    }
+    return "unknown";
+}
+
+const char* resourceSafetyKindName(ResourceSafetyKind kind) {
+    switch (kind) {
+        case ResourceSafetyKind::kUnproven:
+            return "unproven";
+        case ResourceSafetyKind::kSafe:
+            return "safe";
+    }
+    return "unproven";
 }
 
 const char* postAcceptanceName(PostAcceptance acceptance) {
@@ -182,6 +230,8 @@ const char* completionOutcomeName(CompletionOutcome outcome) {
             return "MEMORY_ERROR";
         case CompletionOutcome::kLocalAccessError:
             return "LOCAL_ACCESS_ERROR";
+        case CompletionOutcome::kLengthMismatch:
+            return "LENGTH_MISMATCH";
         case CompletionOutcome::kUnknownError:
             return "UNKNOWN_ERROR";
     }
@@ -463,6 +513,14 @@ LogicalOutcome decideLogicalOutcome(const CompletionRecord& record) {
     // Ordering mirrors the baseline: a record that was already marked timed out
     // resolves as TIMEOUT even if its late completion was an error.
     if (record.notAccepted()) {
+        // T-11 / C07: a real CQE contradicts the definite zero acceptance, so
+        // "definitely not executed" no longer holds (the CQE proves the WR
+        // reached a terminal state). The attempt fails closed instead: the
+        // success category of the contradictory CQE must not upgrade this to
+        // a completed result, and a WRITE may not be transparently replayed.
+        if (record.wr_terminal.load(std::memory_order_acquire)) {
+            return LogicalOutcome::kFailed;
+        }
         // The WR never crossed the native boundary. Baseline calls this result
         // FAILED, upstream §8 calls the logical state FAILED/NotExecuted; the
         // owner side keeps delivering FAILED (see
@@ -528,6 +586,29 @@ void advance(CompletionRecord& record, Sink& sink, GateContext& context) {
 
     // ---- stage two: three mutually exclusive owner exits -------------------
     if (record.notAccepted()) {
+        // T-11 / C07: a real completion contradicting the definite zero
+        // acceptance is an isolation case, not a rollback case: the CQE
+        // proves the WR reached a terminal state on this member, so the
+        // "clean, never crossed the boundary" premise of the reject exit
+        // does not hold. The verdict was already settled (fail-closed); the
+        // member is retired through the finalize exit and never recycled
+        // (INV07), while the rail/probe side effects stay with onFault.
+        if (record.wr_terminal.load(std::memory_order_acquire)) {
+            // The contradiction itself is already counted exactly once by
+            // the conflict_claimed guard at the top of advance().
+            if (!record.fault_reported.exchange(true,
+                                                std::memory_order_acq_rel)) {
+                sink.onFault(record, FaultKind::kCompletionError);
+            }
+            if (record.finalize_claimed.exchange(true,
+                                                  std::memory_order_acq_rel)) {
+                bump(context.stats.gate_claim_race);
+                return;
+            }
+            bump(context.stats.record_finalized);
+            sink.onOwners(record, OwnerDisposition::kFinalize);
+            return;
+        }
         // Nothing was posted, so nothing can be in flight. A concurrent timeout
         // mark on this record is a false positive and must not be reported as
         // a fault, and a (contradictory) real completion must not leave the

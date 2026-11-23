@@ -1613,9 +1613,11 @@ class RealUrmaAdapter final : public UrmaAdapter {
         LOG(INFO) << "UB_SEG_TOKEN_ID token_id_valid=1"
                   << " va=0x" << std::hex << address << " len=0x" << length
                   << std::dec;
-
         SegmentDescriptor descriptor;
-        descriptor.urma_api_version = URMA_API_VERSION;
+
+        // URMA_API_VERSION is 64 bits macro, the descriptor is 32 bits.
+        const uint32_t urma_api_version_wire = static_cast<uint32_t>(URMA_API_VERSION);
+        descriptor.urma_api_version = urma_api_version_wire;
         descriptor.urma_abi_size = sizeof(urma_seg_t);
         descriptor.hex = encodeHex(&wire_descriptor, sizeof(wire_descriptor));
         output = std::make_shared<RealLocalSegment>(
@@ -1643,7 +1645,7 @@ class RealUrmaAdapter final : public UrmaAdapter {
             return Status::InvalidArgument(
                 "unsupported URMA segment descriptor schema");
         }
-        if (descriptor.urma_api_version != URMA_API_VERSION) {
+        if (descriptor.urma_api_version != urma_api_version_wire) {
             return Status::InvalidArgument(
                 "URMA segment descriptor API version mismatch");
         }
@@ -1965,6 +1967,27 @@ class RealUrmaAdapter final : public UrmaAdapter {
             default:
                 return EntityMarkerKind::kNone;
         }
+    }
+
+    // T-13 / C02: the versioned capability statement of the real provider
+    // stack. Every flag below is backed by an implemented and exercised
+    // primitive on this adapter; reset re-arm stays unproven (B-03/G-01: a
+    // reset object is retired, never recycled) and the completion-length
+    // semantics stay kZeroIsUnreported until a versioned provider statement
+    // freezes the zero convention (E-03).
+    [[nodiscard]] ProviderContract providerContract() const override {
+        ProviderContract contract;
+        contract.provider_id = "urma-native";
+        contract.native_api_version = nativeApiVersion();
+        contract.abi_size = nativeSegmentDescriptorSize();
+        contract.software_flush = true;
+        contract.marker_flush = true;
+        contract.delete_tristate = true;
+        contract.async_drain = true;
+        contract.event_barrier = true;
+        contract.reset_rearm_proven = false;
+        contract.length_semantics = LengthSemantics::kZeroIsUnreported;
+        return contract;
     }
 
     Status flushJettyOnce(const JettyPtr& jetty,

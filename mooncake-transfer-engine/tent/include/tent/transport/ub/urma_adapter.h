@@ -29,6 +29,8 @@
 // leaf header: completion_record.h includes no adapter header, so there is no
 // include cycle.
 #include "tent/transport/ub/completion_record.h"
+// T-13 / C02: the version-isolated provider capability contract.
+#include "tent/transport/ub/provider_contract.h"
 
 namespace mooncake {
 namespace tent {
@@ -689,6 +691,47 @@ class UrmaAdapter {
         const Completion& completion) const {
         (void)completion;
         return EntityMarkerKind::kNone;
+    }
+
+    // T-13 / C02: the version-isolated capability statement of this adapter
+    // build. The default reports nothing proven: every capability stays
+    // unproven, so the production pool gate refuses the asynchronous mode
+    // and length normalization keeps the B-03 zero-is-unreported semantics.
+    // Real and fake adapters override this with what they can verify; the
+    // production contract is never injected, only reported.
+    [[nodiscard]] virtual ProviderContract providerContract() const {
+        return legacyUnknownContract();
+    }
+
+    // T-13 / C02: normalize the completion length against the versioned
+    // contract and strictly compare it with the requested length.
+    //   OK + normalized == requested: the length is proven correct.
+    //   OK + normalized == 0 with kZeroIsUnreported: the provider made no
+    //     statement (zero is unreported, never padded, never a mismatch -
+    //     B-03/E-03); the caller keeps zero as an observation only.
+    //   non-OK: the contract proves the count contradicts the request
+    //     (short, overlong, or zero under kStrictMatch). The caller fails
+    //     the attempt closed; no length is ever fabricated.
+    // The default implements the W3 rules with kZeroIsUnreported semantics;
+    // a versioned provider overrides this with its documented meaning.
+    virtual Status normalizeCompletionLength(const Completion& completion,
+                                             size_t requested,
+                                             size_t& normalized) {
+        normalized = completion.completed_bytes;
+        if (completion.category != CompletionCategory::SUCCESS) {
+            return Status::OK();
+        }
+        const ProviderContract contract = providerContract();
+        if (completion.completed_bytes == 0 &&
+            contract.length_semantics ==
+                LengthSemantics::kZeroIsUnreported) {
+            return Status::OK();
+        }
+        if (normalized != requested) {
+            return Status::InvalidArgument(
+                "completion length contradicts the request");
+        }
+        return Status::OK();
     }
 
     // Runs one bounded round of urma_flush_jetty(): returns the WR completions

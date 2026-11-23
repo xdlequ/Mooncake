@@ -86,6 +86,11 @@ enum class CompletionOutcome : uint8_t {
     // it is retryable and reported as a path fault; genuine token/permission
     // errors exhaust the bounded retry budget instead of killing the slice.
     kLocalAccessError = 7,
+    // T-11 / G-04: a success CQE whose completed byte count contradicts the
+    // submitted length (short or overlong). The provider contract is broken,
+    // so the attempt fails closed: the member is retired and never recycled.
+    // The outcome is permanent, not a retryable path fault.
+    kLengthMismatch = 8,
 };
 
 // Logical result of the attempt (three-layer semantics, total design §8).
@@ -107,6 +112,35 @@ enum class RecordDropReason : uint8_t {
     kCompletionError = 3,
     kShutdown = 4,
 };
+
+// T-12 / D02 execution layer: did the WR actually execute on the wire? Derived
+// strictly from published facts, never from a fence (INV13: a fence changes
+// safety only, it cannot turn an Unknown WRITE into "not executed").
+
+// Opcode of the WR a record represents, mirrored from Request::OpCode so the
+// shared kernel stays independent of the business headers (T-12 / C07).
+enum class RequestOpCode : uint8_t {
+    kUnknown = 0,
+    kRead = 1,
+    kWrite = 2,
+};
+
+enum class ExecutionOutcomeKind : uint8_t {
+    kNotExecuted = 0,  // definite zero acceptance, no real completion
+    kSucceeded = 1,    // real completion proved success
+    kFailed = 2,       // real completion proved failure
+    kUnknown = 3,      // no completion, acceptance not disproven
+};
+
+// T-12 / D02 resource-safety layer: may the buffers be reused/read again?
+enum class ResourceSafetyKind : uint8_t {
+    kUnproven = 0,  // in flight or unfenced: nothing may be released
+    kSafe = 1,      // responsibility ended (CQE / fence / zero acceptance)
+};
+
+[[nodiscard]] const char* recordKindName(RecordKind kind);
+[[nodiscard]] const char* executionOutcomeKindName(ExecutionOutcomeKind kind);
+[[nodiscard]] const char* resourceSafetyKindName(ResourceSafetyKind kind);
 
 // Why the gate refused to release the owner (design §9, gate_blocked_by_*).
 enum class BlockReason : uint8_t {
@@ -203,6 +237,10 @@ struct CompletionRecord {
     uint32_t attempt_serial{0};
     RecordPath path{};
     uint64_t jetty_generation{0};
+    // T-12 / C07: the WR opcode this record represents. Frozen at
+    // makeRecord() time; the retry policy (Unknown WRITE must never be
+    // transparently replayed) and the result sidecar read it here.
+    RequestOpCode opcode{RequestOpCode::kUnknown};
     // Generational anchors. Business leaves them zero in W2; the probe side
     // fills them from its PathVersion (§5.4).
     uint64_t topology_epoch{0};
@@ -280,8 +318,33 @@ struct CompletionRecord {
     }
     [[nodiscard]] bool disposed() const {
         return reject_claimed.load(std::memory_order_acquire) ||
-               finalize_claimed.load(std::memory_order_acquire) ||
-               lease_return_claimed.load(std::memory_order_acquire);
+                finalize_claimed.load(std::memory_order_acquire) ||
+                lease_return_claimed.load(std::memory_order_acquire);
+    }
+
+    // ---- T-12 / D02 three-layer result, derived from published facts ------
+    // Execution layer: did the WR cross the wire? A fence never changes this
+    // verdict (INV13). NOT_EXECUTED requires the *definite* zero acceptance
+    // without a real completion; anything unfenced or unknown stays kUnknown
+    // and must not be silently mapped to "definitely not written".
+    [[nodiscard]] ExecutionOutcomeKind executionOutcome() const {
+        if (notAccepted() &&
+            !wr_terminal.load(std::memory_order_acquire)) {
+            return ExecutionOutcomeKind::kNotExecuted;
+        }
+        if (wr_terminal.load(std::memory_order_acquire)) {
+            return terminal.success()
+                       ? ExecutionOutcomeKind::kSucceeded
+                       : ExecutionOutcomeKind::kFailed;
+        }
+        return ExecutionOutcomeKind::kUnknown;
+    }
+    // Resource-safety layer: only a real completion, a proven fence or the
+    // definite zero acceptance may release buffers. WaitExpired and a logical
+    // cancel never prove safety by themselves (D02 / C11).
+    [[nodiscard]] ResourceSafetyKind resourceSafety() const {
+        return hasResponsibilityEvidence() ? ResourceSafetyKind::kSafe
+                                           : ResourceSafetyKind::kUnproven;
     }
 };
 
@@ -314,10 +377,11 @@ struct CompletionStatsSnapshot {
     // acceptance: a contradiction that is isolated (the reject disposition
     // retires the endpoint) and must stay visible.
     uint64_t not_accepted_with_completion{0};
-    // W3 D-15: the completion reported a byte count that differs from the
-    // submitted length. Recorded only - the W2 settlement predicate and the
-    // pool return predicate stay untouched, so this must stay at zero on a
-    // healthy build and never changes a verdict.
+    // T-11 / G-04: a success completion reported a byte count that differs
+    // from the submitted length. The check itself lives in
+    // UbWorkers::makeWrFacts, which flips the outcome to kLengthMismatch
+    // (fail closed: the attempt fails and the member is retired), so this
+    // counter tracks how often that verdict was taken.
     uint64_t completion_length_mismatch{0};
     // Invariant counters; always zero on a healthy build.
     uint64_t one_shot_violations{0};

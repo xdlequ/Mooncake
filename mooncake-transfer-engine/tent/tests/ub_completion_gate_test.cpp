@@ -732,16 +732,24 @@ TEST(UbCompletionGateTest, NotAcceptedCompletionConflictIsCounted) {
         }
         EXPECT_EQ(context.stats.snapshot().not_accepted_with_completion, 1U);
         ASSERT_EQ(sink.settles().size(), 1U);
-        EXPECT_EQ(sink.settles().front(), LogicalOutcome::kCanceled);
+        // T-11 / C07: the CQE proves the WR reached a terminal state, so the
+        // "definitely not executed" verdict no longer applies. The attempt
+        // fails closed instead of taking the clean rollback verdict.
+        EXPECT_EQ(sink.settles().front(), LogicalOutcome::kFailed);
         ASSERT_EQ(sink.dispositions().size(), 1U);
-        EXPECT_EQ(sink.dispositions().front(), OwnerDisposition::kReject);
+        // The member served a real completion, so it is isolated through the
+        // finalize exit (retired, never recycled), not the reject rollback.
+        EXPECT_EQ(sink.dispositions().front(), OwnerDisposition::kFinalize);
         EXPECT_EQ(sink.duplicateCount(), 0U);
+        ASSERT_EQ(sink.faults().size(), 1U);
+        EXPECT_EQ(sink.faults().front(), FaultKind::kCompletionError);
     }
     {
         // Completion first, contradictory post result second. A real completion
         // is responsibility evidence on its own, so its verdict (COMPLETED) is
         // already claimed when the post result arrives: the first verdict wins
-        // and the reject disposition still runs exactly once (upstream §1.2.4).
+        // and the conflict isolation (finalize) still runs exactly once
+        // (upstream §1.2.4 / T-11).
         CompletionRecord record;
         RecordingSink sink;
         GateContext context;
@@ -761,8 +769,10 @@ TEST(UbCompletionGateTest, NotAcceptedCompletionConflictIsCounted) {
         EXPECT_EQ(sink.settleCount(), 1U);
         EXPECT_EQ(sink.settles().front(), LogicalOutcome::kCompleted);
         ASSERT_EQ(sink.dispositions().size(), 1U);
-        EXPECT_EQ(sink.dispositions().front(), OwnerDisposition::kReject);
+        EXPECT_EQ(sink.dispositions().front(), OwnerDisposition::kFinalize);
         EXPECT_EQ(context.stats.snapshot().gate_claim_race, 0U);
+        ASSERT_EQ(sink.faults().size(), 1U);
+        EXPECT_EQ(sink.faults().front(), FaultKind::kCompletionError);
     }
 }
 
@@ -799,7 +809,11 @@ TEST(UbCompletionGateTest, NotAcceptedCompletionConflictIsExact) {
         // Exactly one verdict and one disposition, whichever fact was first.
         ASSERT_EQ(sink.settleCount(), 1U) << "round " << round;
         ASSERT_EQ(sink.dispositions().size(), 1U) << "round " << round;
-        EXPECT_EQ(sink.dispositions().front(), OwnerDisposition::kReject);
+        // T-11 / C07: the zero-acceptance fact contradicted by a real CQE is
+        // isolated (finalize: the member is retired), never rolled back for
+        // reuse, regardless of which fact was published first.
+        EXPECT_EQ(sink.dispositions().front(), OwnerDisposition::kFinalize)
+            << "round " << round;
     }
 }
 
@@ -861,25 +875,217 @@ TEST(UbCompletionGateTest, PredicatesFollowTheDocumentedMatrix) {
     EXPECT_TRUE(pending.hasResponsibilityEvidence());
 }
 
-// F6d: the READ/WRITE timeout replay policy is explicit, not a blanket
-// "timeouts are retryable". Four combinations: READ/WRITE x switch on/off.
+// F6d + T-12 / C07 / G-05: the READ/WRITE timeout replay policy is explicit
+// and layered. A WRITE (probe opcode annotation or the F6d business write
+// mark) may only replay when it is provably not executed AND the deployment
+// keeps the write-replay switch on; READ and unmarked records keep the
+// baseline. The switch only tightens, never loosens, the C07 rule.
 TEST(UbCompletionGateTest, RetryableTimeoutPolicyIsExplicit) {
-    CompletionRecord read;
-    read.write_opcode = false;
-    CompletionRecord write;
-    write.write_opcode = true;
-
-    EXPECT_TRUE(gate::logicalRetryable(read, LogicalOutcome::kTimeout, true));
-    EXPECT_TRUE(gate::logicalRetryable(read, LogicalOutcome::kTimeout, false));
-    EXPECT_TRUE(gate::logicalRetryable(write, LogicalOutcome::kTimeout, true));
-    EXPECT_FALSE(
-        gate::logicalRetryable(write, LogicalOutcome::kTimeout, false));
-
+    // READ: the switch never gates a READ replay; the fence proves the old
+    // DMA stopped touching the destination (C07).
+    {
+        CompletionRecord read;
+        RecordingSink sink;
+        GateContext context;
+        {
+            HandlerRef post(read, sink, context);
+            onPostReturn(read, acceptedPost(), context);
+        }
+        ASSERT_TRUE(onTimeout(read));
+        read.fence_proven.store(true, std::memory_order_release);
+        EXPECT_TRUE(
+            gate::logicalRetryable(read, LogicalOutcome::kTimeout, true));
+        EXPECT_TRUE(
+            gate::logicalRetryable(read, LogicalOutcome::kTimeout, false));
+    }
+    // WRITE, provably not executed (definite zero acceptance): retryable
+    // only while the deployment keeps write replay enabled.
+    {
+        CompletionRecord write;
+        write.opcode = RequestOpCode::kWrite;
+        write.write_opcode = true;
+        RecordingSink sink;
+        GateContext context;
+        {
+            HandlerRef post(write, sink, context);
+            onPostReturn(write, notAcceptedPost(), context);
+        }
+        EXPECT_TRUE(
+            gate::logicalRetryable(write, LogicalOutcome::kTimeout, true));
+        EXPECT_FALSE(
+            gate::logicalRetryable(write, LogicalOutcome::kTimeout, false));
+    }
+    // WRITE whose execution is unknown (accepted post, no completion, even
+    // after a proven fence): never replayed regardless of the switch
+    // (INV13: the fence cannot turn an Unknown WRITE into "not executed").
+    {
+        CompletionRecord write;
+        write.opcode = RequestOpCode::kWrite;
+        write.write_opcode = true;
+        RecordingSink sink;
+        GateContext context;
+        {
+            HandlerRef post(write, sink, context);
+            onPostReturn(write, acceptedPost(), context);
+        }
+        ASSERT_TRUE(onTimeout(write));
+        write.fence_proven.store(true, std::memory_order_release);
+        EXPECT_FALSE(
+            gate::logicalRetryable(write, LogicalOutcome::kTimeout, true));
+        EXPECT_FALSE(
+            gate::logicalRetryable(write, LogicalOutcome::kTimeout, false));
+    }
     // The switch only affects timeouts: a completed transfer is never retried.
-    EXPECT_FALSE(
-        gate::logicalRetryable(read, LogicalOutcome::kCompleted, true));
-    EXPECT_FALSE(
-        gate::logicalRetryable(write, LogicalOutcome::kCompleted, true));
+    {
+        CompletionRecord read;
+        EXPECT_FALSE(
+            gate::logicalRetryable(read, LogicalOutcome::kCompleted, true));
+        CompletionRecord write;
+        write.write_opcode = true;
+        EXPECT_FALSE(
+            gate::logicalRetryable(write, LogicalOutcome::kCompleted, true));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T-12 / D02: the three-layer sidecar is derived from published facts only.
+// Logical verdict, execution outcome and resource safety are independent: a
+// fence flips the safety layer and must never flip the execution layer
+// (INV13). WaitExpired is a waiting result, not a DMA verdict.
+TEST(UbCompletionGateTest, ThreeLayerSidecarFollowsPublishedFacts) {
+    CompletionRecord record;
+    RecordingSink sink;
+    GateContext context;
+
+    // Fresh record: execution unknown, safety unproven.
+    EXPECT_EQ(record.executionOutcome(), ExecutionOutcomeKind::kUnknown);
+    EXPECT_EQ(record.resourceSafety(), ResourceSafetyKind::kUnproven);
+
+    // Definite zero acceptance without a completion: not executed, safe.
+    onPostReturn(record, notAcceptedPost(), context);
+    EXPECT_EQ(record.executionOutcome(), ExecutionOutcomeKind::kNotExecuted);
+    EXPECT_EQ(record.resourceSafety(), ResourceSafetyKind::kSafe);
+
+    // A real success completion: executed and safe.
+    CompletionRecord completed;
+    onPostReturn(completed, acceptedPost(), context);
+    {
+        HandlerRef cqe(completed, sink, context);
+        onRealCr(completed, successFacts(), sink, context);
+    }
+    EXPECT_EQ(completed.executionOutcome(), ExecutionOutcomeKind::kSucceeded);
+    EXPECT_EQ(completed.resourceSafety(), ResourceSafetyKind::kSafe);
+
+    // A real error completion: executed (failed), still safe.
+    CompletionRecord failed;
+    onPostReturn(failed, acceptedPost(), context);
+    {
+        HandlerRef cqe(failed, sink, context);
+        onRealCr(failed, facts(CompletionOutcome::kRemotePathError), sink,
+                 context);
+    }
+    EXPECT_EQ(failed.executionOutcome(), ExecutionOutcomeKind::kFailed);
+    EXPECT_EQ(failed.resourceSafety(), ResourceSafetyKind::kSafe);
+
+    // An accepted post without any completion: unknown execution, unproven
+    // safety. A proven fence then flips safety ONLY - the execution layer
+    // stays unknown (INV13: the fence cannot turn an Unknown WRITE into
+    // "not executed").
+    CompletionRecord fenced;
+    onPostReturn(fenced, acceptedPost(), context);
+    EXPECT_EQ(fenced.executionOutcome(), ExecutionOutcomeKind::kUnknown);
+    EXPECT_EQ(fenced.resourceSafety(), ResourceSafetyKind::kUnproven);
+    ASSERT_TRUE(onTimeout(fenced));
+    fenced.fence_proven.store(true, std::memory_order_release);
+    EXPECT_EQ(fenced.resourceSafety(), ResourceSafetyKind::kSafe);
+    EXPECT_EQ(fenced.executionOutcome(), ExecutionOutcomeKind::kUnknown);
+}
+
+// ---------------------------------------------------------------------------
+// T-12 / C07 / G-05: timeout retryability follows the opcode and the
+// execution facts. A WRITE whose execution is not *definitely not executed*
+// is never transparently replayed; a READ may retry once the fence proved the
+// old DMA stopped. Records without a known opcode keep the baseline.
+TEST(UbCompletionGateTest, TimeoutRetryableFollowsOpcodeAndFacts) {
+    // WRITE, no completion (execution unknown): the G-05 headline - not
+    // retryable, even after a successful fence.
+    {
+        CompletionRecord record;
+        record.opcode = RequestOpCode::kWrite;
+        RecordingSink sink;
+        GateContext context;
+        {
+            HandlerRef post(record, sink, context);
+            onPostReturn(record, acceptedPost(), context);
+        }
+        ASSERT_TRUE(onTimeout(record));
+        record.fence_proven.store(true, std::memory_order_release);
+        {
+            HandlerRef fence(record, sink, context);
+            advance(record, sink, context);
+        }
+        EXPECT_EQ(sink.settles().front(), LogicalOutcome::kTimeout);
+        EXPECT_FALSE(record.logical_retryable)
+            << "an Unknown WRITE must not be replayed after a proven fence";
+    }
+    // READ, no completion: retryable - the fence proved the old DMA stopped
+    // touching the destination, so a fresh attempt is safe (C07).
+    {
+        CompletionRecord record;
+        record.opcode = RequestOpCode::kRead;
+        RecordingSink sink;
+        GateContext context;
+        {
+            HandlerRef post(record, sink, context);
+            onPostReturn(record, acceptedPost(), context);
+        }
+        ASSERT_TRUE(onTimeout(record));
+        record.fence_proven.store(true, std::memory_order_release);
+        {
+            HandlerRef fence(record, sink, context);
+            advance(record, sink, context);
+        }
+        EXPECT_EQ(sink.settles().front(), LogicalOutcome::kTimeout);
+        EXPECT_TRUE(record.logical_retryable)
+            << "a fenced READ must retry under the unified budget";
+    }
+    // WRITE with a late success completion (execution proven): the replay
+    // would re-execute a WRITE that already took effect - forbidden too.
+    {
+        CompletionRecord record;
+        record.opcode = RequestOpCode::kWrite;
+        RecordingSink sink;
+        GateContext context;
+        {
+            HandlerRef post(record, sink, context);
+            onPostReturn(record, acceptedPost(), context);
+        }
+        ASSERT_TRUE(onTimeout(record));
+        {
+            HandlerRef cqe(record, sink, context);
+            onRealCr(record, successFacts(), sink, context);
+        }
+        EXPECT_FALSE(record.logical_retryable)
+            << "a proven-executed WRITE must not be replayed";
+    }
+    // Unknown opcode (probe / unannotated): baseline timeout stays retryable.
+    {
+        CompletionRecord record;
+        RecordingSink sink;
+        GateContext context;
+        {
+            HandlerRef post(record, sink, context);
+            onPostReturn(record, acceptedPost(), context);
+        }
+        ASSERT_TRUE(onTimeout(record));
+        record.fence_proven.store(true, std::memory_order_release);
+        {
+            HandlerRef fence(record, sink, context);
+            advance(record, sink, context);
+        }
+        EXPECT_TRUE(record.logical_retryable)
+            << "records without a known opcode keep the baseline behavior";
+    }
 }
 
 }  // namespace

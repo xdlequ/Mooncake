@@ -199,10 +199,12 @@ TEST(UbCompletionRecordTest, LogicalDecisionFollowsTheDocumentedTable) {
     record.terminal.outcome = CompletionOutcome::kSuccess;
     EXPECT_EQ(gate::decideLogicalOutcome(record), LogicalOutcome::kTimeout);
 
-    // NotAccepted wins over everything (the WR never existed).
+    // NotAccepted wins over everything (the WR never existed). T-11/C07: a
+    // record that is both not accepted and completed is a contradiction, so
+    // "never existed" no longer holds: the attempt fails closed instead.
     record.acceptance.store(PostAcceptance::kNotAccepted,
                             std::memory_order_relaxed);
-    EXPECT_EQ(gate::decideLogicalOutcome(record), LogicalOutcome::kCanceled);
+    EXPECT_EQ(gate::decideLogicalOutcome(record), LogicalOutcome::kFailed);
 
     // A fence proven without any completion resolves TIMEOUT.
     CompletionRecord fenced;

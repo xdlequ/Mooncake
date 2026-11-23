@@ -1246,19 +1246,22 @@ bool UbWorkers::dispatchCompletion(const Completion& completion, int local_nic,
     // touches reusable state (design §6.5).
     auto record = findRecord(completion.token);
     if (record) {
-        // W3 D-15: books only. A completion whose byte count differs from the
-        // submitted length is recorded and never changes the settlement
-        // predicate or the pool return predicate.
-        if (record->pending.slice &&
-            completion.category == CompletionCategory::SUCCESS &&
-            completion.completed_bytes != 0 &&
-            completion.completed_bytes !=
-                record->pending.slice->spec().length) {
+        // T-11 / G-04: the strict length check lives in makeWrFacts (it
+        // flips a contradicting SUCCESS completion to kLengthMismatch); the
+        // counter keeps the W3 D-15 observability seam so a broken provider
+        // contract stays visible in the stats snapshot.
+        gate::HandlerRef handler(record->core, *this, gate_ctx_);
+        const WrFacts facts = makeWrFacts(completion, record.get());
+        if (facts.outcome == CompletionOutcome::kLengthMismatch) {
             gate_ctx_.stats.completion_length_mismatch.fetch_add(
                 1, std::memory_order_relaxed);
+            LOG(WARNING)
+                << "UB completion length mismatch: token=" << record->core.token
+                << " completed_bytes=" << completion.completed_bytes
+                << " requested=" << record->pending.slice->spec().length
+                << "; failing the attempt closed and retiring the member";
         }
-        gate::HandlerRef handler(record->core, *this, gate_ctx_);
-        gate::onRealCr(record->core, makeWrFacts(completion), *this, gate_ctx_);
+        gate::onRealCr(record->core, facts, *this, gate_ctx_);
         return true;
     }
     // Step 4: unknown / late / already disposed. Count it, report it, and keep
@@ -2245,6 +2248,14 @@ std::shared_ptr<UbWorkers::BusinessRecord> UbWorkers::makeRecord(
     record->core.attempt_serial = attempt.attempt;
     record->core.path = makeBusinessRecordPath(path);
     record->core.jetty_generation = path.endpoint_generation;
+    // T-12 / C07: freeze the opcode into the record before publication so the
+    // retry policy (Unknown WRITE never replayed transparently) and the
+    // result sidecar read the fact that was posted, not a later guess.
+    record->core.opcode = pending.opcode == Request::READ
+                              ? RequestOpCode::kRead
+                              : (pending.opcode == Request::WRITE
+                                     ? RequestOpCode::kWrite
+                                     : RequestOpCode::kUnknown);
     record->core.owner = record.get();
     record->core.write_opcode = pending.opcode == Request::WRITE;
     record->pending = pending;
@@ -3011,7 +3022,8 @@ void UbWorkers::progressLocalDeviceFailure(const UbContextPtr& context) {
         << status.ToString();
 }
 
-WrFacts UbWorkers::makeWrFacts(const Completion& completion) {
+WrFacts UbWorkers::makeWrFacts(const Completion& completion,
+                                const BusinessRecord* record) {
     WrFacts facts;
     facts.completion_ns = steadyNowNs();
     facts.native_status = completion.native_status;
@@ -3042,6 +3054,28 @@ WrFacts UbWorkers::makeWrFacts(const Completion& completion) {
             facts.outcome = CompletionOutcome::kUnknownError;
             break;
     }
+    // T-11 / G-04 + T-13: strict completion-length check, delegated to the
+    // versioned provider contract (C02 normalizeCompletionLength). A SUCCESS
+    // completion whose reported byte count contradicts the submitted slice
+    // length is a provider-contract violation: the attempt fails closed and
+    // the member is retired (never recycled). Zero is judged only when the
+    // contract declares kStrictMatch; with kZeroIsUnreported (B-03, no
+    // versioned 0-length convention yet; E-03 owns the real semantic) it
+    // stays an observation.
+    if (facts.outcome == CompletionOutcome::kSuccess && record != nullptr &&
+        record->pending.slice != nullptr && adapter_ != nullptr) {
+        const auto requested = record->pending.slice->spec().length;
+        size_t normalized = 0;
+        const Status length_status = adapter_->normalizeCompletionLength(
+            completion, requested, normalized);
+        if (!length_status.ok()) {
+            facts.outcome = CompletionOutcome::kLengthMismatch;
+        } else if (normalized != 0) {
+            // The contract proved a count: the facts carry the normalized
+            // value so the gate's completed_bytes matches the verdict.
+            facts.completed_bytes = static_cast<uint32_t>(normalized);
+        }
+    }
     return facts;
 }
 
@@ -3049,6 +3083,9 @@ void UbWorkers::onSettle(CompletionRecord& record, LogicalOutcome outcome) {
     // The verdict is already published in the record. Delivery deliberately
     // waits for onOwners(): a retry must never be queued before the old owners
     // were released (D-8 / IN-7).
+    // T-12 / D02: the settle line also carries the three-layer sidecar -
+    // logical verdict, execution outcome and resource safety are independent
+    // (a fence changes safety only, INV13), so the log shows all three.
     LOG_EVERY_N(INFO, 1000)
         << "UB completion settled: token=" << record.token
         << " kind=" << recordKindName(record.kind)
@@ -3056,7 +3093,14 @@ void UbWorkers::onSettle(CompletionRecord& record, LogicalOutcome outcome) {
         << " generation=" << record.jetty_generation << " acceptance="
         << postAcceptanceName(record.acceptance.load(std::memory_order_relaxed))
         << " terminal=" << completionOutcomeName(record.terminal.outcome)
-        << " outcome=" << logicalOutcomeName(outcome);
+        << " outcome=" << logicalOutcomeName(outcome)
+        << " execution=" << executionOutcomeKindName(record.executionOutcome())
+        << " resources=" << resourceSafetyKindName(record.resourceSafety())
+        << " opcode="
+        << (record.opcode == RequestOpCode::kRead
+                ? "read"
+                : (record.opcode == RequestOpCode::kWrite ? "write" : "?"))
+        << " retryable=" << (record.logical_retryable ? 1 : 0);
 }
 
 void UbWorkers::onFault(CompletionRecord& record, FaultKind kind) {
@@ -3145,6 +3189,11 @@ void UbWorkers::onFault(CompletionRecord& record, FaultKind kind) {
         case CompletionOutcome::kMemoryError:
             category = "param_error";
             break;
+        case CompletionOutcome::kLengthMismatch:
+            // Provider contract violation, not a path fault: the member is
+            // retired by the finalize disposition, the path stays eligible.
+            category = "length_mismatch";
+            break;
         case CompletionOutcome::kLocalAccessError:
             category = "path_fault";
             break;
@@ -3219,6 +3268,14 @@ void UbWorkers::onFault(CompletionRecord& record, FaultKind kind) {
             if (probe_manager_ != nullptr) {
                 report_error(BusinessErrorKind::kParamError);
             }
+            rail_monitor_->recordError(business->path, now);
+            return;
+        case CompletionOutcome::kLengthMismatch:
+            // T-11 / G-04: a length mismatch is a provider contract
+            // violation on this lane, not evidence against the path or the
+            // peer (INV17: single member evidence never scales up). The
+            // rail is billed and the member itself is retired through the
+            // finalize disposition; no probe campaign is triggered.
             rail_monitor_->recordError(business->path, now);
             return;
         case CompletionOutcome::kUnknownError:
@@ -3464,7 +3521,10 @@ bool UbWorkers::settleDrainedWr(const Completion& completion,
         return true;
     }
     gate::HandlerRef handler(record->core, *this, gate_ctx_);
-    gate::onRealCr(record->core, makeWrFacts(completion), *this, gate_ctx_);
+    // Same T-11/G-04 strict length check as the poller path: a drained WR
+    // whose reported byte count contradicts the request fails closed too.
+    gate::onRealCr(record->core, makeWrFacts(completion, record.get()), *this,
+                   gate_ctx_);
     return true;
 }
 

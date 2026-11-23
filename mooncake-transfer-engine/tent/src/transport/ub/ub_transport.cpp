@@ -648,6 +648,21 @@ struct UbTransport::Impl {
             tombstones =
                 std::make_shared<ub::TombstoneTable>(params.tombstone_budget);
             if (params.jetty_pool.async_drain) {
+                // T-13 / C08 production pool gate: the asynchronous drain
+                // chain may only be armed when the adapter *verifies* the
+                // capabilities it depends on (software flush, marker
+                // classification, event barrier). A missing capability is an
+                // installation failure - the pooled profile must not
+                // silently fall back to the synchronous quiesce on the hot
+                // path with an unproven provider.
+                status = ub::checkPooledAsyncDrainContract(
+                    adapter->providerContract());
+                if (!status.ok()) {
+                    return failInstall(Status::InvalidArgument(
+                        "rm_pool requires a verifiable asynchronous drain "
+                        "contract: " +
+                        status.ToString()));
+                }
                 // Every drain step runs here, never on a JFC poller and never
                 // on the error-return path. A refused thread degrades to the
                 // synchronous fence instead of terminating the process.
