@@ -196,6 +196,12 @@ class UnavailableUrmaAdapter final : public UrmaAdapter {
 
 #if defined(TENT_HAS_REAL_URMA) && TENT_HAS_REAL_URMA
 
+// URMA_API_VERSION is a 64-bit macro while the segment descriptor wire field
+// is 32 bits. Keep the single narrowing conversion next to the provider so the
+// publisher and the importer compare the same value.
+constexpr uint32_t kUrmaApiVersionWire =
+    static_cast<uint32_t>(URMA_API_VERSION);
+
 Status nativeError(const char* operation, int native_status) {
     return Status::InternalError(std::string(operation) +
                                  " failed with URMA status " +
@@ -1291,7 +1297,7 @@ class RealUrmaAdapter final : public UrmaAdapter {
    public:
     bool available() const noexcept override { return true; }
     uint32_t nativeApiVersion() const noexcept override {
-        return URMA_API_VERSION;
+        return kUrmaApiVersionWire;
     }
     size_t nativeSegmentDescriptorSize() const noexcept override {
         return sizeof(urma_seg_t);
@@ -1615,9 +1621,7 @@ class RealUrmaAdapter final : public UrmaAdapter {
                   << std::dec;
         SegmentDescriptor descriptor;
 
-        // URMA_API_VERSION is 64 bits macro, the descriptor is 32 bits.
-        const uint32_t urma_api_version_wire = static_cast<uint32_t>(URMA_API_VERSION);
-        descriptor.urma_api_version = urma_api_version_wire;
+        descriptor.urma_api_version = kUrmaApiVersionWire;
         descriptor.urma_abi_size = sizeof(urma_seg_t);
         descriptor.hex = encodeHex(&wire_descriptor, sizeof(wire_descriptor));
         output = std::make_shared<RealLocalSegment>(
@@ -1645,7 +1649,7 @@ class RealUrmaAdapter final : public UrmaAdapter {
             return Status::InvalidArgument(
                 "unsupported URMA segment descriptor schema");
         }
-        if (descriptor.urma_api_version != urma_api_version_wire) {
+        if (descriptor.urma_api_version != kUrmaApiVersionWire) {
             return Status::InvalidArgument(
                 "URMA segment descriptor API version mismatch");
         }
