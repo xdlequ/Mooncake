@@ -527,6 +527,24 @@ std::vector<UbPathSnapshot> UbPathRegistry::snapshotEligible(
     return snapshots;
 }
 
+bool UbPathRegistry::snapshotFor(const UbPathVersion& version,
+                                 UbPathSnapshot& out) const {
+    // Structural read only: callers already hold a version they published, so
+    // an unassigned key is "not published" rather than an argument error.
+    if (!version.key.pool.valid()) return false;
+    std::lock_guard<std::mutex> guard(mutex_);
+    const auto it = by_key_.find(version.key);
+    if (it == by_key_.end()) return false;
+    const auto& record = it->second;
+    if (!(record->version == version) || record->retired || record->paused ||
+        record->eligibility == UbPathEligibility::kFaulted ||
+        record->eligibility == UbPathEligibility::kInvalid) {
+        return false;
+    }
+    out = record->selectionSnapshotLocked();
+    return true;
+}
+
 Status UbPathRegistry::tryCharge(const UbPathVersion& version, uint64_t bytes,
                                  uint64_t wrs, UbPathLoadCharge& charge,
                                  UbPathChargeDisposition& disposition) {

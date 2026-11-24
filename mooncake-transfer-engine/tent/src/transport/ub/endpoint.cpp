@@ -15,6 +15,7 @@
 #include <functional>
 #include <iterator>
 #include <limits>
+#include <sstream>
 #include <utility>
 
 namespace mooncake::tent::ub {
@@ -140,6 +141,15 @@ Status UbEndpoint::resetAndUnbindLocked() {
 
 Status UbEndpoint::unimportTargetsLocked(bool retry_retained) {
     Status first_error = Status::OK();
+    // Pooled rm_pool (C04 / v3): the shared imports are owned by the Context
+    // registry, which reclaims an entry once it is retired and its last
+    // reference drops (Context shutdown retires every entry). This endpoint
+    // only drops its own references here.
+    if (!imported_target_refs_.empty()) {
+        imported_target_refs_.clear();
+        imported_target_registry_.reset();
+        return first_error;
+    }
     auto registry = context_ ? context_->targetRegistry() : nullptr;
     if (!registry) {
         return Status::InternalError(
@@ -237,6 +247,13 @@ Status UbEndpoint::failLocked(Status status) {
     // has been deleted.
     rememberFirstError(resetAndUnbindLocked(), retire_status_);
     rememberFirstError(deleteJettysLocked(), retire_status_);
+    // Pooled receive side: the shared target is registry-owned, so this
+    // incarnation only drops its reference (the registry destroys it after the
+    // last reference and proven destruction).
+    if (local_target_ref_.valid()) {
+        local_target_ref_ = UbLocalPortTargetRef{};
+        local_target_registry_.reset();
+    }
     if (jetties_.empty()) {
         rememberFirstError(unimportTargetsLocked(/*retry_retained=*/false),
                            retire_status_);
@@ -279,6 +296,43 @@ Status UbEndpoint::prepare() {
         return failLocked(
             Status::InvalidArgument("Requested endpoint Jetty count exceeds "
                                     "device capability" LOC_MARK));
+    }
+
+    // rm_pool receive side (C04 / C05.1): one LocalPortTarget per configured
+    // port, shared by every endpoint of this Context. The endpoint references
+    // it instead of creating its own native Jetties; posting always leases a
+    // Context pool member, so this target is never used as a send Jetty.
+    if (auto registry = context_->localPortTargetRegistry()) {
+        const auto& device = context_->deviceInfo();
+        UbLocalPortTargetDesc desc;
+        desc.port_id = device.topology_name;
+        desc.target_epoch = context_->incarnation();
+        desc.target_identity =
+            makePhysicalDeviceIdentity(device.native_device_path, device.eid);
+        desc.profile.trans_mode = kUrmaTransportModeRm;
+        desc.profile.target_type = kUrmaTargetTypeJetty;
+        desc.profile.tp_type = kUrmaTpTypeCtp;
+        UbTargetAcquireDisposition disposition{};
+        UbLocalPortTargetRef reference;
+        auto status = registry->acquire(desc, UbTargetReferenceRole::kEndpoint,
+                                        reference, disposition);
+        if (!status.ok()) return failLocked(std::move(status));
+        if (disposition == UbTargetAcquireDisposition::kCapacity ||
+            disposition == UbTargetAcquireDisposition::kDeferred) {
+            return failLocked(Status::TooManyRequests(
+                "UB shared receive target is not ready; retry later" LOC_MARK));
+        }
+        if (disposition != UbTargetAcquireDisposition::kReady ||
+            !reference.valid()) {
+            return failLocked(Status::InvalidArgument(
+                "UB shared receive target was rejected for this epoch" LOC_MARK));
+        }
+        local_target_registry_ = std::move(registry);
+        local_target_ref_ = std::move(reference);
+        published_target_count_ = jetty_count_;
+        lifecycle_status_ = Status::OK();
+        state_.store(State::kPrepared, std::memory_order_release);
+        return Status::OK();
     }
 
     // Simple send-Jetty reuse (RM Legacy only): lease the whole set from the
@@ -536,7 +590,7 @@ Status UbEndpoint::bindRm(const UbBootstrapDesc& peer,
             "Peer RM bootstrap identity does not match trusted metadata: " +
             identity_status.ToString() + LOC_MARK));
     }
-    if (rm.targets.size() != jetties_.size()) {
+    if (rm.targets.size() != publishedTargetCountLocked()) {
         return failLocked(
             Status::InvalidArgument("Peer RM target count does not match "
                                     "local endpoint" LOC_MARK));
@@ -560,23 +614,69 @@ Status UbEndpoint::bindRm(const UbBootstrapDesc& peer,
     // failed import rolls the registry back to its previous state, and any
     // partially allocated native handle is adopted and quarantined there (same
     // provider contract as createJetty in prepare()).
-    auto registry = context_ ? context_->targetRegistry() : nullptr;
-    if (!registry) {
-        return failLocked(Status::InternalError(
-            "UB endpoint has no Context target registry" LOC_MARK));
-    }
-    const std::string peer_scope =
-        peer.segment_name + "|" + rm.physical_device_identity;
-    std::vector<RemoteTargetPtr> imported;
-    const Status import_status =
-        registry->importAll(peer_scope, rm.targets, imported);
-    if (!import_status.ok()) {
-        return failLocked(import_status);
+    if (auto imports = context_ ? context_->importedTargetRegistry() : nullptr) {
+        // v3 shared import owner (C04): one entry per ImportedTargetKey,
+        // referenced by every endpoint of this Context.
+        std::vector<UbImportedTargetRef> references;
+        references.reserve(rm.targets.size());
+        const auto& local_device = context_->deviceInfo();
+        for (const auto& target : rm.targets) {
+            UbImportedTargetKey key;
+            key.context.device_identity = makePhysicalDeviceIdentity(
+                local_device.native_device_path, local_device.eid);
+            key.context.eid = local_device.eid;
+            key.context.context_incarnation = context_->incarnation();
+            key.peer.node_incarnation = rm.node_incarnation;
+            key.peer.port_id = peer.local_nic_path;
+            key.peer.target_epoch = target.target_epoch;
+            key.peer.profile = target.profile;
+            key.eid = target.eid;
+            key.uasid = target.uasid;
+            key.id = target.id;
+            std::ostringstream descriptor;
+            descriptor << target.target_identity << '|' << target.target_epoch
+                       << '|' << target.eid << '|' << target.uasid << '|'
+                       << target.id;
+            UbImportedTargetRef reference;
+            UbTargetAcquireDisposition disposition{};
+            auto status = imports->acquire(key, descriptor.str(),
+                                           UbTargetReferenceRole::kEndpoint,
+                                           reference, disposition);
+            if (!status.ok()) return failLocked(std::move(status));
+            if (disposition == UbTargetAcquireDisposition::kCapacity ||
+                disposition == UbTargetAcquireDisposition::kDeferred) {
+                return failLocked(Status::TooManyRequests(
+                    "UB peer import is not ready; retry later" LOC_MARK));
+            }
+            if (disposition != UbTargetAcquireDisposition::kReady ||
+                !reference.valid()) {
+                return failLocked(Status::InvalidArgument(
+                    "UB peer import was rejected for this epoch" LOC_MARK));
+            }
+            references.push_back(std::move(reference));
+        }
+        imported_target_registry_ = std::move(imports);
+        imported_target_refs_ = std::move(references);
+        imported_targets_.clear();
+    } else {
+        auto registry = context_ ? context_->targetRegistry() : nullptr;
+        if (!registry) {
+            return failLocked(Status::InternalError(
+                "UB endpoint has no Context target registry" LOC_MARK));
+        }
+        const std::string peer_scope =
+            peer.segment_name + "|" + rm.physical_device_identity;
+        std::vector<RemoteTargetPtr> imported;
+        const Status import_status =
+            registry->importAll(peer_scope, rm.targets, imported);
+        if (!import_status.ok()) {
+            return failLocked(import_status);
+        }
+        imported_targets_ = std::move(imported);
     }
 
     // Compare-and-commit: the incumbent state is only replaced after every
     // validation and import succeeded.
-    imported_targets_ = std::move(imported);
     peer_ = peer;
     bound_descriptor_hash_ = descriptorHash(peer_);
     peer_generation_.store(peer.endpoint_generation, std::memory_order_release);
@@ -691,8 +791,12 @@ Status UbEndpoint::makeBootstrapDescV2(const std::string& segment_name,
     rm.topology_epoch = topology_epoch;
     rm.transport_modes = device.capabilities.transport_modes;
     rm.provider_capabilities = {"read", "write", "rm"};
-    rm.targets.reserve(jetties_.size());
-    for (const auto& jetty : jetties_) {
+    const size_t target_count = publishedTargetCountLocked();
+    rm.targets.reserve(target_count);
+    for (size_t index = 0; index < target_count; ++index) {
+        const JettyPtr& jetty =
+            local_target_ref_.valid() ? local_target_ref_.jetty()
+                                      : jetties_[index];
         if (!jetty || !jetty->valid() || jetty->id() == 0) {
             return Status::InternalError(
                 "UB endpoint contains an invalid Jetty" LOC_MARK);
@@ -877,7 +981,7 @@ bool UbEndpoint::reusable() const noexcept {
 
 size_t UbEndpoint::jettyCount() const {
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);
-    return jetties_.size();
+    return publishedTargetCountLocked();
 }
 
 JettyPtr UbEndpoint::jetty(size_t index) const {
@@ -899,13 +1003,41 @@ std::vector<JettyPtr> UbEndpoint::jetties() const {
 
 RemoteTargetPtr UbEndpoint::rmTarget(size_t jetty_index) const {
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    if (!imported_target_refs_.empty()) {
+        return imported_target_refs_[jetty_index % imported_target_refs_.size()]
+            .target();
+    }
     if (imported_targets_.empty()) return nullptr;
     return imported_targets_[jetty_index % imported_targets_.size()];
 }
 
 size_t UbEndpoint::importedTargetCount() const {
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    if (!imported_target_refs_.empty()) return imported_target_refs_.size();
     return imported_targets_.size();
+}
+
+bool UbEndpoint::pooledImportedTarget(size_t slot, UbImportedTargetKey& key,
+                                      std::string& descriptor) const {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    if (imported_target_refs_.empty()) return false;
+    const auto& reference =
+        imported_target_refs_[slot % imported_target_refs_.size()];
+    if (!reference.valid()) return false;
+    key = reference.key();
+    // Content fingerprint of the native target. It must be stable across
+    // republication of the same epoch, so it is derived from the key fields
+    // only (the payload bytes are not retained after import).
+    descriptor = std::to_string(key.peer.target_epoch) + '|' + key.eid + '|' +
+                 std::to_string(key.uasid) + '|' + std::to_string(key.id);
+    return true;
+}
+
+uint64_t UbEndpoint::peerTopologyEpoch() const {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    if (peer_.rm.has_value()) return peer_.rm->topology_epoch;
+    if (peer_.pooled.has_value()) return peer_.pooled->topology_epoch;
+    return 0;
 }
 
 Status UbEndpoint::lifecycleStatus() const {

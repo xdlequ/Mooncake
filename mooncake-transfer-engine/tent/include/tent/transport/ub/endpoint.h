@@ -175,6 +175,16 @@ class UbEndpoint final : public std::enable_shared_from_this<UbEndpoint> {
     // retirement.
     [[nodiscard]] RemoteTargetPtr rmTarget(size_t jetty_index) const;
     [[nodiscard]] size_t importedTargetCount() const;
+    // Pooled rm_pool send side: the shared imported target identity for one
+    // slot plus its content fingerprint. False when this endpoint is not using
+    // the v3 import registry (RM Legacy) or holds no import. Workers use this
+    // to publish the path version that the WR will reference.
+    [[nodiscard]] bool pooledImportedTarget(size_t slot,
+                                            UbImportedTargetKey& key,
+                                            std::string& descriptor) const;
+    // Peer topology epoch from the bound descriptor (v2 `rm` or v3 `pooled`).
+    // Zero when the endpoint has not completed a handshake that carries one.
+    [[nodiscard]] uint64_t peerTopologyEpoch() const;
     [[nodiscard]] size_t jfcIndex(size_t jetty_index) const;
     [[nodiscard]] std::vector<JettyPtr> jetties() const;
     [[nodiscard]] Status lifecycleStatus() const;
@@ -196,6 +206,13 @@ class UbEndpoint final : public std::enable_shared_from_this<UbEndpoint> {
     // waits for a later retire) and true on the retire path (the retry that
     // drains the registry quarantine).
     Status unimportTargetsLocked(bool retry_retained);
+    // Number of receive targets this incarnation advertises to peers. Pooled
+    // endpoints publish their shared port target `jetty_count_` times, legacy
+    // endpoints publish one per locally owned Jetty.
+    [[nodiscard]] size_t publishedTargetCountLocked() const noexcept {
+        return local_target_ref_.valid() ? published_target_count_
+                                         : jetties_.size();
+    }
     static void rememberFirstError(const Status& candidate, Status& first);
 
     const UbEndpointKey key_;
@@ -216,6 +233,16 @@ class UbEndpoint final : public std::enable_shared_from_this<UbEndpoint> {
     // this endpoint incarnation from a successful bindRm() until retirement
     // has fenced and deleted every Jetty.
     std::vector<RemoteTargetPtr> imported_targets_;
+    // Pooled rm_pool receive side (C04 / C05.1): one shared target per port,
+    // owned by the Context registry. When valid, jetties_ stays empty and the
+    // descriptor advertises the shared target `published_target_count_` times.
+    std::shared_ptr<UbLocalPortTargetRegistry> local_target_registry_;
+    UbLocalPortTargetRef local_target_ref_;
+    uint32_t published_target_count_{0};
+    // Pooled rm_pool send side (C04 / v3): shared imports owned by the Context
+    // registry. Positional with the peer descriptor; empty on the legacy path.
+    std::shared_ptr<UbImportedTargetRegistry> imported_target_registry_;
+    std::vector<UbImportedTargetRef> imported_target_refs_;
     UbBootstrapDesc peer_;
     uint64_t bound_descriptor_hash_{0};
     Status lifecycle_status_;

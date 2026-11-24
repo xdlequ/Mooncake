@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -19,8 +20,10 @@
 #include "tent/runtime/segment_manager.h"
 #include "tent/runtime/segment_registry.h"
 #include "tent/transport/ub/buffers.h"
+#include "tent/transport/ub/cold_resolve_scheduler.h"
 #include "tent/transport/ub/context.h"
 #include "tent/transport/ub/endpoint_store.h"
+#include "tent/transport/ub/node_target_quota.h"
 #include "tent/transport/ub/quota.h"
 #include "tent/transport/ub/rail_monitor.h"
 #include "tent/transport/ub/topology_attrs.h"
@@ -275,7 +278,7 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         segment.reset();
         return Status::OK();
     }
-    Status createJetty(const ContextPtr&, const JfcPtr& jfc,
+    Status createJetty(const ContextPtr& context, const JfcPtr& jfc,
                        const JettyOptions& options, JettyPtr& jetty) override {
         create_jetty_calls_.fetch_add(1, std::memory_order_relaxed);
         auto fake_jfc = std::dynamic_pointer_cast<FakeJfc>(jfc);
@@ -284,6 +287,14 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         if (rm_mode && (options.bind_tp_type_mask & kUrmaTpTypeCtpMask) == 0) {
             return Status::InvalidArgument(
                 "RM JFS bind mask does not cover URMA_CTP");
+        }
+        // Record the exact options each Context's members were created with so
+        // a heterogeneous install can be verified per device (C01 / G-03).
+        if (auto fake_context =
+                std::dynamic_pointer_cast<FakeContext>(context)) {
+            std::lock_guard<std::mutex> lock(created_options_mutex_);
+            created_jetty_options_[fake_context->deviceInfo().topology_name]
+                .push_back(options);
         }
         jetty =
             std::make_shared<FakeJetty>(next_jetty_id_++, fake_jfc, rm_mode);
@@ -666,6 +677,15 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     void failNextShutdown() {
         fail_next_shutdown_.store(true, std::memory_order_release);
     }
+    // Snapshot of the JettyOptions every member on `topology_name` was created
+    // with, in creation order (C01 / G-03 per-Context profile verification).
+    std::vector<JettyOptions> createdJettyOptions(
+        const std::string& topology_name) const {
+        std::lock_guard<std::mutex> lock(created_options_mutex_);
+        auto found = created_jetty_options_.find(topology_name);
+        if (found == created_jetty_options_.end()) return {};
+        return found->second;
+    }
     size_t pendingCount() const {
         std::lock_guard<std::mutex> lock(pending_mutex_);
         return pending_.size();
@@ -788,6 +808,8 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     std::atomic<uint64_t> posted_wrs_{0};
     std::atomic<uint32_t> last_post_target_id_{0};
     std::atomic<uint32_t> last_registered_access_{0};
+    mutable std::mutex created_options_mutex_;
+    std::map<std::string, std::vector<JettyOptions>> created_jetty_options_;
 };
 
 class NullRegistry final : public SegmentRegistry {
@@ -900,6 +922,22 @@ void setDeviceIdentity(Config& config, const DeviceInfo& device,
 
 void setPhysicalOnlyIdentity(Config& config, const DeviceInfo& device) {
     setDeviceIdentity(config, device, "physical");
+}
+
+void setPhysicalOnlyIdentities(Config& config,
+                               const std::vector<DeviceInfo>& devices) {
+    nlohmann::json array = nlohmann::json::array();
+    for (const auto& device : devices) {
+        array.push_back({{"native_device_name", device.native_device_name},
+                         {"native_device_path", device.native_device_path},
+                         {"eid_index", device.eid_index},
+                         {"eid", device.eid},
+                         {"kind", "physical"},
+                         {"transport_modes",
+                          device.capabilities.transport_modes}});
+    }
+    config.set("transports/ub/physical_only", true);
+    config.set("transports/ub/device_identities", array);
 }
 
 // Two UB NICs (device ids 0 and 1) both reachable from the wildcard memory
@@ -1884,6 +1922,16 @@ JettyOptions rmJettyOptions() {
 
 DeviceInfo rmCapableDevice() {
     auto device = fakeDevice();
+    device.capabilities.transport_modes = 3;  // RC|RM
+    device.kind = DeviceKind::PHYSICAL;
+    device.capabilities.rm_tp_cap = kUrmaTpTypeCtpMask;
+    device.capabilities.priority_tp_type_masks[kUrmaMaxPriority] =
+        kUrmaTpTypeCtpMask;
+    return device;
+}
+
+DeviceInfo rmCapableSecondaryDevice() {
+    auto device = fakeSecondaryDevice();
     device.capabilities.transport_modes = 3;  // RC|RM
     device.kind = DeviceKind::PHYSICAL;
     device.capabilities.rm_tp_cap = kUrmaTpTypeCtpMask;
@@ -3181,6 +3229,163 @@ TEST(UbRmPoolTest, TransportRunsSelfReadWriteThroughPooledSendPool) {
         << "every imported target must be unimported before uninstall ends";
 }
 
+// T-07 / C04: the pooled send path publishes one path version and charges it
+// for the posted WR. The charge is released at the same point as the quota
+// release, so after the transfer completes the published path must be back to
+// zero in-flight load while the cumulative charge counter has advanced.
+TEST(UbRmPoolTest, PooledSendPublishesAndChargesPathVersion) {
+    auto device = rmCapableDevice();
+    auto adapter = std::make_shared<FakeUrmaAdapter>(device);
+    auto topology = fakeTopology(false);
+    auto control = std::make_shared<ControlService>("p2p", "", nullptr);
+    uint16_t port = 0;
+    ASSERT_TRUE(control->start(port).ok());
+    const std::string segment_name =
+        "127.0.0.1:" + std::to_string(static_cast<unsigned>(port));
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        segment.name = segment_name;
+                        segment.rpc_server_addr = segment_name;
+                        segment.machine_id = "fake-machine";
+                        segment.type = SegmentType::Memory;
+                        segment.detail = MemorySegmentDesc{};
+                        std::get<MemorySegmentDesc>(segment.detail).topology =
+                            *topology;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    auto config = std::make_shared<Config>();
+    config->set("transports/ub/enable", true);
+    config->set("transports/ub/runtime_profile", "rm_pool");
+    config->set("transports/ub/trans_mode", "rm");
+    config->set("transports/ub/worker_count", 1);
+    config->set("transports/ub/poller_count", 1);
+    config->set("transports/ub/jfc_per_context", 1);
+    config->set("transports/ub/jetty_per_endpoint", 1);
+    config->set("transports/ub/max_endpoints", 16);
+    config->set("transports/ub/slice_size", 64);
+    config->set("transports/ub/max_slices_per_task", 8);
+    config->set("transports/ub/max_retries", 1);
+    config->set("transports/ub/slice_timeout_ms", 1000);
+    config->set("transports/ub/endpoint_cooldown_ms", 100);
+    config->set("transports/ub/jetty_pool/enable", true);
+    config->set("transports/ub/jetty_pool/business_desired_serving", 1);
+    config->set("transports/ub/send_pool/background_refill", false);
+    setPhysicalOnlyIdentity(*config, device);
+
+    UbTransport transport(adapter);
+    std::string mutable_segment_name = segment_name;
+    const auto install_status =
+        transport.install(mutable_segment_name, control, topology, config);
+    ASSERT_TRUE(install_status.ok()) << install_status.ToString();
+
+    std::array<char, 64> source{};
+    std::array<char, 64> target{};
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(100 - i);
+    }
+    BufferDesc source_desc{};
+    source_desc.addr = reinterpret_cast<uint64_t>(source.data());
+    source_desc.length = source.size();
+    source_desc.location = kWildcardLocation;
+    BufferDesc target_desc{};
+    target_desc.addr = reinterpret_cast<uint64_t>(target.data());
+    target_desc.length = target.size();
+    target_desc.location = kWildcardLocation;
+    MemoryOptions options;
+    options.perm = kGlobalReadWrite;
+    std::vector<BufferDesc> descriptors{source_desc, target_desc};
+    ASSERT_TRUE(transport.addMemoryBuffer(descriptors, options).ok());
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        std::get<MemorySegmentDesc>(segment.detail).buffers =
+                            descriptors;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    // A fresh install has a registry but nothing published or charged yet.
+    const auto before_any_send = transport.ubPathRegistryStats();
+    EXPECT_TRUE(before_any_send.entries.empty())
+        << "no path may be published before the first resolution";
+    EXPECT_EQ(before_any_send.total_charges, 0U);
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(target.data());
+    request.length = source.size();
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {request}).ok());
+
+    TransferStatus transfer{PENDING, 0};
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (transfer.s == PENDING &&
+           std::chrono::steady_clock::now() < deadline) {
+        ASSERT_TRUE(transport.getTransferStatus(batch, 0, transfer).ok());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_EQ(transfer.s, COMPLETED);
+    ASSERT_EQ(source, target);
+
+    // C03: the first submit missed the endpoint cache, so the handshake must
+    // have gone through the async seam instead of blocking the posting thread.
+    const auto async = transport.ubAsyncBootstrapStats();
+    EXPECT_GE(async.requested, 1U);
+    EXPECT_GE(async.enqueued, 1U);
+    EXPECT_GE(async.completed, 1U);
+    EXPECT_EQ(async.failed, 0U);
+    EXPECT_EQ(async.dropped_full, 0U);
+
+    // The settlement and the owner release are asynchronous to COMPLETED, so
+    // poll until the charge has drained rather than assuming one ordering.
+    ub::UbPathRegistrySnapshot snapshot;
+    const auto drain_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (;;) {
+        snapshot = transport.ubPathRegistryStats();
+        bool drained = !snapshot.entries.empty() &&
+                       snapshot.total_charges >= 1;
+        for (const auto& entry : snapshot.entries) {
+            drained = drained && entry.path_inflight_wrs == 0 &&
+                      entry.path_inflight_bytes == 0 &&
+                      entry.target_inflight_wrs == 0 &&
+                      entry.target_inflight_bytes == 0;
+        }
+        if (drained) break;
+        if (std::chrono::steady_clock::now() >= drain_deadline) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_FALSE(snapshot.entries.empty())
+        << "the pooled send path must publish a path version";
+    EXPECT_GE(snapshot.total_charges, 1U)
+        << "every posted pooled WR must take one registry charge";
+    EXPECT_EQ(snapshot.total_cold_prepares_enqueued, 0U)
+        << "a resolved endpoint is published ready, never cold";
+    for (const auto& entry : snapshot.entries) {
+        EXPECT_TRUE(entry.target_ready);
+        EXPECT_FALSE(entry.retired);
+        EXPECT_FALSE(entry.paused);
+        EXPECT_NE(entry.version.key.pool.context_incarnation, 0U);
+        EXPECT_NE(entry.version.key.peer_incarnation, 0U);
+        EXPECT_FALSE(entry.version.key.remote_port_id.empty());
+        EXPECT_NE(entry.version.topology_epoch, 0U);
+        EXPECT_NE(entry.version.target_epoch, 0U);
+        EXPECT_EQ(entry.path_inflight_wrs, 0U)
+            << "the charge must be released with the quota release";
+        EXPECT_EQ(entry.path_inflight_bytes, 0U);
+        EXPECT_EQ(entry.target_inflight_wrs, 0U);
+        EXPECT_EQ(entry.target_inflight_bytes, 0U);
+    }
+
+    ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+    EXPECT_TRUE(transport.uninstall().ok());
+}
+
 // T-10 / C02: one pooled attempt is exactly one single-WR post. Every post
 // call crossing the adapter boundary carries exactly one WorkRequest (the
 // postOne contract), so the call count and the WR count stay equal however
@@ -3390,18 +3595,17 @@ TEST(UbRmPoolTest, PooledZeroAcceptRollsBackAdmissionAndRetriesSameMember) {
     ASSERT_EQ(transfer.s, COMPLETED);
     EXPECT_EQ(transfer.transferred_bytes, source.size());
     EXPECT_EQ(source, target);
-    // One endpoint Jetty, one pool member, and one rebuilt endpoint Jetty:
-    // the zero-accept rollback returned the member (the W3 reject
-    // disposition retires the endpoint incarnation once, not the member),
-    // so the retry (and every later slice) reuses the same pool member
-    // instead of creating a new one.
-    EXPECT_EQ(adapter->createJettyCalls(), 3U);
+    // One shared receive target (C04 / C05.1: the endpoint incarnation no
+    // longer owns a native Jetty) plus one pool member. The zero-accept
+    // rollback returned the member, so the retry (and every later slice)
+    // reuses the same pool member instead of creating a new one.
+    EXPECT_EQ(adapter->createJettyCalls(), 2U);
     // Four slices: one rejected post, its retry, and three further slices.
     EXPECT_EQ(adapter->postCalls(), 5U);
     EXPECT_EQ(adapter->postCalls(), adapter->postedWrs());
-    EXPECT_EQ(adapter->deleteJettyCalls(), 1U)
-        << "only the retired endpoint incarnation's Jetty is deleted; the "
-           "rolled-back member must not be retired before uninstall";
+    EXPECT_EQ(adapter->deleteJettyCalls(), 0U)
+        << "the shared receive target outlives the endpoint incarnation and "
+           "the rolled-back member must not be retired before uninstall";
 
     ASSERT_TRUE(transport.freeSubBatch(batch).ok());
     EXPECT_TRUE(transport.uninstall().ok());
@@ -3710,6 +3914,11 @@ static void runPooledLengthMismatchCase(int32_t delta) {
     config->set("transports/ub/endpoint_cooldown_ms", 100);
     config->set("transports/ub/jetty_pool/enable", true);
     config->set("transports/ub/jetty_pool/business_desired_serving", 1);
+    // The retirement wakes the background refill, which legitimately restores
+    // the pool's serving capacity; that is not a retry of the failed attempt.
+    // Keep refill off so createJettyCalls measures only the endpoint Jetty and
+    // the leased member, as the hot-path invariant below states.
+    config->set("transports/ub/send_pool/background_refill", false);
     setPhysicalOnlyIdentity(*config, device);
 
     UbTransport transport(adapter);
@@ -4046,6 +4255,11 @@ TEST(UbRmPoolTest, PooledZeroAcceptContradictedByRealCqeRetiresMember) {
     config->set("transports/ub/endpoint_cooldown_ms", 100);
     config->set("transports/ub/jetty_pool/enable", true);
     config->set("transports/ub/jetty_pool/business_desired_serving", 1);
+    // The contradicted member's retirement wakes the background refill, which
+    // restores serving capacity; that is not a hot-path replacement for the
+    // failed attempt. Keep refill off so createJettyCalls stays at endpoint
+    // Jetty plus leased member.
+    config->set("transports/ub/send_pool/background_refill", false);
     setPhysicalOnlyIdentity(*config, device);
 
     UbTransport transport(adapter);
@@ -4260,6 +4474,362 @@ TEST(UbRmPoolTest, BackgroundRefillTopsUpKnownPoolKey) {
     EXPECT_EQ(adapter->deleteJettyCalls(), adapter->createJettyCalls());
 }
 
+// C01 / G-03 heterogeneous install: each Context must create its members with
+// its OWN device's LocalSendProfile. device0 supports CTP at priority 15;
+// device1 only at priority 3 (CTP|RTP). A last-value scalar collapse would
+// give both devices the same priority/mask and misconfigure one of them.
+TEST(UbRmPoolTest, PerContextProfilesKeepHeterogeneousPriorityAndMask) {
+    auto device0 = rmCapableDevice();  // CTP @ priority 15, mask = CTP
+    auto device1 = rmCapableSecondaryDevice();
+    device1.capabilities.priority_tp_type_masks[kUrmaMaxPriority] = 0;
+    device1.capabilities.priority_tp_type_masks[3] =
+        kUrmaTpTypeCtpMask | kUrmaTpTypeRtpMask;
+    // Pin the path quota to a single WR (depth x jetty_per_endpoint). Slice
+    // routing must exercise both Contexts: with the default depth the four
+    // slices can all retire sequentially on device0 before the next post, and
+    // device1 would never register its PoolKey.
+    device0.capabilities.max_jetty_depth = 1;
+    device1.capabilities.max_jetty_depth = 1;
+    auto adapter = std::make_shared<FakeUrmaAdapter>(
+        std::vector<DeviceInfo>{device0, device1});
+
+    auto topology = fakeTwoDeviceTopology();
+    auto control = std::make_shared<ControlService>("p2p", "", nullptr);
+    uint16_t port = 0;
+    ASSERT_TRUE(control->start(port).ok());
+    const std::string segment_name =
+        "127.0.0.1:" + std::to_string(static_cast<unsigned>(port));
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        segment.name = segment_name;
+                        segment.rpc_server_addr = segment_name;
+                        segment.machine_id = "fake-machine";
+                        segment.type = SegmentType::Memory;
+                        segment.detail = MemorySegmentDesc{};
+                        std::get<MemorySegmentDesc>(segment.detail).topology =
+                            *topology;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    auto config = std::make_shared<Config>();
+    config->set("transports/ub/enable", true);
+    config->set("transports/ub/runtime_profile", "rm_pool");
+    config->set("transports/ub/trans_mode", "rm");
+    config->set("transports/ub/worker_count", 1);
+    config->set("transports/ub/poller_count", 1);
+    config->set("transports/ub/jfc_per_context", 1);
+    config->set("transports/ub/jetty_per_endpoint", 1);
+    config->set("transports/ub/max_endpoints", 16);
+    config->set("transports/ub/slice_size", 16);
+    config->set("transports/ub/max_slices_per_task", 4);
+    config->set("transports/ub/max_retries", 1);
+    config->set("transports/ub/slice_timeout_ms", 1000);
+    config->set("transports/ub/endpoint_cooldown_ms", 100);
+    config->set("transports/ub/jetty_pool/enable", true);
+    config->set("transports/ub/jetty_pool/business_desired_serving", 2);
+    config->set("transports/ub/send_pool/background_refill", true);
+    config->set("transports/ub/send_pool/background_delete", true);
+    config->set("transports/ub/jetty_pool/refill_interval_ms", 5);
+    setPhysicalOnlyIdentities(*config, {device0, device1});
+
+    UbTransport transport(adapter);
+    std::string mutable_segment_name = segment_name;
+    const auto install_status =
+        transport.install(mutable_segment_name, control, topology, config);
+    ASSERT_TRUE(install_status.ok()) << install_status.ToString();
+    // Install stays lazy: no Jetty exists before the first business attempt.
+    EXPECT_EQ(adapter->createJettyCalls(), 0U);
+
+    // A 64-byte WRITE splits into four 16-byte slices across the two local
+    // ports, so both Contexts resolve endpoints and register their PoolKeys.
+    std::array<char, 64> source{};
+    std::array<char, 64> target{};
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(100 - i);
+    }
+    BufferDesc source_desc{};
+    source_desc.addr = reinterpret_cast<uint64_t>(source.data());
+    source_desc.length = source.size();
+    source_desc.location = kWildcardLocation;
+    BufferDesc target_desc{};
+    target_desc.addr = reinterpret_cast<uint64_t>(target.data());
+    target_desc.length = target.size();
+    target_desc.location = kWildcardLocation;
+    MemoryOptions options;
+    options.perm = kGlobalReadWrite;
+    std::vector<BufferDesc> descriptors{source_desc, target_desc};
+    ASSERT_TRUE(transport.addMemoryBuffer(descriptors, options).ok());
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        std::get<MemorySegmentDesc>(segment.detail).buffers =
+                            descriptors;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(target.data());
+    request.length = source.size();
+    // Freeze completions: the first slice keeps its path quota consumed, so
+    // the next slice must take the other Context's path instead of racing a
+    // provider that retires CQEs in a handful of microseconds.
+    adapter->holdAllCompletions();
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {request}).ok());
+
+    // device0 is ranked first, so device1 only registers its PoolKey through
+    // the second slice's path. Wait for that key before letting the held
+    // completions drain.
+    const auto both_contexts_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (adapter->createdJettyOptions("ub:fake1:eid0").size() < 2 &&
+           std::chrono::steady_clock::now() < both_contexts_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    adapter->releaseHeldCompletions();
+
+    TransferStatus transfer{PENDING, 0};
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (transfer.s == PENDING &&
+           std::chrono::steady_clock::now() < deadline) {
+        ASSERT_TRUE(transport.getTransferStatus(batch, 0, transfer).ok());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(transfer.s, COMPLETED);
+    EXPECT_EQ(source, target);
+
+    // Background refill tops each known PoolKey up to desired_serving.
+    const auto refill_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((adapter->createdJettyOptions("ub:fake0:eid0").size() < 2 ||
+            adapter->createdJettyOptions("ub:fake1:eid0").size() < 2) &&
+           std::chrono::steady_clock::now() < refill_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const auto options0 = adapter->createdJettyOptions("ub:fake0:eid0");
+    const auto options1 = adapter->createdJettyOptions("ub:fake1:eid0");
+    ASSERT_GE(options0.size(), 2U);
+    ASSERT_GE(options1.size(), 2U);
+    for (const auto& options : options0) {
+        EXPECT_EQ(options.trans_mode, kUrmaTransportModeRm);
+        EXPECT_EQ(options.priority, 15U);
+        EXPECT_EQ(options.bind_tp_type_mask, kUrmaTpTypeCtpMask);
+    }
+    for (const auto& options : options1) {
+        EXPECT_EQ(options.trans_mode, kUrmaTransportModeRm);
+        EXPECT_EQ(options.priority, 3U);
+        EXPECT_EQ(options.bind_tp_type_mask,
+                  kUrmaTpTypeCtpMask | kUrmaTpTypeRtpMask);
+    }
+    EXPECT_NE(options0.front().priority, options1.front().priority)
+        << "heterogeneous devices must not collapse into one scalar profile";
+
+    ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+    EXPECT_TRUE(transport.uninstall().ok());
+    EXPECT_EQ(adapter->deleteJettyCalls(), adapter->createJettyCalls());
+}
+
+// B-11 / C05.1 node-level receive-target quota: frozen at rm_pool install and
+// checked before any native allocation. helper keeps the two quota cases from
+// drifting apart.
+std::shared_ptr<Config> rmPoolNodeQuotaConfig(
+    const std::vector<DeviceInfo>& devices, uint32_t max_target_jetties) {
+    auto config = std::make_shared<Config>();
+    config->set("transports/ub/enable", true);
+    config->set("transports/ub/runtime_profile", "rm_pool");
+    config->set("transports/ub/trans_mode", "rm");
+    config->set("transports/ub/worker_count", 1);
+    config->set("transports/ub/poller_count", 1);
+    config->set("transports/ub/jfc_per_context", 1);
+    config->set("transports/ub/jetty_per_endpoint", 1);
+    config->set("transports/ub/max_endpoints", 16);
+    config->set("transports/ub/slice_size", 64);
+    config->set("transports/ub/max_slices_per_task", 4);
+    config->set("transports/ub/max_retries", 0);
+    config->set("transports/ub/slice_timeout_ms", 1000);
+    config->set("transports/ub/endpoint_cooldown_ms", 100);
+    config->set("transports/ub/jetty_pool/enable", true);
+    config->set("transports/ub/jetty_pool/business_desired_serving", 1);
+    config->set("transports/ub/max_target_jetties_per_node",
+                max_target_jetties);
+    setPhysicalOnlyIdentities(*config, devices);
+    return config;
+}
+
+// The static demand (one receive target per selected port) is rejected before
+// a Context or Jetty exists when it exceeds max_target_jetties_per_node.
+TEST(UbRmPoolTest, PooledInstallRejectsStaticDemandAboveNodeQuota) {
+    NodeTargetQuota::resetRegistryForTest();
+    auto device0 = rmCapableDevice();
+    auto device1 = rmCapableSecondaryDevice();
+    auto adapter = std::make_shared<FakeUrmaAdapter>(
+        std::vector<DeviceInfo>{device0, device1});
+    auto topology = fakeTwoDeviceTopology();
+    auto control = std::make_shared<ControlService>("p2p", "", nullptr);
+    uint16_t port = 0;
+    ASSERT_TRUE(control->start(port).ok());
+    const std::string segment_name =
+        "127.0.0.1:" + std::to_string(static_cast<unsigned>(port));
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        segment.name = segment_name;
+                        segment.rpc_server_addr = segment_name;
+                        segment.machine_id = "fake-machine";
+                        segment.type = SegmentType::Memory;
+                        segment.detail = MemorySegmentDesc{};
+                        std::get<MemorySegmentDesc>(segment.detail).topology =
+                            *topology;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    auto config = rmPoolNodeQuotaConfig({device0, device1}, 1);
+
+    UbTransport transport(adapter);
+    std::string mutable_segment_name = segment_name;
+    const auto install_status =
+        transport.install(mutable_segment_name, control, topology, config);
+    EXPECT_TRUE(install_status.IsInvalidArgument())
+        << "a two-port topology under a one-target quota must fail closed: "
+        << install_status.ToString();
+    EXPECT_EQ(adapter->openContextCalls(), 0U)
+        << "the static quota check must run before native allocation";
+    EXPECT_EQ(adapter->createJettyCalls(), 0U);
+    NodeTargetQuota::resetRegistryForTest();
+}
+
+// The ledger is process-authoritative: a second install that asks for another
+// limit fails closed instead of splitting or widening the frozen accounting.
+TEST(UbRmPoolTest, PooledInstallRejectsConflictingFrozenNodeQuotaLimit) {
+    NodeTargetQuota::resetRegistryForTest();
+    std::shared_ptr<NodeTargetQuota> frozen;
+    ASSERT_TRUE(NodeTargetQuota::acquire(8, frozen).ok());
+
+    auto device = rmCapableDevice();
+    auto adapter = std::make_shared<FakeUrmaAdapter>(device);
+    auto topology = fakeTopology(false);
+    auto control = std::make_shared<ControlService>("p2p", "", nullptr);
+    uint16_t port = 0;
+    ASSERT_TRUE(control->start(port).ok());
+    const std::string segment_name =
+        "127.0.0.1:" + std::to_string(static_cast<unsigned>(port));
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        segment.name = segment_name;
+                        segment.rpc_server_addr = segment_name;
+                        segment.machine_id = "fake-machine";
+                        segment.type = SegmentType::Memory;
+                        segment.detail = MemorySegmentDesc{};
+                        std::get<MemorySegmentDesc>(segment.detail).topology =
+                            *topology;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    auto config = rmPoolNodeQuotaConfig({device}, 4);
+
+    UbTransport transport(adapter);
+    std::string mutable_segment_name = segment_name;
+    const auto install_status =
+        transport.install(mutable_segment_name, control, topology, config);
+    EXPECT_TRUE(install_status.IsInvalidArgument())
+        << "a different limit must not re-freeze the process ledger: "
+        << install_status.ToString();
+    EXPECT_EQ(adapter->openContextCalls(), 0U);
+
+    std::shared_ptr<NodeTargetQuota> again;
+    ASSERT_TRUE(NodeTargetQuota::acquire(8, again).ok());
+    EXPECT_EQ(again->snapshot().limit, 8U)
+        << "the first limit stays authoritative";
+    NodeTargetQuota::resetRegistryForTest();
+}
+
+// C03 async bootstrap seam: request() must be non-blocking, coalesce an
+// in-flight key, respect the failure cooldown and refuse a new key once the
+// bounded table is full.
+TEST(UbColdResolveSchedulerTest, CoalescesInFlightAndHonoursCooldownAndBound) {
+    std::shared_ptr<UbThreadedPathControlExecutor> executor;
+    ASSERT_TRUE(UbThreadedPathControlExecutor::create(8, executor).ok());
+
+    std::mutex mutex;
+    std::condition_variable started_cv;
+    std::condition_variable release_cv;
+    bool release = false;
+    size_t calls = 0;
+    // The resolver records the calling thread and blocks until released, which
+    // is what proves request() itself never waited.
+    std::vector<std::thread::id> resolve_threads;
+    EndpointResolveRequest request;
+    request.local_context = nullptr;
+    request.remote_segment = nullptr;
+    request.remote_segment_id = LOCAL_SEGMENT_ID;
+    request.remote_topology_id = 0;
+
+    std::shared_ptr<AsyncColdResolveScheduler> scheduler;
+    ASSERT_TRUE(AsyncColdResolveScheduler::create(
+                    executor,
+                    [&](const EndpointResolveRequest&,
+                        std::shared_ptr<UbEndpoint>&) {
+                        {
+                            std::lock_guard<std::mutex> lock(mutex);
+                            ++calls;
+                            resolve_threads.push_back(
+                                std::this_thread::get_id());
+                        }
+                        started_cv.notify_all();
+                        std::unique_lock<std::mutex> lock(mutex);
+                        release_cv.wait(lock, [&] { return release; });
+                        return Status::TooManyRequests(
+                            "injected async resolve failure");
+                    },
+                    /*max_entries=*/1, /*retry_cooldown_ns=*/50'000'000ULL,
+                    scheduler)
+                    .ok());
+
+    // Two requests for the same key: the second is coalesced while the first
+    // is in flight, and both return before the resolver is released.
+    EXPECT_TRUE(scheduler->request(request));
+    EXPECT_TRUE(scheduler->request(request));
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        ASSERT_TRUE(started_cv.wait_for(lock, std::chrono::seconds(2),
+                                        [&] { return calls == 1; }));
+        EXPECT_FALSE(resolve_threads.empty());
+        EXPECT_NE(resolve_threads.front(), std::this_thread::get_id())
+            << "the resolve must run on the control executor thread";
+        release = true;
+    }
+    release_cv.notify_all();
+
+    // Wait for the failed resolve to settle, then verify the cooldown.
+    const auto settled = [&] {
+        return scheduler->stats().failed == 1;
+    };
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(2);
+    while (!settled() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(settled());
+    EXPECT_TRUE(scheduler->request(request));
+    EXPECT_GE(scheduler->stats().coalesced, 2U)
+        << "in-flight and cooling-down duplicates must not re-run the resolve";
+
+    // The entry table is already at its bound (one key), so a different key is
+    // refused instead of growing it.
+    EndpointResolveRequest other = request;
+    other.remote_topology_id = 1;
+    EXPECT_FALSE(scheduler->request(other));
+    const auto stats = scheduler->stats();
+    EXPECT_GE(stats.dropped_full, 1U);
+    EXPECT_EQ(stats.enqueued, 1U);
+}
 
 }  // namespace
 }  // namespace mooncake::tent::ub

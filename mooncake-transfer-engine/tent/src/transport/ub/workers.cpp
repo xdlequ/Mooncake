@@ -18,6 +18,8 @@
 
 #include <glog/logging.h>
 
+#include "tent/transport/ub/cold_resolve_scheduler.h"
+
 #include "tent/runtime/platform.h"
 #include "tent/transport/ub/endpoint.h"
 
@@ -146,6 +148,10 @@ struct UbWorkers::BusinessRecord {
     uint64_t fault_epoch_snapshot{0};
     // True while this record owns one task-level K slot (D-6).
     bool attempt_slot_held{false};
+    // C04: the path-registry load charge this WR holds. Move-only and released
+    // on destruction, i.e. at the same point as the quota release in
+    // onOwners(). Invalid on RC / RM Legacy, where PathLoadLedger is used.
+    UbPathLoadCharge path_charge;
 };
 
 UbWorkers::UbWorkers(std::shared_ptr<UrmaAdapter> adapter,
@@ -160,7 +166,10 @@ UbWorkers::UbWorkers(std::shared_ptr<UrmaAdapter> adapter,
                      std::vector<ProbeJfcSlot> probe_jfcs,
                      std::shared_ptr<TombstoneTable> tombstones,
                      const ProbeTopology* probe_topology,
-                     std::shared_ptr<ControlExecutor> control_executor)
+                     std::shared_ptr<ControlExecutor> control_executor,
+                     std::shared_ptr<UbPathRegistry> path_registry,
+                     EndpointResolver cached_resolver,
+                     std::shared_ptr<AsyncColdResolveScheduler> cold_resolver)
     : adapter_(std::move(adapter)),
       contexts_(std::move(contexts)),
       local_topology_(std::move(local_topology)),
@@ -177,7 +186,10 @@ UbWorkers::UbWorkers(std::shared_ptr<UrmaAdapter> adapter,
       param_error_edges_(
           params_.probe.adjacency_policy.param_error_invalidate_threshold),
       tombstones_(std::move(tombstones)),
-      control_executor_(std::move(control_executor)) {
+      control_executor_(std::move(control_executor)),
+      path_registry_(std::move(path_registry)),
+      cached_endpoint_resolver_(std::move(cached_resolver)),
+      cold_resolver_(std::move(cold_resolver)) {
     gate_ctx_.retry_timeout_write = params_.retry_timeout_write;
     for (const auto& context : contexts_) {
         if (!context) continue;
@@ -1547,11 +1559,17 @@ std::vector<Topology::NicID> UbWorkers::orderedRemoteDevices(
 Status UbWorkers::chooseAndResolveEndpoint(
     const PendingSlice& pending, Route& route,
     std::shared_ptr<UbEndpoint>& endpoint, UbPostPath& path,
-    QuotaReservation& reservation, DeferPlan* plan) {
+    QuotaReservation& reservation, DeferPlan* plan,
+    UbPathVersion* path_version) {
     struct Candidate {
         std::shared_ptr<UbEndpoint> endpoint;
         UbPostPath path;
         UbPathSelectionScore score;
+        // C04: set only when this candidate was published to the path
+        // registry (pooled RM). The version is what tryCharge() and the
+        // finalize release key on.
+        UbPathVersion version{};
+        bool has_version{false};
     };
 
     // One local x remote combination, scored from rail-level state before any
@@ -1927,6 +1945,14 @@ Status UbWorkers::chooseAndResolveEndpoint(
     std::vector<Candidate> candidates;
     candidates.reserve(std::min(rails.size(), resolve_limit));
     bool pool_screened_out = false;
+    // C03: a cached-only lookup missed at least one rail and the handshake is
+    // now queued on the control executor. When no candidate is ready the slice
+    // parks instead of paying the RPC on this posting thread.
+    bool cold_resolve_pending = false;
+    size_t cold_resolve_queued = 0;
+    const bool async_resolve =
+        cold_resolver_ != nullptr &&
+        static_cast<bool>(cached_endpoint_resolver_);
     for (size_t attempt : ubResolutionAttemptOrder(rail_local_ids)) {
         if (candidates.size() >= resolve_limit) break;
         const auto& rail = rails[attempt];
@@ -1935,7 +1961,23 @@ Status UbWorkers::chooseAndResolveEndpoint(
                                        route.pin.get(), rail.remote_id,
                                        route.metadata.generation};
         std::shared_ptr<UbEndpoint> candidate_endpoint;
-        auto status = endpoint_resolver_(request, candidate_endpoint);
+        Status status;
+        if (async_resolve) {
+            // Cache-only: never performs the bootstrap RPC on this thread.
+            status = cached_endpoint_resolver_(request, candidate_endpoint);
+            if (status.IsTooManyRequests()) {
+                // Cold key. Queue one coalesced handshake and keep scanning:
+                // another rail may already be cached and usable right now.
+                if (cold_resolve_queued < resolve_limit &&
+                    cold_resolver_->request(request)) {
+                    ++cold_resolve_queued;
+                }
+                cold_resolve_pending = true;
+                continue;
+            }
+        } else {
+            status = endpoint_resolver_(request, candidate_endpoint);
+        }
         if (!status.ok() || !candidate_endpoint ||
             !candidate_endpoint->ready()) {
             if (first_error.IsDeviceNotFound() && !status.ok())
@@ -1971,7 +2013,105 @@ Status UbWorkers::chooseAndResolveEndpoint(
                 rail_stats.ewma_bandwidth_bytes_per_second, rail.retry_order,
                 rail.local_id, rail.remote_id}});
     }
+    // C04 path layer (pooled RM only). Publish one version per resolved path,
+    // then read the registry snapshot back: it is the authoritative source of
+    // path in-flight pressure and aggregated imported-target pressure, and a
+    // path that is paused / faulted / superseded is no longer selectable.
+    // RC, RM Legacy and pool-less transports keep path_registry_ == nullptr and
+    // skip this block entirely.
+    bool path_registry_screened_out = false;
+    if (path_registry_ != nullptr && !candidates.empty()) {
+        for (auto& candidate : candidates) {
+            if (!candidate.endpoint->rmMode()) continue;
+            if (!pooledPoolFor(candidate.endpoint)) continue;
+            UbImportedTargetKey target_key;
+            std::string target_descriptor;
+            if (!candidate.endpoint->pooledImportedTarget(
+                    0, target_key, target_descriptor)) {
+                continue;
+            }
+            const uint64_t peer_topology_epoch =
+                candidate.endpoint->peerTopologyEpoch();
+            // A peer that did not publish a topology epoch cannot be keyed
+            // without guessing; such a candidate stays on the legacy ledger.
+            if (peer_topology_epoch == 0) continue;
+            UbPathVersion version;
+            version.key.pool = poolKeyFor(candidate.endpoint);
+            version.key.peer_incarnation = target_key.peer.node_incarnation;
+            version.key.remote_port_id = target_key.peer.port_id;
+            version.key.remote_profile = target_key.peer.profile;
+            version.topology_epoch = peer_topology_epoch;
+            version.target_epoch = target_key.peer.target_epoch;
+            const UbPathEligibility eligibility =
+                probe_manager_ != nullptr
+                    ? UbPathEligibility::kHealthy
+                    : UbPathEligibility::kEligibleUnverified;
+            UbPathPublishDisposition disposition =
+                UbPathPublishDisposition::kPublished;
+            // The endpoint is already resolved and imported here (the C03 seam
+            // performs the handshake off this thread before the retry that got
+            // us here), so the version is published ready. A cold path version
+            // would need an inventory-driven publisher, which this transport
+            // does not have.
+            const Status publish_status = path_registry_->publish(
+                version, candidate.score.topology_rank, eligibility,
+                target_key, target_descriptor, /*target_ready=*/true,
+                disposition);
+            if (!publish_status.ok()) {
+                VLOG(1) << "UB path registry publish skipped: "
+                        << publish_status.ToString();
+                continue;
+            }
+            if (disposition != UbPathPublishDisposition::kPublished) continue;
+            candidate.version = version;
+            candidate.has_version = true;
+        }
+        std::vector<Candidate> selectable;
+        selectable.reserve(candidates.size());
+        for (auto& candidate : candidates) {
+            if (!candidate.has_version) {
+                selectable.push_back(std::move(candidate));
+                continue;
+            }
+            UbPathSnapshot snapshot;
+            if (!path_registry_->snapshotFor(candidate.version, snapshot) ||
+                !snapshot.target_ready) {
+                path_registry_screened_out = true;
+                continue;
+            }
+            candidate.score.path_inflight_wrs = snapshot.path_inflight_wrs;
+            candidate.score.path_inflight_bytes = snapshot.path_inflight_bytes;
+            candidate.score.target_inflight_wrs = snapshot.target_inflight_wrs;
+            candidate.score.target_inflight_bytes =
+                snapshot.target_inflight_bytes;
+            selectable.push_back(std::move(candidate));
+        }
+        candidates.swap(selectable);
+    }
     if (candidates.empty()) {
+        if (cold_resolve_pending) {
+            // The handshake is running on the control executor. Park with a
+            // bounded re-evaluation deadline (the completion hint reflows
+            // earlier); no retry is consumed and the posting thread never
+            // performs the bootstrap RPC.
+            if (plan != nullptr) {
+                plan->reason = DeferReason::kPathUnavailable;
+                plan->expire_ns = deadlineAfter(steadyNowNs(), kTimedDeferNs);
+            }
+            return Status::TooManyRequests(
+                "UB endpoint handshake is in progress (async bootstrap) "
+                "LOC_MARK");
+        }
+        if (path_registry_screened_out) {
+            // Every published path was paused, faulted, superseded or cold.
+            // That is a transient path-layer verdict, not a device failure.
+            if (plan != nullptr) {
+                plan->reason = DeferReason::kPathUnavailable;
+                plan->expire_ns = deadlineAfter(steadyNowNs(), kTimedDeferNs);
+            }
+            return Status::TooManyRequests(
+                "Every published UB path is not selectable" LOC_MARK);
+        }
         if (health_screened_out) {
             // Every candidate was excluded by health. That is capacity
             // pressure, not a failure: failing the slice here would turn a
@@ -2043,6 +2183,9 @@ Status UbWorkers::chooseAndResolveEndpoint(
     endpoint = selected->endpoint;
     path = selected->path;
     reservation = *acquired;
+    if (path_version != nullptr && selected->has_version) {
+        *path_version = selected->version;
+    }
     {
         const auto slice = pending.slice->snapshot();
         const uint64_t task_id = reinterpret_cast<uint64_t>(pending.task.get());
@@ -2332,8 +2475,9 @@ void UbWorkers::processPending(const PendingSlice& pending,
     UbPostPath path;
     QuotaReservation reservation;
     DeferPlan plan;
+    UbPathVersion path_version;
     status = chooseAndResolveEndpoint(pending, route, endpoint, path,
-                                      reservation, &plan);
+                                      reservation, &plan, &path_version);
     if (!status.ok()) {
         if (status.IsTooManyRequests()) {
             deferPending(pending, plan.reason,
@@ -2419,7 +2563,8 @@ void UbWorkers::processPending(const PendingSlice& pending,
     const ProbePathKey probe_key = probeKeyFor(route, path);
     if (pooledPoolFor(endpoint)) {
         processPendingPooled(pending, worker_index, route, endpoint, path,
-                             probe_key, reservation, local, remote, *attempt);
+                             probe_key, reservation, local, remote, *attempt,
+                             path_version);
         return;
     }
     postLegacy(pending, worker_index, probe_key, endpoint, path, reservation,
@@ -2544,7 +2689,7 @@ void UbWorkers::processPendingPooled(
     const std::shared_ptr<UbEndpoint>& endpoint, const UbPostPath& path,
     const ProbePathKey& probe_key, const QuotaReservation& reservation,
     const LocalSegmentRef& local, const ImportedSegmentRef& remote,
-    const UbAttemptToken& attempt) {
+    const UbAttemptToken& attempt, const UbPathVersion& path_version) {
     (void)route;
     const size_t length = pending.slice->spec().length;
     auto pool = pooledPoolFor(endpoint);
@@ -2686,6 +2831,47 @@ void UbWorkers::processPendingPooled(
     // probe_evidence_unmapped (design §10.4).
     record->core.fault_epoch = fault_epoch_snapshot;
 
+    // C04: take the path-layer load charge before the commit linearization
+    // point, so a path that paused or faulted between selection and here never
+    // produces a posted WR. The charge is move-only and its destructor
+    // releases the counters, so every rollback below is automatically balanced.
+    if (path_registry_ != nullptr && path_version.key.pool.valid()) {
+        UbPathLoadCharge charge;
+        UbPathChargeDisposition charge_disposition =
+            UbPathChargeDisposition::kNotEligible;
+        const Status charge_status = path_registry_->tryCharge(
+            path_version, length, 1, charge, charge_disposition);
+        if (!charge_status.ok() ||
+            charge_disposition != UbPathChargeDisposition::kCharged) {
+            SliceJettyLease lease = std::move(record->lease);
+            if (auto credits = pool->creditLedger()) {
+                credits->release(record->credit_jfc_index,
+                                 record->credit_token);
+            }
+            (void)pool->returnOnce(std::move(lease), /*gate_passed=*/true);
+            pooled_return_.fetch_add(1, std::memory_order_relaxed);
+            endpoint->releaseOutstanding(length);
+            (void)quota_->release(reservation);
+            pending.task->releaseAttemptSlot();
+            if (!charge_status.ok()) {
+                const auto resolution = pending.slice->resolveAttempt(
+                    attempt, FAILED, 0, retryableStatus(charge_status));
+                if (resolution == UbAttemptResolution::kRetryScheduled) {
+                    enqueueRetry(pending);
+                }
+                return;
+            }
+            // kDeferred (cold target) / kNotEligible (paused, faulted,
+            // superseded): the attempt never crossed the boundary, so the
+            // slice is re-planned rather than failed.
+            (void)pending.slice->deferAttempt(attempt);
+            deferPending(pending, DeferReason::kPathUnavailable, epochs.path,
+                         deadlineAfter(steadyNowNs(), kTimedDeferNs));
+            return;
+        }
+        record->path_charge = std::move(charge);
+    }
+
     if (!pending.slice->tryCommitPost(attempt, record->posted_ns)) {
         // Cancellation won the linearization point: no WR crossed, so every
         // owner is released and the slice is already terminal. No defer here.
@@ -2727,7 +2913,9 @@ void UbWorkers::processPendingPooled(
         }
         gate_ctx_.stats.record_published.fetch_add(1,
                                                    std::memory_order_relaxed);
-        path_load_.onPublish(path, length);
+        // The registry charge already accounts for this WR; only the legacy
+        // ledger paths (RC / RM Legacy / pool-less) double-entry here.
+        if (!record->path_charge.valid()) path_load_.onPublish(path, length);
 
         const auto member = record->lease.member();
         JettyPtr jetty = member ? member->jetty : nullptr;
@@ -2805,6 +2993,20 @@ void UbWorkers::processPendingPooled(
 void UbWorkers::setControlExecutor(std::shared_ptr<ControlExecutor> executor) {
     control_executor_ = std::move(executor);
     control_executor_owned_ = false;
+}
+
+void UbWorkers::noteColdPathReady() {
+    // Runs on the cold-resolve control executor thread. A new ready endpoint is
+    // added path capacity, so it can unblock every admission bucket - not just
+    // the path bucket: a slice parked on quota (because the only *cached* rail
+    // was saturated) must re-select and see the freshly resolved rail.
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        bumpLocked(DeferReason::kPathUnavailable);
+        bumpLocked(DeferReason::kQuota);
+        bumpLocked(DeferReason::kPoolIdle);
+    }
+    queue_cv_.notify_all();
 }
 
 void UbWorkers::startControlExecutor() {
@@ -3604,8 +3806,13 @@ void UbWorkers::releaseOwnerResources(BusinessRecord& record,
     }
     // W3-IN-7: the ledger is decremented at the same point as the quota
     // release, with the same path the publish used, so the pair always
-    // balances.
-    if (record.path.valid()) path_load_.onFinalize(record.path, length);
+    // balances. C04 replaces the ledger with the registry charge for pooled
+    // RM; releasing the charge here is the same linearization point.
+    if (record.path_charge.valid()) {
+        record.path_charge = UbPathLoadCharge{};
+    } else if (record.path.valid()) {
+        path_load_.onFinalize(record.path, length);
+    }
     // Wake exactly the buckets this release unblocked (design §7.4). The quota
     // release and the K release happen for every record; a pool return wakes
     // the pool bucket only on the pooled path.

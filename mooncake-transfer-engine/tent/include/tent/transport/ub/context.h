@@ -130,6 +130,32 @@ class UbContext final : public std::enable_shared_from_this<UbContext> {
         return target_registry_;
     }
 
+    // Receive-side shared target owner of this Context (C04 / C05.1). One
+    // LocalPortTarget per configured port is referenced by every endpoint of
+    // this Context instead of each endpoint creating its own native Jetty.
+    // Null unless the rm_pool install attached one; RM legacy and RC keep
+    // their per-endpoint Jetty ownership.
+    void attachLocalPortTargetRegistry(
+        std::shared_ptr<UbLocalPortTargetRegistry> registry);
+    [[nodiscard]] std::shared_ptr<UbLocalPortTargetRegistry>
+    localPortTargetRegistry() const {
+        std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+        return local_target_registry_;
+    }
+
+    // Send-side shared import owner of this Context (C04 / v3). One native
+    // import per ImportedTargetKey is referenced by every endpoint, business
+    // attempt and probe; the entry is reclaimed only when it is retired and
+    // its last reference drops. Null unless the rm_pool install attached one;
+    // RM legacy keeps the classic ImportedTargetRegistry.
+    void attachImportedTargetRegistry(
+        std::shared_ptr<UbImportedTargetRegistry> registry);
+    [[nodiscard]] std::shared_ptr<UbImportedTargetRegistry>
+    importedTargetRegistry() const {
+        std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+        return imported_target_registry_;
+    }
+
     void addInflight(uint64_t bytes) noexcept;
     void removeInflight(uint64_t bytes) noexcept;
     [[nodiscard]] uint64_t inflightBytes() const noexcept {
@@ -160,6 +186,10 @@ class UbContext final : public std::enable_shared_from_this<UbContext> {
     std::shared_ptr<SendJettyPool> pooled_send_pool_;
     std::shared_ptr<JettyDrainController> drain_controller_;
     std::shared_ptr<ImportedTargetRegistry> target_registry_;
+    // Receive-side shared target owner (C04 / C05.1); rm_pool installs only.
+    std::shared_ptr<UbLocalPortTargetRegistry> local_target_registry_;
+    // Send-side shared import owner (v3); rm_pool installs only.
+    std::shared_ptr<UbImportedTargetRegistry> imported_target_registry_;
     mutable std::mutex lifecycle_mutex_;
     std::atomic<State> state_{State::kUninitialized};
     std::atomic<uint64_t> inflight_bytes_{0};

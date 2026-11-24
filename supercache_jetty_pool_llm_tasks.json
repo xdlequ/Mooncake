@@ -275,6 +275,7 @@
         "D-22：BONDP 隔离（TENT_UB_BONDP 默认 OFF，physical 仅标准 URMA 头/库，bonding fail-closed）；FindUrma GIT_TAG 冻结 8cdca734c2f71113cf3d0d8d6d60157d77cd3d88",
         "ctest -R tent_ub_: 6/6 Passed；fake UT 186 用例全绿（core47/pooled73/teardown15/native39/autoimport12）；回归门禁 livelock 修复 --gtest_repeat=100 全过",
         "tent_ub_real_device_test 4 用例 SKIP（无 /sys/class/ubcore，SKIP≠PASS）",
+        "G-06/D-22 reliable_dev 补位闭环（2026-11-24）：ub_real_device_test.cpp 整体并入 tent 线修复版（src jetty_pool 头路径、UbSendJettyPool acquire/release API、CTP profile、fprintf 类型化），TENT_UB_REAL_DEVICE_TESTS=ON 编译链接通过、无硬件 4 例 SKIP；src/transport/ub/CMakeLists.txt 新增 option(TENT_UB_BONDP ... OFF)，ON 缺 liburma 配置期 FATAL_ERROR，OFF 仅标准 URMA 头/库；ctest -R tent_ub_ 29/29 PASS",
         "native_gate_result=BLOCKED_EXTERNAL（无 UB 硬件、URMA_LIBRARY=NOTFOUND）"
       ],
       "source_decision_ids": [
@@ -321,6 +322,7 @@
         "G-02 关闭顺序：beginStop→drain（失败阻止 close）→detach→关 JFC→closeContext；外部 holder 持 pool shared_ptr 不阻塞关闭",
         "G-03 逐 Context profile：context jetty_options_/setJettyOptions、ub_transport rm_profiles_by_topology、endpoint_store 改用 context->jettyOptions()",
         "新增 4 用例 4/4 PASSED（native_data_path 35→39）；ctest -R tent_ub_ 6/6；fake UT 186 全绿",
+        "G-03 reliable_dev 移植闭环（2026-11-24，HEAD fd93dbde，合并已提交）：ub_transport install 改为 rm_profiles_by_topology + 逐 Context 派生并 setJettyOptions（profile 缺失 failInstall），EndpointStore 回退/legacy 复用池/rm_pool 池统一读 context->jettyOptions()；PerContextProfilesKeepHeterogeneousPriorityAndMask 确定化并入（max_jetty_depth=1 单 WR 路径配额 + holdAllCompletions）；native_data_path 43/43、新用例 repeat=20 全过、ctest -R tent_ub_ 28/28 PASS",
         "native_gate_result=BLOCKED_EXTERNAL（真实 reset/rearm/stop/delete 证据需 UB 硬件 + liburma）"
       ],
       "source_decision_ids": [
@@ -486,7 +488,11 @@
         "新增 path_registry.{h,cpp}：UbPathVersion（PathKey=PoolKey+peer_incarnation+remote_port_id+profile，+topology_epoch+target_epoch，不可变快照，幂等刷新保留负载计数器）；同 ImportedTargetKey 的 WR/字节聚合到共享 UbTargetLoadCell（拓扑换代/endpoint 视图切换不重置）；snapshotEligible 保留 C04 分层（quota/带宽/retry_order 留调用方，T-10 接线闭环）",
         "冷路径异步 ready：tryCharge 缺 ready target 返回 kDeferred 不持 charge/lease，单飞合并入有界控制执行器（UbPathControlExecutor 接口+线程实现），prepare 仅在执行器线程运行（无锁、无 lease）；旧 epoch kStale 不覆盖、同代异内容 kConflict、pauseForTargetRebuild 按目标 scope 暂停引用路径；UbPathLoadCharge move-only 无锁释放",
         "tent_ub_pooled_core_test 105/105 PASS（新增 16 例 UbPathRegistryTest：无 lease 持有 RPC、非对称路径数、旧 epoch 不覆盖、target 重建暂停引用路径、并发 charge churn）",
-        "ctest -R tent_ub_ 6/6 Passed（2026-11-21 复验）；workers.cpp 选路接线待 T-10；真实 preparer 接线待 T-13/T-24；native_gate_result=NOT_RUN"
+        "ctest -R tent_ub_ 6/6 Passed（2026-11-21 复验）；workers.cpp 选路接线待 T-10；真实 preparer 接线待 T-13/T-24；native_gate_result=NOT_RUN",
+        "2026-11-24 reliable_dev 线生产装配完成：rm_pool install 创建 install 级 UbPathRegistry（UbThreadedPathControlExecutor 1024 / 冷路径上限 256），UbTransport 新增 ubPathRegistryStats() 观测口；UbWorkers::chooseAndResolveEndpoint 对已解析 pooled RM 候选发布 UbPathVersion（target_ready=true，kStale/kConflict 不覆盖 incumbent），用新增 UbPathRegistry::snapshotFor(version) 逐候选取快照并剔除不可选路径，路径/同 target 聚合 in-flight 覆盖进 UbPathSelectionScore（新增 target_inflight_{wrs,bytes}，RC/RM Legacy 恒 0）；processPendingPooled 在 tryCommitPost 前 tryCharge，kDeferred/kNotEligible 按 claim 失败同序回滚并 park，charge 在 releaseOwnerResources 中与 quota release 同点析构；pooled RM 不再写 PathLoadLedger",
+        "2026-11-24 验证：新增 UbRmPoolTest.PooledSendPublishesAndChargesPathVersion（发送前 registry 为空；完成后存在 ready/published 版本、total_charges>=1、cold_prepares_enqueued==0、所有 entry in-flight 归零）；tent_ub_native_data_path_test 46/46 PASS；ctest -R tent_ub_ 29/29 100% PASS。边界：冷路径 prepare 仍为 fail-closed 桩（NotYetAsynchronousColdPathPreparer，依赖 C03 异步 bootstrap seam，当前不会触发）；本树 ub_pooled_core_test.cpp 无 UbPathRegistryTest 16 例（上条为异分支证据），路径层以本轮端到端用例为准",
+        "2026-11-24 C03 异步 bootstrap seam 落地：新增 cold_resolve_scheduler.{h,cpp}（AsyncColdResolveScheduler 建在 UbPathControlExecutor 上，独立有界执行器 capacity=64；request() 非阻塞、按 endpoint 身份合并、失败 50ms 冷却、表满/队满拒绝；计数 requested/enqueued/coalesced/completed/failed/dropped_full 经 UbTransport::ubAsyncBootstrapStats() 导出）；workers 选路先用 EndpointStore::get() 纯缓存查询，冷 key 入队并 park 到 kPathUnavailable，posting 线程不再执行 bootstrap RPC；完成回调 noteColdPathReady() 同时 bump kPathUnavailable/kQuota/kPoolIdle（修复唯一缓存 rail 配额饱和时的死锁）；shutdown 在 shutting_down 置位后先 join 解析线程。RC/RM Legacy 走原同步解析，行为不变；冷路径版本发布仍无 inventory 驱动，preparer 继续 fail-closed",
+        "2026-11-24 C03 验证：新增 UbColdResolveSchedulerTest.CoalescesInFlightAndHonoursCooldownAndBound（合并/非阻塞/解析线程非调用线程/失败冷却/表满拒绝）；PooledSendPublishesAndChargesPathVersion 增加 requested/enqueued/completed>=1、failed==0、dropped_full==0；tent_ub_native_data_path_test 47/47 PASS（--gtest_repeat=3 稳定）；ctest -R tent_ub_ 29/29 100% PASS"
       ],
       "source_decision_ids": [
         "B-05"

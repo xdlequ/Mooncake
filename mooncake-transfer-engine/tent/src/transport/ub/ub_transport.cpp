@@ -43,12 +43,15 @@
 #include "tent/transport/ub/topology_attrs.h"
 
 #include "jetty_pool.h"
+#include "tent/transport/ub/cold_resolve_scheduler.h"
 #include "tent/transport/ub/device_selection.h"
 #include "tent/transport/ub/endpoint.h"
 #include "tent/transport/ub/endpoint_store.h"
 #include "tent/transport/ub/identity_import.h"
 #include "tent/transport/ub/native_budget.h"
+#include "tent/transport/ub/node_target_quota.h"
 #include "tent/transport/ub/params.h"
+#include "tent/transport/ub/path_registry.h"
 #include "tent/transport/ub/send_jetty_pool.h"
 #include "tent/transport/ub/target_registry.h"
 #include "tent/transport/ub/tombstone.h"
@@ -62,6 +65,17 @@
 namespace mooncake::tent {
 namespace {
 
+// Bounds for the C04 path-layer control plane. The executor queue is sized for
+// a burst of cold preparations; the pending set is coalesced per path version,
+// so it only grows with the number of distinct unresolved paths.
+constexpr size_t kPathControlQueueCapacity = 1024;
+constexpr size_t kMaxPendingColdPaths = 256;
+// C03 async bootstrap seam. The resolve queue is bounded independently of the
+// path-control queue so a burst of cold peers cannot starve cold path work (or
+// vice versa), and a failed handshake is not retried before the cooldown.
+constexpr size_t kColdResolveQueueCapacity = 64;
+constexpr uint64_t kColdResolveRetryCooldownNs = 50'000'000ULL;
+
 bool filterAllows(const std::vector<std::string>& filter,
                   const ub::DeviceInfo& device) {
     if (filter.empty()) return true;
@@ -70,6 +84,167 @@ bool filterAllows(const std::vector<std::string>& filter,
            std::find(filter.begin(), filter.end(), device.native_device_name) !=
                filter.end();
 }
+
+// Production receive-target boundary for the pooled rm_pool path (C04 /
+// C05.1). One native RM Jetty per configured port is created on the owning
+// Context and destruction is proven through the adapter's reset+delete
+// contract; an unproven destruction keeps the node quota slot charged.
+class ContextLocalPortTargetFactory final
+    : public ub::UbLocalPortTargetFactory {
+   public:
+    ContextLocalPortTargetFactory(std::shared_ptr<ub::UrmaAdapter> adapter,
+                                  ub::ContextPtr handle,
+                                  std::vector<std::shared_ptr<ub::UbJfc>> jfcs,
+                                  ub::JettyOptions options)
+        : adapter_(std::move(adapter)),
+          handle_(std::move(handle)),
+          jfcs_(std::move(jfcs)),
+          options_(options) {}
+
+    Status createTarget(const ub::UbLocalPortTargetDesc& desc,
+                        ub::JettyPtr& out) override {
+        (void)desc;
+        if (!adapter_ || !handle_ || !handle_->valid() || jfcs_.empty()) {
+            return Status::InvalidArgument(
+                "UB receive target requires an active Context" LOC_MARK);
+        }
+        const size_t index = next_jfc_.fetch_add(1, std::memory_order_relaxed) %
+                             jfcs_.size();
+        auto jfc = jfcs_[index];
+        if (!jfc || !jfc->valid()) {
+            return Status::InvalidArgument(
+                "UB receive target selected an inactive JFC" LOC_MARK);
+        }
+        const Status status =
+            adapter_->createJetty(handle_, jfc->handle(), options_, out);
+        if (!status.ok()) {
+            // The factory contract: a failed create fully cleans up any
+            // partially allocated handle before returning.
+            if (out) {
+                (void)adapter_->deleteJetty(out);
+                out.reset();
+            }
+            return status;
+        }
+        if (!out || !out->valid() || out->id() == 0) {
+            if (out) {
+                (void)adapter_->deleteJetty(out);
+                out.reset();
+            }
+            return Status::InternalError(
+                "URMA adapter returned an invalid receive target" LOC_MARK);
+        }
+        return Status::OK();
+    }
+
+    Status destroyTarget(const ub::JettyPtr& target,
+                         bool& destruction_proven) override {
+        destruction_proven = false;
+        if (!target) {
+            destruction_proven = true;
+            return Status::OK();
+        }
+        if (!adapter_) {
+            return Status::InternalError(
+                "UB receive target cannot be destroyed without an adapter" LOC_MARK);
+        }
+        // The provider APIs take a mutable handle (they may adopt a partially
+        // allocated one), so destroy through a local copy of the registry's
+        // handle.
+        ub::JettyPtr owned = target;
+        auto status = adapter_->resetJetty(owned);
+        if (!status.ok()) return status;
+        status = adapter_->deleteJetty(owned);
+        destruction_proven = status.ok();
+        return status;
+    }
+
+   private:
+    std::shared_ptr<ub::UrmaAdapter> adapter_;
+    ub::ContextPtr handle_;
+    std::vector<std::shared_ptr<ub::UbJfc>> jfcs_;
+    const ub::JettyOptions options_;
+    std::atomic<size_t> next_jfc_{0};
+};
+
+// Production import boundary for the pooled rm_pool path (C04 / v3). Every
+// native import is owned by the Context's UbImportedTargetRegistry; a failed
+// cleanup is quarantined process-wide instead of losing native ownership.
+class ContextTargetImportBroker final : public ub::UbTargetImportBroker {
+   public:
+    ContextTargetImportBroker(std::shared_ptr<ub::UrmaAdapter> adapter,
+                              ub::ContextPtr context)
+        : adapter_(std::move(adapter)), context_(std::move(context)) {}
+
+    Status importTarget(const ub::UbImportedTargetKey& key,
+                        const std::string& target_descriptor,
+                        ub::RemoteTargetPtr& out) override {
+        (void)target_descriptor;
+        if (!adapter_ || !context_ || !context_->valid()) {
+            return Status::InvalidArgument(
+                "UB import requires an active Context" LOC_MARK);
+        }
+        const Status status = adapter_->importRemoteTarget(
+            context_, key.eid, key.uasid, key.id, key.peer.profile.trans_mode,
+            key.peer.profile.target_type, key.peer.profile.tp_type, out);
+        if (!status.ok()) {
+            quarantinePartialHandle(out);
+            return status;
+        }
+        if (!out) {
+            return Status::InternalError(
+                "URMA adapter returned an empty imported target" LOC_MARK);
+        }
+        return Status::OK();
+    }
+
+    Status unimportTarget(const ub::RemoteTargetPtr& target) override {
+        if (!target) return Status::OK();
+        if (!adapter_) {
+            return Status::InternalError(
+                "UB import cannot be released without an adapter" LOC_MARK);
+        }
+        ub::RemoteTargetPtr owned = target;
+        auto status = adapter_->unimportRemoteTarget(owned);
+        if (!status.ok()) quarantinePartialHandle(owned);
+        return status;
+    }
+
+   private:
+    static void quarantinePartialHandle(ub::RemoteTargetPtr& handle) {
+        if (!handle) return;
+        static auto* leaked = new std::vector<ub::RemoteTargetPtr>();
+        static auto* mutex = new std::mutex();
+        std::lock_guard<std::mutex> lock(*mutex);
+        leaked->push_back(std::move(handle));
+        handle.reset();
+    }
+
+    std::shared_ptr<ub::UrmaAdapter> adapter_;
+    ub::ContextPtr context_;
+};
+
+// Cold path preparation boundary for the C04 path registry. The C03 async
+// bootstrap seam (see cold_resolve_scheduler.h) already runs the endpoint
+// handshake off the posting threads, but this transport never publishes a
+// *cold* path version: a path is only known after its target was imported, so
+// every published version is already target_ready=true. The hook therefore
+// fails closed if a future inventory-driven publisher ever publishes a cold
+// version without wiring a real preparer first.
+class NotYetAsynchronousColdPathPreparer final
+    : public ub::UbColdPathPreparer {
+   public:
+    Status prepare(const ub::UbPathVersion& path,
+                   const ub::UbImportedTargetKey& target_key,
+                   const std::string& target_descriptor) override {
+        (void)path;
+        (void)target_key;
+        (void)target_descriptor;
+        return Status::NotImplemented(
+            "pooled UB cold path versions require an inventory-driven "
+            "publisher; none is installed" LOC_MARK);
+    }
+};
 
 uint64_t generationSeed() {
     const auto wall = static_cast<uint64_t>(
@@ -376,8 +551,13 @@ struct UbTransport::Impl {
         // silent fallback to RC or bonding.
         const bool rm_runtime = runtime_mode == ub::UbRuntimeMode::kRmLegacy ||
                                 runtime_mode == ub::UbRuntimeMode::kPooledRm;
-        uint32_t rm_capability_bind_tp_type_mask = 0;
-        uint8_t rm_capability_priority = ub::JettyOptions{}.priority;
+        // Per-Context LocalSendProfile keyed by topology_name (C01 / G-03).
+        // Each selectable device keeps its own priority/bind mask; iterating
+        // the unordered_map must never collapse them into a last-value scalar
+        // shared by every Context (heterogeneous devices would otherwise use
+        // another device's priority tier).
+        std::unordered_map<std::string, ub::LocalSendProfile>
+            rm_profiles_by_topology;
         if (rm_runtime) {
             for (const auto& [name, device] : by_topology_name) {
                 if (preferred_topology_names.find(device.topology_name) ==
@@ -402,13 +582,53 @@ struct UbTransport::Impl {
                         device.native_device_name + ": " +
                         profile_status.ToString() + LOC_MARK));
                 }
-                rm_capability_bind_tp_type_mask = profile.bind_tp_type_mask;
-                rm_capability_priority = profile.priority;
+                rm_profiles_by_topology.emplace(device.topology_name, profile);
             }
         }
 
         std::vector<std::string> preferred_names;
         std::vector<std::string> skipped_names;
+
+        // Node-level receive-target quota (B-11 / C05.1 / guidance 4.2.1).
+        // rm_pool only: the ledger is frozen at node install and the static
+        // demand (one receive target per selected port) is rejected before any
+        // native allocation. RC and RM-legacy semantics are unchanged by this
+        // key, so this block is gated on the pooled runtime.
+        if (runtime_mode == ub::UbRuntimeMode::kPooledRm) {
+            uint64_t required_targets = 0;
+            if (probe_topology->declared()) {
+                required_targets = probe_topology->ports().size();
+            } else {
+                for (size_t id = 0; id < local_topology->getNicCount(); ++id) {
+                    const auto* nic = local_topology->getNicEntry(
+                        static_cast<int>(id));
+                    if (!nic || nic->type != Topology::NIC_UB) continue;
+                    auto found = by_topology_name.find(nic->name);
+                    if (found == by_topology_name.end() ||
+                        !found->second.active) {
+                        continue;
+                    }
+                    if (!filterAllows(params.device_filter, found->second)) {
+                        continue;
+                    }
+                    if (preferred_topology_names.find(
+                            found->second.topology_name) ==
+                        preferred_topology_names.end()) {
+                        continue;
+                    }
+                    ++required_targets;
+                }
+            }
+            status = ub::NodeTargetQuota::acquire(
+                params.max_target_jetties_per_node, node_target_quota);
+            if (!status.ok()) return failInstall(status);
+            status = node_target_quota->validateStaticDemand(required_targets);
+            if (!status.ok()) return failInstall(status);
+            const auto quota_snapshot = node_target_quota->snapshot();
+            LOG(INFO) << "UB node target quota: limit=" << quota_snapshot.limit
+                      << " required=" << required_targets
+                      << " occupied=" << quota_snapshot.total_occupied;
+        }
 
         if (probe_topology->declared()) {
             for (const auto& binding : probe_topology->ports()) {
@@ -551,11 +771,11 @@ struct UbTransport::Impl {
         }
 
         size_t safe_slice_size = params.slice_size;
+        // Base/fallback JettyOptions (RC default). RM priority/bind mask are
+        // derived per Context below from each device's own profile (G-03).
         ub::JettyOptions jetty_options;
         if (rm_runtime) {
             jetty_options.trans_mode = ub::kUrmaTransportModeRm;
-            jetty_options.bind_tp_type_mask = rm_capability_bind_tp_type_mask;
-            jetty_options.priority = rm_capability_priority;
         }
         for (const auto& context : contexts) {
             const auto& device_caps = context->deviceInfo().capabilities;
@@ -604,20 +824,42 @@ struct UbTransport::Impl {
             params.slice_size = safe_slice_size;
         }
 
+        // Derive and freeze per-Context JettyOptions (C01 / G-03). RM Contexts
+        // take priority/bind mask from their OWN device profile; RC Contexts
+        // keep the shared base options so the RC baseline is unchanged.
+        for (const auto& context : contexts) {
+            ub::JettyOptions context_options = jetty_options;
+            if (rm_runtime) {
+                const auto& device = context->deviceInfo();
+                auto found =
+                    rm_profiles_by_topology.find(device.topology_name);
+                if (found == rm_profiles_by_topology.end()) {
+                    return failInstall(Status::NotImplemented(
+                        "RM capability profile missing for device " +
+                        device.native_device_name + LOC_MARK));
+                }
+                context_options.bind_tp_type_mask =
+                    found->second.bind_tp_type_mask;
+                context_options.priority = found->second.priority;
+            }
+            context->setJettyOptions(context_options);
+        }
+
         buffers = std::make_unique<ub::UbBufferManager>(adapter, contexts);
         endpoints = std::make_unique<ub::EndpointStore>(
             adapter, params.max_endpoints, params.jetty_per_endpoint,
             jetty_options);
         // Simple send-Jetty reuse (RM Legacy only): attach a per-context idle
         // pool so endpoint incarnations lease Jettys LIFO instead of always
-        // creating and deleting them. RC installs never attach a pool, so the
-        // legacy create/delete path is unchanged.
+        // creating and deleting them. Each pool is created with that
+        // Context's own JettyOptions (G-03); RC installs never attach a pool,
+        // so the legacy create/delete path is unchanged.
         if (runtime_mode == ub::UbRuntimeMode::kRmLegacy &&
             params.jetty_reuse.enable) {
             for (auto& context : contexts) {
                 context->attachJettyPool(std::make_shared<ub::UbSendJettyPool>(
                     adapter, context->handle(), context->jfcs(),
-                    jetty_options));
+                    context->jettyOptions().value_or(jetty_options)));
             }
         }
         // rm_pool data path (C01/C05/C06): attach one SendJettyPool per
@@ -700,6 +942,30 @@ struct UbTransport::Impl {
                                                   configured, reserve);
                 if (!status.ok()) return failInstall(status);
             }
+            // C04 / C05.1 receive side: one shared LocalPortTarget registry per
+            // Context. Endpoints reference the shared target instead of each
+            // creating its own native Jetty; every creation reserves a node
+            // quota ticket and a kTarget device budget reservation (joint
+            // admission), so the shared handshake never bypasses either
+            // ledger.
+            for (auto& context : contexts) {
+                std::shared_ptr<ub::UbLocalPortTargetRegistry> targets;
+                auto factory = std::make_shared<ContextLocalPortTargetFactory>(
+                    adapter, context->handle(), context->jfcs(),
+                    context->jettyOptions().value_or(jetty_options));
+                status = ub::UbLocalPortTargetRegistry::create(
+                    node_target_quota, factory, targets, native_budget,
+                    ub::physicalDeviceKey(context->deviceInfo()));
+                if (!status.ok()) return failInstall(status);
+                context->attachLocalPortTargetRegistry(std::move(targets));
+                // Send side (C04 / v3): one shared import registry per Context.
+                std::shared_ptr<ub::UbImportedTargetRegistry> imports;
+                auto broker = std::make_shared<ContextTargetImportBroker>(
+                    adapter, context->handle());
+                status = ub::UbImportedTargetRegistry::create(broker, imports);
+                if (!status.ok()) return failInstall(status);
+                context->attachImportedTargetRegistry(std::move(imports));
+            }
             for (auto& context : contexts) {
                 const auto& device = context->deviceInfo();
                 const uint32_t depth =
@@ -737,7 +1003,11 @@ struct UbTransport::Impl {
                 pool_options.cooldown_ms = params.jetty_pool.cooldown_ms;
                 pool_options.quarantine_budget = params.quarantine_budget;
                 pool_options.tombstones = tombstones;
-                pool_options.jetty_options = jetty_options;
+                // Per-Context RM profile (C01 / G-03): the pooled members must
+                // be created with this Context's own priority/bind mask, not
+                // the shared base options.
+                pool_options.jetty_options =
+                    context->jettyOptions().value_or(jetty_options);
                 pool_options.verbose_events =
                     params.observability.verbose_events;
                 pool_options.sample_every =
@@ -809,6 +1079,38 @@ struct UbTransport::Impl {
                     pool->attachDrainController(std::move(controller));
                 }
             }
+            // C04 path layer: one registry per install (shared by every
+            // Context), so the aggregated imported-target load spans paths of
+            // different local ports. Publishing happens on the resolved
+            // candidate inside the posting path; cold preparation is bounded
+            // and coalesced on its own control thread.
+            auto cold_preparer =
+                std::make_shared<NotYetAsynchronousColdPathPreparer>();
+            std::shared_ptr<ub::UbThreadedPathControlExecutor> path_executor;
+            status = ub::UbThreadedPathControlExecutor::create(
+                kPathControlQueueCapacity, path_executor);
+            if (!status.ok()) return failInstall(status);
+            status = ub::UbPathRegistry::create(
+                cold_preparer, path_executor, kMaxPendingColdPaths,
+                path_registry);
+            if (!status.ok()) return failInstall(status);
+            // C03 async bootstrap seam: the handshake runs on its own bounded
+            // executor. Coalescing is per endpoint identity and a failed key
+            // cools down before it is retried.
+            std::shared_ptr<ub::UbThreadedPathControlExecutor>
+                resolve_executor;
+            status = ub::UbThreadedPathControlExecutor::create(
+                kColdResolveQueueCapacity, resolve_executor);
+            if (!status.ok()) return failInstall(status);
+            status = ub::AsyncColdResolveScheduler::create(
+                resolve_executor,
+                [this](const ub::EndpointResolveRequest& request,
+                       std::shared_ptr<ub::UbEndpoint>& endpoint) {
+                    return resolveEndpoint(request, endpoint);
+                },
+                params.max_endpoints, kColdResolveRetryCooldownNs,
+                cold_resolver);
+            if (!status.ok()) return failInstall(status);
         }
         ub::RailMonitorConfig rail_config;
         rail_config.cooldown_ns =
@@ -1062,7 +1364,19 @@ struct UbTransport::Impl {
                 return endpoints->retireLocalDevice(local_topology_id);
             },
             probe_manager.get(), std::move(probe_jfcs), tombstones,
-            probe_topology.get());
+            probe_topology.get(), nullptr, path_registry,
+            [this](const ub::EndpointResolveRequest& request,
+                   std::shared_ptr<ub::UbEndpoint>& endpoint) {
+                return lookupCachedEndpoint(request, endpoint);
+            },
+            cold_resolver);
+        if (cold_resolver && workers) {
+            // The hint runs on the resolve executor thread, so it must never
+            // outlive the workers: shutdown resets cold_resolver (joining that
+            // thread) before workers.reset().
+            ub::UbWorkers* raw = workers.get();
+            cold_resolver->setReadyHint([raw] { raw->noteColdPathReady(); });
+        }
         if (probe_coordinator) {
             workers->setProbeRefreshHint([this](uint64_t peer_id) {
                 if (probe_coordinator) {
@@ -1131,6 +1445,10 @@ struct UbTransport::Impl {
     Status shutdownUnlocked() {
         installed.store(false, std::memory_order_release);
         shutting_down.store(true, std::memory_order_release);
+        // C03: no async handshake may start once teardown begins. Resetting
+        // joins the resolve executor; its ready hint still targets a live
+        // workers object because workers.reset() happens later.
+        cold_resolver.reset();
 
         // Wake every single-flight follower. Copy the flights under the map
         // lock and signal them after releasing it: the leader takes the flight
@@ -1270,6 +1588,8 @@ struct UbTransport::Impl {
         // released now.
         native_budget.reset();
         tombstones.reset();
+        node_target_quota.reset();
+        path_registry.reset();
         rails.reset();
         quota.reset();
         if (adapter_initialized && adapter) {
@@ -1352,6 +1672,40 @@ struct UbTransport::Impl {
         rails->recordEndpointRebuild(
             ub::UbPostPath{key.local_topology_id, key.remote_segment_id,
                            key.remote_topology_id, endpoint->generation()});
+    }
+
+    // C03: cache-only endpoint lookup for the posting threads. It never
+    // performs the bootstrap RPC and never creates a native resource; a cold
+    // key returns TooManyRequests, which the workers turn into "queue the
+    // handshake on the control executor and park".
+    Status lookupCachedEndpoint(const ub::EndpointResolveRequest& request,
+                                std::shared_ptr<ub::UbEndpoint>& endpoint) {
+        endpoint.reset();
+        if (shutting_down.load(std::memory_order_acquire) || !endpoints ||
+            !request.local_context || !request.remote_segment) {
+            return Status::InvalidArgument(
+                "UB transport is shutting down or route is invalid" LOC_MARK);
+        }
+        const auto* remote_nic =
+            request.remote_segment->getMemory().topology.getNicEntry(
+                request.remote_topology_id);
+        if (!remote_nic || remote_nic->type != Topology::NIC_UB) {
+            return Status::DeviceNotFound(
+                "Remote segment does not advertise a UB topology "
+                "device" LOC_MARK);
+        }
+        const ub::UbEndpointKey key{
+            request.local_context->topologyId(), request.remote_segment_id,
+            request.remote_topology_id,
+            MakeNicPath(request.remote_segment->name, remote_nic->name)};
+        endpoint = endpoints->get(key);
+        if (endpoint && endpoint->ready()) {
+            recordReadyEndpoint(endpoint);
+            return Status::OK();
+        }
+        endpoint.reset();
+        return Status::TooManyRequests(
+            "UB endpoint is cold; async handshake queued" LOC_MARK);
     }
 
     Status resolveEndpoint(const ub::EndpointResolveRequest& request,
@@ -1928,6 +2282,16 @@ struct UbTransport::Impl {
     // Bounded tombstones for unproven native destruction (design §7.2). One
     // table per install generation, shared by the pools and the workers.
     std::shared_ptr<ub::TombstoneTable> tombstones;
+    // Process-authoritative receive-target quota (B-11 / C05.1). Frozen at
+    // rm_pool install; the shared_ptr is dropped on shutdown but the process
+    // registry keeps the accounting alive across reinstall generations.
+    std::shared_ptr<ub::NodeTargetQuota> node_target_quota;
+    // C04 path layer (path snapshot / load charge). Created for rm_pool and
+    // shared with the workers; dropped on shutdown after the workers stop.
+    std::shared_ptr<ub::UbPathRegistry> path_registry;
+    // C03 async bootstrap seam. Created for rm_pool; executes the endpoint
+    // handshake off the posting threads.
+    std::shared_ptr<ub::AsyncColdResolveScheduler> cold_resolver;
     // v1 peers that carried a v2 block (sanitized ignore, design §6.4).
     std::atomic<uint64_t> bootstrap_v2_ignored{0};
     std::atomic<uint64_t> probe_publication_identity_fail{0};
@@ -2265,6 +2629,24 @@ uint64_t UbTransport::poolGeneration() const {
         if (context) generation = std::max(generation, context->incarnation());
     }
     return generation;
+}
+
+ub::UbPathRegistrySnapshot UbTransport::ubPathRegistryStats() const {
+    ub::UbPathRegistrySnapshot snapshot;
+    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    if (impl_->path_registry) {
+        snapshot = impl_->path_registry->statsSnapshot();
+    }
+    return snapshot;
+}
+
+ub::ColdResolveStats UbTransport::ubAsyncBootstrapStats() const {
+    ub::ColdResolveStats stats;
+    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    if (impl_->cold_resolver) {
+        stats = impl_->cold_resolver->stats();
+    }
+    return stats;
 }
 
 double UbTransport::getEstimatedBandwidth() const {

@@ -367,6 +367,13 @@ class UbPathRegistry final : public std::enable_shared_from_this<UbPathRegistry>
     [[nodiscard]] std::vector<UbPathSnapshot> snapshotEligible(
         uint64_t peer_incarnation) const;
 
+    // Lock-consistent selection snapshot of one published version (the
+    // per-candidate read used by the posting path, without the O(paths) scan
+    // of snapshotEligible). Returns false when the version is unknown,
+    // superseded, retired, paused or faulted, i.e. not selectable right now.
+    [[nodiscard]] bool snapshotFor(const UbPathVersion& version,
+                                   UbPathSnapshot& out) const;
+
     // Non-blocking load charge on one published version.
     //  - ready: kCharged with a move-only charge (lock-free release);
     //  - eligible but cold: kDeferred, no charge held, cold preparation

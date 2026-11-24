@@ -215,3 +215,20 @@ core_*
 
 # 个人实验记录/部署手记（不入库；已跟踪的文件需 git rm -r --cached 才生效）
 docs/yin/
+
+# 本地临时工作文档（不入库，已归档至仓库外 _mooncake_backup）
+/supercache_jetty_pool_*.md
+/tent_rm_p0_p5_*.md
+
+# 本地构建目录
+/build-t08/
+
+# IDE / 本地助手工具配置
+/.trae/
+/.workbuddy/
+/.arts/
+/.clangd
+
+# 本地环境脚本（不入库）
+/docker/devenv.Dockerfile
+/scripts/docker-build.ps1

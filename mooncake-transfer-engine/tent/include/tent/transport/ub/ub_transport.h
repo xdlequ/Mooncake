@@ -11,6 +11,8 @@
 
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transport.h"
+#include "tent/transport/ub/cold_resolve_scheduler.h"
+#include "tent/transport/ub/path_registry.h"
 #include "tent/transport/ub/probe_resources.h"
 #include "tent/transport/ub/probe_stats.h"
 
@@ -108,6 +110,13 @@ class UbTransport final : public Transport {
     // Largest installed Context incarnation. Pool members are keyed by it, so
     // a summary that prints it can be correlated with a pool generation.
     [[nodiscard]] uint64_t poolGeneration() const;
+    // C04 path-layer snapshot (published versions + charge counters). Empty
+    // before install and for runtimes without a path registry (RC / RM
+    // Legacy).
+    [[nodiscard]] ub::UbPathRegistrySnapshot ubPathRegistryStats() const;
+    // C03 async bootstrap counters (requested/enqueued/coalesced/completed/
+    // failed/dropped). All zero for runtimes without the seam.
+    [[nodiscard]] ub::ColdResolveStats ubAsyncBootstrapStats() const;
 
    private:
     struct Impl;

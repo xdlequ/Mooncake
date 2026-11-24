@@ -29,6 +29,7 @@
 #include "tent/transport/ub/jetty_drain_controller.h"
 #include "tent/transport/ub/params.h"
 #include "tent/transport/ub/path_load_ledger.h"
+#include "tent/transport/ub/path_registry.h"
 #include "tent/transport/ub/post_scheduler.h"
 #include "tent/transport/ub/probe_topology.h"
 #include "tent/transport/ub/probe_link_manager.h"
@@ -42,6 +43,7 @@
 namespace mooncake::tent::ub {
 
 class UbEndpoint;
+class AsyncColdResolveScheduler;
 
 struct EndpointResolveRequest {
     UbContextPtr local_context;
@@ -77,6 +79,13 @@ struct UbPathSelectionScore {
     size_t retry_order{0};
     Topology::NicID local_topology_id{-1};
     int remote_device_id{-1};
+    // C04: aggregated in-flight load of every path in this process that
+    // references the same imported target. Populated from the path registry
+    // for pooled RM only; zero everywhere else, so the legacy ordering is
+    // unchanged. Declared last so the existing positional initializers stay
+    // valid.
+    uint64_t target_inflight_wrs{0};
+    uint64_t target_inflight_bytes{0};
 };
 
 [[nodiscard]] inline bool betterUbPathScore(
@@ -93,6 +102,14 @@ struct UbPathSelectionScore {
     }
     if (lhs.path_inflight_bytes != rhs.path_inflight_bytes) {
         return lhs.path_inflight_bytes < rhs.path_inflight_bytes;
+    }
+    // C04: aggregate pressure of every path sharing the same imported target,
+    // applied after the path's own pressure and before learned bandwidth.
+    if (lhs.target_inflight_wrs != rhs.target_inflight_wrs) {
+        return lhs.target_inflight_wrs < rhs.target_inflight_wrs;
+    }
+    if (lhs.target_inflight_bytes != rhs.target_inflight_bytes) {
+        return lhs.target_inflight_bytes < rhs.target_inflight_bytes;
     }
     if (lhs.has_bandwidth_sample != rhs.has_bandwidth_sample)
         return lhs.has_bandwidth_sample;
@@ -233,7 +250,18 @@ class UbWorkers final : public gate::Sink {
               // dedicated one owned by the transport. Null makes start()
               // create its own; an executor passed here is never stopped by
               // the workers.
-              std::shared_ptr<ControlExecutor> control_executor = nullptr);
+              std::shared_ptr<ControlExecutor> control_executor = nullptr,
+              // C04 path registry. Non-null only for the pooled RM runtime;
+              // null keeps the W2/W3 legacy selection and ledger untouched.
+              std::shared_ptr<UbPathRegistry> path_registry = nullptr,
+              // C03 async bootstrap seam (pooled RM only). `cached_resolver`
+              // answers from the endpoint cache without any RPC and returns
+              // TooManyRequests for a cold key; `cold_resolver` then performs
+              // the handshake off the posting thread. Both null keeps the
+              // synchronous inline resolve of every legacy runtime.
+              EndpointResolver cached_resolver = {},
+              std::shared_ptr<AsyncColdResolveScheduler> cold_resolver =
+                  nullptr);
     ~UbWorkers();
 
     UbWorkers(const UbWorkers&) = delete;
@@ -297,6 +325,11 @@ class UbWorkers final : public gate::Sink {
     // before start(); when it is null (tests, or a refused thread) the work
     // runs inline and the poller keeps the legacy blocking behavior.
     void setControlExecutor(std::shared_ptr<ControlExecutor> executor);
+
+    // C03: a cold endpoint handshake completed on the control executor. Wakes
+    // every slice parked on the path-availability bucket so the resolve is not
+    // paid again on a timed retry. Safe to call after stop().
+    void noteColdPathReady();
 
    private:
     friend class UbWorkersTestPeer;
@@ -392,7 +425,7 @@ class UbWorkers final : public gate::Sink {
         const std::shared_ptr<UbEndpoint>& endpoint, const UbPostPath& path,
         const ProbePathKey& probe_key, const QuotaReservation& reservation,
         const LocalSegmentRef& local, const ImportedSegmentRef& remote,
-        const UbAttemptToken& attempt);
+        const UbAttemptToken& attempt, const UbPathVersion& path_version);
     // W2 tail of processPending, kept byte-for-byte for pool == nullptr.
     void postLegacy(const PendingSlice& pending, size_t worker_index,
                     const ProbePathKey& probe_key,
@@ -450,7 +483,8 @@ class UbWorkers final : public gate::Sink {
                                     std::shared_ptr<UbEndpoint>& endpoint,
                                     UbPostPath& path,
                                     QuotaReservation& reservation,
-                                    DeferPlan* plan = nullptr);
+                                    DeferPlan* plan = nullptr,
+                                    UbPathVersion* path_version = nullptr);
     // Namespace first: probe tokens are routed to the PLM before the business
     // table can silently drop them (design §11.2). `local_nic`/`jfc_index`
     // identify the polling slot for the interface-8 reports; the fence/stop
@@ -646,8 +680,16 @@ class UbWorkers final : public gate::Sink {
     // Bounded record of unproven destructions, used to attribute a completion
     // whose token no longer maps to a live record (design §7.1/§7.2).
     std::shared_ptr<TombstoneTable> tombstones_;
-    // W3 per-path in-flight ledger (scoring only, D-11).
+    // W3 per-path in-flight ledger (scoring only, D-11). Pooled RM replaces
+    // this source with the path registry's snapshots/charges; the ledger
+    // remains authoritative for RC and RM Legacy.
     PathLoadLedger path_load_;
+    // C04 path layer. Null for RC / RM Legacy / test transports without the
+    // pooled runtime, so those paths are byte-for-byte unchanged.
+    std::shared_ptr<UbPathRegistry> path_registry_;
+    // C03 async bootstrap seam. Null keeps the synchronous inline resolve.
+    EndpointResolver cached_endpoint_resolver_;
+    std::shared_ptr<AsyncColdResolveScheduler> cold_resolver_;
 
     // W3 business counters. Cumulative except the two sampled depths.
     std::atomic<uint64_t> submit_backpressure_{0};

@@ -191,6 +191,32 @@ Status UbContext::shutdownLocked() {
         auto status = target_registry_->drainRetained();
         if (!status.ok() && first_error.ok()) first_error = std::move(status);
     }
+    // Retire every v3 shared import (C04) before the JFCs close. Endpoints
+    // already dropped their references during endpoint store teardown, so a
+    // last-reference import is unimported here; an unproven failure stays
+    // retained inside the registry.
+    if (imported_target_registry_) {
+        const auto imports = imported_target_registry_->snapshot();
+        for (const auto& entry : imports.entries) {
+            if (entry.retired) continue;
+            (void)imported_target_registry_->retireImport(entry.key);
+        }
+        imported_target_registry_.reset();
+    }
+    // Retire every receive-side shared target (C04 / C05.1) before the JFCs
+    // close. Endpoints have already dropped their references during endpoint
+    // store teardown, so a last-reference target is destroyed here; a failed
+    // destruction keeps its node quota slot charged inside the registry.
+    if (local_target_registry_) {
+        const auto targets = local_target_registry_->snapshot();
+        for (const auto& entry : targets.entries) {
+            if (entry.retired) continue;
+            auto status = local_target_registry_->retirePortTarget(
+                entry.port_id, entry.target_epoch);
+            if (!status.ok() && first_error.ok()) first_error = std::move(status);
+        }
+        local_target_registry_.reset();
+    }
     for (size_t index = jfcs_.size(); index > 0;) {
         --index;
         auto& jfc = jfcs_[index];
@@ -247,6 +273,18 @@ void UbContext::setJettyOptions(JettyOptions options) {
 std::optional<JettyOptions> UbContext::jettyOptions() const {
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);
     return jetty_options_;
+}
+
+void UbContext::attachLocalPortTargetRegistry(
+    std::shared_ptr<UbLocalPortTargetRegistry> registry) {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    local_target_registry_ = std::move(registry);
+}
+
+void UbContext::attachImportedTargetRegistry(
+    std::shared_ptr<UbImportedTargetRegistry> registry) {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    imported_target_registry_ = std::move(registry);
 }
 
 void UbContext::addInflight(uint64_t bytes) noexcept {
