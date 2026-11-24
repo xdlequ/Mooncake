@@ -41,9 +41,8 @@ namespace ub {
 class ProbePeerRegistry;
 
 // Provider-neutral reachability scope of one EID. The default derives it from
-// the canonical EID prefix (the first seven groups, i.e. everything except the
-// interface/port group); config declarations can disable the check when a
-// deployment really routes across scopes.
+// the canonical EID subnet prefix (the first four groups); config declarations
+// can disable the check when a deployment really routes across subnets.
 struct EidScope {
     std::string key;
     bool trusted{false};
@@ -54,8 +53,8 @@ struct EidScope {
 // True when both EIDs are trusted and share a reachability scope. An EID that
 // cannot be parsed is treated as compatible: an older peer may not publish it,
 // and refusing to pair would break deployments that work today. Legacy device
-// selection uses this to refuse cross-scope local x remote pairs (df00 vs
-// df04), which the provider rejects with URMA_CR_LOC_ACCESS_ERR.
+// selection uses this to refuse cross-subnet local x remote pairs, which the
+// provider rejects with URMA_CR_LOC_ACCESS_ERR.
 [[nodiscard]] bool sameEidScope(std::string_view local_eid,
                                 std::string_view remote_eid);
 

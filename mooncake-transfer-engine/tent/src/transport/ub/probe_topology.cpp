@@ -71,9 +71,11 @@ std::optional<Topology::NicID> remoteNicForEid(const Topology& topology,
 EidScope eidScopeForEid(std::string_view eid) {
     EidScope scope;
     if (!isCanonicalEid(eid)) return scope;
-    // Eight groups of four hex digits. The last group is the interface/port
-    // identity; the prefix is the reachability scope (df00 vs df04).
-    scope.key = lowerAscii(eid.substr(0, 34));
+    // Eight groups of four hex digits. Reachability is scoped to the subnet,
+    // i.e. the first four groups (19 characters including separators); the
+    // remaining groups identify the device/interface inside that subnet. The
+    // key is lowered so the comparison is case-insensitive.
+    scope.key = lowerAscii(eid.substr(0, 19));
     scope.trusted = true;
     return scope;
 }
@@ -270,8 +272,9 @@ Status ProbeTopology::resolve(const ProbeParams& params,
     }
 
     // INV-4: declared edges must be reachable at install time. The default
-    // EID-prefix scope rejects a cross-subnet edge (e.g. df00 <-> df04)
-    // instead of letting it fail later as a business MEMORY_ERROR.
+    // EID subnet-prefix scope rejects an edge whose local and remote EIDs are
+    // in different subnets (the first four groups differ) instead of letting
+    // it fail later as a business MEMORY_ERROR.
     bool scope_mismatch = false;
     std::string first_scope_error;
     for (const auto& [peer_name, edges] : resolved.adjacency_) {

@@ -242,34 +242,38 @@ TEST(UbProbeTopologyTest, ApplyUbNicKindsPublishesTrustedKind) {
         "unknown");
 }
 
-TEST(UbProbeTopologyTest, EidScopeUsesTheEidPrefix) {
+TEST(UbProbeTopologyTest, EidScopeUsesTheSubnetPrefix) {
+    // The scope key is the first four groups; the trailing groups identify the
+    // device/interface inside the subnet and do not affect the scope.
     const auto same = eidScopeForEid("0000:0000:0004:0200:0010:0000:df00:4500");
     const auto same_peer =
-        eidScopeForEid("0000:0000:0004:0200:0010:0000:df00:c500");
-    const auto other =
         eidScopeForEid("0000:0000:0004:0200:0010:0000:df04:c500");
+    const auto other =
+        eidScopeForEid("0000:0000:0004:0201:0010:0000:df00:c500");
     ASSERT_TRUE(same.trusted);
     ASSERT_TRUE(same_peer.trusted);
     ASSERT_TRUE(other.trusted);
+    EXPECT_EQ(same.key, "0000:0000:0004:0200");
     EXPECT_EQ(same.key, same_peer.key);
     EXPECT_NE(same.key, other.key);
     EXPECT_FALSE(eidScopeForEid("bad-eid").trusted);
 }
 
-TEST(UbProbeTopologyTest, SameEidScopeComparesTheReachabilityPrefix) {
-    constexpr const char* kDf00A = "0000:0000:0004:0200:0010:0000:df00:4500";
-    constexpr const char* kDf00B = "0000:0000:0004:0200:0010:0000:df00:c500";
-    constexpr const char* kDf04 = "0000:0000:0004:0200:0010:0000:df04:c500";
+TEST(UbProbeTopologyTest, SameEidScopeComparesTheSubnetPrefix) {
+    constexpr const char* kSubnetA = "0000:0000:0004:0200:0010:0000:df00:4500";
+    constexpr const char* kSubnetAPeer =
+        "0000:0000:0004:0200:0010:0000:df04:c500";
+    constexpr const char* kSubnetB = "0000:0000:0004:0201:0010:0000:df00:c500";
 
-    EXPECT_TRUE(sameEidScope(kDf00A, kDf00B));
-    EXPECT_FALSE(sameEidScope(kDf00A, kDf04));
+    EXPECT_TRUE(sameEidScope(kSubnetA, kSubnetAPeer));
+    EXPECT_FALSE(sameEidScope(kSubnetA, kSubnetB));
     // Case-insensitive: the scope key is normalized to lower case.
-    EXPECT_TRUE(sameEidScope("0000:0000:0004:0200:0010:0000:DF00:4500",
-                             "0000:0000:0004:0200:0010:0000:df00:c500"));
+    EXPECT_TRUE(sameEidScope("0000:0000:0004:02A0:0010:0000:df00:4500",
+                             "0000:0000:0004:02a0:0010:0000:df04:c500"));
     // An EID that cannot be parsed must not refuse the pair (compatibility with
     // peers that do not publish it).
-    EXPECT_TRUE(sameEidScope("bad-eid", kDf04));
-    EXPECT_TRUE(sameEidScope(kDf00A, ""));
+    EXPECT_TRUE(sameEidScope("bad-eid", kSubnetB));
+    EXPECT_TRUE(sameEidScope(kSubnetA, ""));
 }
 
 // Selection-level shape of the policy: a 2x2 local x remote matrix produces
@@ -277,10 +281,10 @@ TEST(UbProbeTopologyTest, SameEidScopeComparesTheReachabilityPrefix) {
 TEST(UbProbeTopologyTest, SameEidScopeKeepsOnlyDiagonalPairs) {
     const std::vector<std::string> locals{
         "0000:0000:0004:0200:0010:0000:df00:4500",
-        "0000:0000:0004:0200:0010:0000:df04:4500"};
+        "0000:0000:0004:0201:0010:0000:df04:4500"};
     const std::vector<std::string> remotes{
-        "0000:0000:0004:0200:0010:0000:df00:c500",
-        "0000:0000:0004:0200:0010:0000:df04:c500"};
+        "0000:0000:0004:0200:0010:0000:df04:c500",
+        "0000:0000:0004:0201:0010:0000:df00:c500"};
     size_t allowed = 0;
     size_t denied = 0;
     for (const auto& local : locals) {
@@ -313,7 +317,7 @@ TEST(UbProbeTopologyTest, CrossScopeEdgeFailsInstallUnlessDisabled) {
                     "enabled": true, "provider": "standalone",
                     "local_ports": [{"id": "P0", "bind": "ub:local0:eid0"}],
                     "peers": {"node-b": {"ports": [
-                        {"id": "R0", "eid": "0000:0000:0004:0200:0010:0000:df04:c500"}
+                        {"id": "R0", "eid": "0000:0000:0004:0201:0010:0000:df04:c500"}
                     ]}},
                     "adjacency": {"node-b": {"P0": ["R0"]}},
                     "adjacency_policy": {"require_same_eid_scope": )" +

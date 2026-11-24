@@ -87,8 +87,8 @@ enum class RemoteScopeScenario {
     kAllCross,       // both remote devices are in a different scope
 };
 
-// Second local/remote device EID used by the scope tests. Its reachability
-// prefix (first seven groups) differs from fakeDevice()'s "0001:...".
+// Second local/remote device EID used by the scope tests. Its subnet prefix
+// (first four groups) differs from fakeDevice()'s "0001:..." prefix.
 constexpr const char* kOtherScopeEid =
     "0002:0000:0000:0000:0000:0000:0000:4500";
 

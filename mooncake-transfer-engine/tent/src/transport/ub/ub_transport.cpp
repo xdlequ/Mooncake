@@ -505,12 +505,10 @@ struct UbTransport::Impl {
                 const auto scope =
                     ub::eidScopeForEid(context->deviceInfo().eid);
                 if (!scope.trusted) continue;
-                // The last four digits of the prefix are the reachability
-                // group (df00 vs df04); the full prefix is repetitive.
-                const std::string short_scope =
-                    scope.key.size() >= 4
-                        ? scope.key.substr(scope.key.size() - 4)
-                        : scope.key;
+                // The scope key is the subnet prefix (the first four groups)
+                // and is short enough to log verbatim; truncating it would
+                // alias distinct subnets under the same label.
+                const std::string& short_scope = scope.key;
                 if (std::find(scopes.begin(), scopes.end(), short_scope) ==
                     scopes.end()) {
                     scopes.push_back(short_scope);
