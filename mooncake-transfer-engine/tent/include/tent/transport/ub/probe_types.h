@@ -358,6 +358,12 @@ struct ProbeParams {
     uint64_t backoff_max_ms{30000};
     uint64_t timeout_ms{1000};
     uint32_t peer_budget{4};
+    // Maximum concurrent probe WRs on one local port. Each port has one
+    // dedicated probe Jetty and one dedicated MR slot, so the binding is a
+    // port-level concurrency cap, not a peer-level one. Default 1 keeps the
+    // W1 single-slot behavior; a deployment may raise it up to the number of
+    // declared paths on a port (each path is still single-flight).
+    uint32_t max_inflight_per_port{1};
     uint32_t failure_threshold{3};
     // F8: consecutive retryable post rejections after which the verification
     // obligation is abandoned explicitly (and counted) instead of silently
@@ -424,6 +430,7 @@ struct ProbeParams {
         if (interval_ms == 0 || backoff_max_ms < interval_ms) return false;
         if (timeout_ms == 0 || timeout_ms > interval_ms) return false;
         if (peer_budget == 0 || failure_threshold == 0) return false;
+        if (max_inflight_per_port == 0) return false;
         // stop_on_recovery/recover_success_threshold/recover_success are fixed
         // values in W1; this struct rejects anything else so a later config
         // reader cannot silently accept a divergent value.
@@ -504,6 +511,9 @@ struct ProbeStats {
     uint64_t probe_skipped_pending{0};
     uint64_t probe_skipped_credit{0};
     uint64_t probe_skipped_peer_budget{0};
+    // Due paths left unscheduled because the port already had
+    // max_inflight_per_port probe WRs outstanding.
+    uint64_t probe_skipped_port_limit{0};
     uint64_t probe_skipped_broken{0};
     uint64_t probe_handle_generation_mismatch{0};
     uint64_t probe_gate_blocked_by_epoch{0};

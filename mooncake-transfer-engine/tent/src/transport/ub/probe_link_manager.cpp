@@ -184,7 +184,6 @@ Status ProbeLinkManager::initialize(const ProbeGraph& graph) {
         PortRuntime runtime;
         runtime.supply = supply;
         runtime.generation = supply.jetty_generation;
-        runtime.slot_generation = supply.jetty_generation;
         runtime.handle_valid = true;
         ports_.emplace(supply.local_nic, std::move(runtime));
     }
@@ -466,15 +465,31 @@ std::vector<ProbeAction> ProbeLinkManager::pendingActions(uint64_t now_ns) {
             }
             continue;
         }
-        // One probe per port including the "unknown responsibility" window: a
-        // non-zero slot means this port already has an outstanding WR.
-        if (port.slot_token != 0) continue;
+        // The port admits up to max_inflight_per_port concurrent probe WRs;
+        // each path is still single-flight (inflight_seq). An unknown-
+        // responsibility window consumes one slot until it resolves or a lane
+        // rebuild resets the port.
+        const size_t room =
+            port.slots.size() < params_.max_inflight_per_port
+                ? params_.max_inflight_per_port - port.slots.size()
+                : 0;
+        if (room == 0) {
+            for (const auto& version : port.paths) {
+                auto runtime = paths_.find(version);
+                if (runtime != paths_.end() &&
+                    dueLocked(version, runtime->second, now)) {
+                    ++stats_.probe_skipped_port_limit;
+                    break;
+                }
+            }
+            continue;
+        }
         const size_t count = port.paths.size();
         if (count == 0) continue;
         const size_t start = port.rr_cursor % count;
-        bool selected = false;
+        size_t remaining = room;
         // Priority 1/2: campaign and periodic work.
-        for (size_t offset = 0; offset < count; ++offset) {
+        for (size_t offset = 0; offset < count && remaining > 0; ++offset) {
             const size_t index = (start + offset) % count;
             const PathVersion& version = port.paths[index];
             auto runtime = paths_.find(version);
@@ -486,6 +501,9 @@ std::vector<ProbeAction> ProbeLinkManager::pendingActions(uint64_t now_ns) {
                 ++stats_.probe_skipped_pending;
                 continue;
             }
+            // The same path must never be posted twice (single-flight per
+            // path); with several port slots this is the only duplicate guard.
+            if (runtime->second.inflight_seq != 0) continue;
             if (!peerBudgetAvailableLocked(runtime->second.peer)) {
                 ++stats_.probe_skipped_peer_budget;
                 continue;
@@ -493,17 +511,17 @@ std::vector<ProbeAction> ProbeLinkManager::pendingActions(uint64_t now_ns) {
             port.rr_cursor = index + 1;
             if (port.rr_cursor >= count) ++stats_.probe_rr_round;
             actions.push_back(makeActionLocked(port, version, runtime->second));
-            selected = true;
-            break;
+            --remaining;
         }
-        if (selected || !params_.test_periodic_all) continue;
+        if (remaining == 0 || !params_.test_periodic_all) continue;
         // Priority 3: test-mode sweep. It ignores health and backoff, but still
-        // obeys the port slot, Pending and peer budget.
-        for (size_t offset = 0; offset < count; ++offset) {
+        // obeys the port slots, Pending and peer budget.
+        for (size_t offset = 0; offset < count && remaining > 0; ++offset) {
             const size_t index = (start + offset) % count;
             const PathVersion& version = port.paths[index];
             auto runtime = paths_.find(version);
             if (runtime == paths_.end()) continue;
+            if (runtime->second.inflight_seq != 0) continue;
             if (!testEligibleLocked(runtime->second, now)) continue;
             if (runtime->second.pending ||
                 !peerBudgetAvailableLocked(runtime->second.peer)) {
@@ -516,7 +534,7 @@ std::vector<ProbeAction> ProbeLinkManager::pendingActions(uint64_t now_ns) {
             action.test = true;
             action.due_ns = runtime->second.test_due_ns;
             actions.push_back(std::move(action));
-            break;
+            --remaining;
         }
     }
     return actions;
@@ -537,7 +555,10 @@ std::shared_ptr<ProbeRecord> ProbeLinkManager::beginPost(
 
     PortRuntime* port = findPortLocked(action.local_nic);
     if (port == nullptr) return nullptr;
-    if (!port->handle_valid || port->slot_token != 0) return nullptr;
+    if (!port->handle_valid ||
+        port->slots.size() >= params_.max_inflight_per_port) {
+        return nullptr;
+    }
     if (port->generation != action.jetty_generation) return nullptr;
 
     const PathVersion& version = action.version;
@@ -609,11 +630,9 @@ std::shared_ptr<ProbeRecord> ProbeLinkManager::beginPost(
     // onPostResult() before settlement is even considered.
     record->post_refs.store(1, std::memory_order_release);
 
-    port->slot_token = token;
-    port->slot_generation = port->generation;
-    ++port->inflight;
+    port->slots.emplace(token, port->generation);
     stats_.probe_inflight_per_port =
-        std::max<uint64_t>(stats_.probe_inflight_per_port, port->inflight);
+        std::max<uint64_t>(stats_.probe_inflight_per_port, port->slots.size());
     ++peer_inflight_[runtime->peer];
     inflight_.emplace(token, record);
     ++stats_.probe_scheduled;
@@ -789,7 +808,9 @@ uint64_t ProbeLinkManager::nextDeadline(uint64_t now_ns) const {
         if (record->deadline_ns != 0) consider(record->deadline_ns);
     }
     for (const auto& [local_nic, port] : ports_) {
-        if (!port.handle_valid || port.slot_token != 0) continue;
+        if (!port.handle_valid || port.slots.size() >=
+                                      params_.max_inflight_per_port)
+            continue;
         for (const auto& version : port.paths) {
             auto runtime = paths_.find(version);
             if (runtime == paths_.end()) continue;
@@ -1188,14 +1209,14 @@ void ProbeLinkManager::applyLocked(const Completion& completion,
 
 void ProbeLinkManager::releaseSlotLocked(PortRuntime& port,
                                          const ProbeRecord& record) {
-    if (port.slot_token == record.core.token &&
-        port.slot_generation == record.key.jetty_generation) {
-        port.slot_token = 0;
-        if (port.inflight > 0) --port.inflight;
+    auto slot = port.slots.find(record.core.token);
+    if (slot != port.slots.end() &&
+        slot->second == record.key.jetty_generation) {
+        port.slots.erase(slot);
         return;
     }
     // A completion from an older generation must never touch the new
-    // generation's slot (invariant 11).
+    // generation's slots (invariant 11).
     ++stats_.probe_slot_anomaly;
 }
 
@@ -1988,9 +2009,7 @@ Status ProbeLinkManager::applyEventLocked(const ProbeEvent& event,
             }
             port->supply = *event.port;
             port->generation = event.port->jetty_generation;
-            port->slot_token = 0;
-            port->slot_generation = port->generation;
-            port->inflight = 0;
+            port->slots.clear();
             port->handle_valid = true;
             port->broken_since_ns = 0;
             clearPortPendingLocked(*port);

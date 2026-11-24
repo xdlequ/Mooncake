@@ -234,7 +234,10 @@ TEST(UbCompletionRecordTest, ProbeKindIsCarriedByTheSharedKernel) {
     CompletionRecord record;
     record.kind = RecordKind::kProbe;
     record.token = 1ULL << 48;
-    EXPECT_EQ(recordKindName(record.kind), "probe");
+    // STREQ, not EQ: recordKindName returns const char*, and pointer equality
+    // only held while the compiler happened to merge identical literals (it
+    // does not in a Debug/ASAN build).
+    EXPECT_STREQ(recordKindName(record.kind), "probe");
     EXPECT_NE(record.token, 0U);
 }
 

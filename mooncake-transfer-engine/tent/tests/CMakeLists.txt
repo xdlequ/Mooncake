@@ -585,6 +585,7 @@ if(USE_UB)
     ub_core_test.cpp ../src/transport/ub/bootstrap.cpp
     ../src/transport/ub/sha256.cpp
     ../src/transport/ub/completion_record.cpp ../src/transport/ub/quota.cpp
+    ../src/transport/ub/node_target_quota.cpp
     ../src/transport/ub/rail_monitor.cpp)
   target_link_libraries(tent_ub_core_test PRIVATE tent_common gtest gtest_main)
   target_include_directories(tent_ub_core_test

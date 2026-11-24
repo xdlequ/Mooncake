@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <string>
 #include <thread>
@@ -24,6 +25,7 @@
 
 #include "tent/transport/ub/bootstrap.h"
 #include "tent/transport/ub/device_selection.h"
+#include "tent/transport/ub/node_target_quota.h"
 #include "tent/transport/ub/quota.h"
 #include "tent/transport/ub/params.h"
 #include "tent/transport/ub/rail_monitor.h"
@@ -124,6 +126,170 @@ TEST(UbParamsTest, ParsesDormantPoolAndProbeKeysWithoutStartingResources) {
     params.jetty_pool.force_disable = true;
     UbRuntimeMode mode = UbRuntimeMode::kRcLegacy;
     EXPECT_TRUE(resolveUbRuntimeMode(params, mode).IsInvalidArgument());
+}
+
+// T-19: the per-port probe concurrency cap is an explicit, strictly parsed
+// configuration key. The default keeps the W1 single-slot behavior.
+TEST(UbParamsTest, ParsesAndValidatesMaxInflightPerPort) {
+    Config defaults;
+    UbParams baseline;
+    ASSERT_TRUE(UbParams::FromConfig(defaults, baseline).ok());
+    EXPECT_EQ(baseline.probe.max_inflight_per_port, 1U);
+
+    Config config;
+    config.set("transports/ub/probe/max_inflight_per_port", 3);
+    UbParams params;
+    ASSERT_TRUE(UbParams::FromConfig(config, params).ok());
+    EXPECT_EQ(params.probe.max_inflight_per_port, 3U);
+
+    // Zero, negative, bool, string and float must all fail closed instead of
+    // being coerced into a limit.
+    const std::vector<std::function<void(Config&)>> invalid = {
+        [](Config& c) { c.set("transports/ub/probe/max_inflight_per_port", 0); },
+        [](Config& c) { c.set("transports/ub/probe/max_inflight_per_port", -1); },
+        [](Config& c) {
+            c.set("transports/ub/probe/max_inflight_per_port", true);
+        },
+        [](Config& c) {
+            c.set("transports/ub/probe/max_inflight_per_port", "2");
+        },
+        [](Config& c) {
+            c.set("transports/ub/probe/max_inflight_per_port", 1.5);
+        }};
+    for (const auto& apply : invalid) {
+        Config broken;
+        apply(broken);
+        UbParams rejected;
+        EXPECT_TRUE(UbParams::FromConfig(broken, rejected).IsInvalidArgument());
+    }
+}
+
+// T-25 software matrix (C05.1): node target quota default, strict input and
+// the 8/9 static-capacity boundary.
+TEST(UbNodeTargetQuotaTest, DefaultLimitStrictInputAndStaticBoundary) {
+    Config defaults;
+    UbParams params;
+    ASSERT_TRUE(UbParams::FromConfig(defaults, params).ok());
+    EXPECT_EQ(params.max_target_jetties_per_node, 8U);
+
+    Config config;
+    config.set("transports/ub/max_target_jetties_per_node", 9);
+    ASSERT_TRUE(UbParams::FromConfig(config, params).ok());
+    EXPECT_EQ(params.max_target_jetties_per_node, 9U);
+
+    const std::vector<std::function<void(Config&)>> invalid = {
+        [](Config& c) {
+            c.set("transports/ub/max_target_jetties_per_node", 0);
+        },
+        [](Config& c) {
+            c.set("transports/ub/max_target_jetties_per_node", -1);
+        },
+        [](Config& c) {
+            c.set("transports/ub/max_target_jetties_per_node", true);
+        },
+        [](Config& c) {
+            c.set("transports/ub/max_target_jetties_per_node", "8");
+        },
+        [](Config& c) {
+            c.set("transports/ub/max_target_jetties_per_node", 8.5);
+        }};
+    for (const auto& apply : invalid) {
+        Config broken;
+        apply(broken);
+        UbParams rejected;
+        EXPECT_TRUE(UbParams::FromConfig(broken, rejected).IsInvalidArgument());
+    }
+
+    NodeTargetQuota::resetRegistryForTest();
+    std::shared_ptr<NodeTargetQuota> quota;
+    ASSERT_TRUE(NodeTargetQuota::acquire(8, quota).ok());
+    EXPECT_TRUE(quota->validateStaticDemand(8).ok());
+    EXPECT_TRUE(quota->validateStaticDemand(9).IsInvalidArgument());
+    NodeTargetQuota::resetRegistryForTest();
+}
+
+// The ledger is process-authoritative: a second Engine/Context with the same
+// limit shares it, a conflicting limit is refused, and the ninth reservation
+// is a capacity rejection rather than a wider limit.
+TEST(UbNodeTargetQuotaTest, ProcessWideSharingAndEightNineBoundary) {
+    NodeTargetQuota::resetRegistryForTest();
+    std::shared_ptr<NodeTargetQuota> quota;
+    ASSERT_TRUE(NodeTargetQuota::acquire(8, quota).ok());
+
+    std::shared_ptr<NodeTargetQuota> same;
+    ASSERT_TRUE(NodeTargetQuota::acquire(8, same).ok());
+    EXPECT_EQ(same.get(), quota.get())
+        << "Contexts/Engines must share one frozen ledger";
+
+    std::shared_ptr<NodeTargetQuota> conflicting;
+    EXPECT_TRUE(NodeTargetQuota::acquire(9, conflicting).IsInvalidArgument());
+
+    std::vector<TargetQuotaTicket> tickets;
+    for (size_t index = 0; index < 8; ++index) {
+        auto ticket = quota->tryReserve();
+        ASSERT_TRUE(ticket.has_value());
+        tickets.push_back(std::move(*ticket));
+    }
+    EXPECT_FALSE(quota->tryReserve().has_value());
+    auto snapshot = quota->snapshot();
+    EXPECT_EQ(snapshot.limit, 8U);
+    EXPECT_EQ(snapshot.creating_reserved, 8U);
+    EXPECT_EQ(snapshot.total_occupied, 8U);
+    EXPECT_EQ(snapshot.rejected_reservations, 1U);
+
+    // A ticket that provably never allocated returns exactly one slot.
+    ASSERT_TRUE(quota->releaseUnallocated(tickets.back()).ok());
+    tickets.pop_back();
+    EXPECT_EQ(quota->snapshot().total_occupied, 7U);
+    auto reused = quota->tryReserve();
+    ASSERT_TRUE(reused.has_value());
+    tickets.push_back(std::move(*reused));
+    EXPECT_EQ(quota->snapshot().total_occupied, 8U);
+
+    // Dropping a ticket without a proven release keeps its slot charged (no
+    // implicit release) and is reported as a leak; this is what preserves
+    // Unknown responsibility.
+    tickets.pop_back();
+    const auto after_drop = quota->snapshot();
+    EXPECT_EQ(after_drop.total_occupied, 8U);
+    EXPECT_EQ(after_drop.leaked_tickets, 1U);
+    NodeTargetQuota::resetRegistryForTest();
+}
+
+TEST(UbNodeTargetQuotaTest, UnprovenDestructionAndQuarantineKeepTheSlot) {
+    NodeTargetQuota::resetRegistryForTest();
+    std::shared_ptr<NodeTargetQuota> quota;
+    ASSERT_TRUE(NodeTargetQuota::acquire(4, quota).ok());
+
+    auto ticket = quota->tryReserve();
+    ASSERT_TRUE(ticket.has_value());
+    // Backwards transitions are rejected without touching the ledger.
+    EXPECT_TRUE(quota->transition(*ticket, TargetObjectState::kRetiringDeleting)
+                    .IsInvalidArgument());
+    ASSERT_TRUE(quota->transition(*ticket, TargetObjectState::kActive).ok());
+    ASSERT_TRUE(
+        quota->transition(*ticket, TargetObjectState::kRetiringDeleting).ok());
+    // Unproven destruction must not free the slot.
+    EXPECT_TRUE(
+        quota
+            ->releaseAfterProvenDestruction(*ticket, /*proven=*/false)
+            .IsInvalidArgument());
+    EXPECT_EQ(quota->snapshot().retiring_deleting, 1U);
+    ASSERT_TRUE(
+        quota->transition(*ticket, TargetObjectState::kQuarantinedUnproven)
+            .ok());
+    EXPECT_EQ(quota->snapshot().quarantined_unproven, 1U);
+    EXPECT_EQ(quota->snapshot().total_occupied, 1U);
+
+    // Old-generation accounting survives a fresh acquire of the same ledger.
+    std::shared_ptr<NodeTargetQuota> next_generation;
+    ASSERT_TRUE(NodeTargetQuota::acquire(4, next_generation).ok());
+    EXPECT_EQ(quota->snapshot().total_occupied, 1U);
+
+    ASSERT_TRUE(
+        quota->releaseAfterProvenDestruction(*ticket, /*proven=*/true).ok());
+    EXPECT_EQ(quota->snapshot().total_occupied, 0U);
+    NodeTargetQuota::resetRegistryForTest();
 }
 
 TEST(UbParamsTest, RuntimeMatrixRejectsInconsistentOrUnsupportedModes) {

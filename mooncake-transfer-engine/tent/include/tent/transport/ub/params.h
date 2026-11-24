@@ -606,6 +606,10 @@ struct UbParams {
                                   parsed.probe.peer_budget,
                                   parsed.probe.peer_budget));
         CHECK_STATUS(readPositive(
+            config, "transports/ub/probe/max_inflight_per_port",
+            parsed.probe.max_inflight_per_port,
+            parsed.probe.max_inflight_per_port));
+        CHECK_STATUS(readPositive(
             config, "transports/ub/probe/failure_threshold",
             parsed.probe.failure_threshold, parsed.probe.failure_threshold));
         // stop_on_recovery and recover_success_threshold are fixed values in

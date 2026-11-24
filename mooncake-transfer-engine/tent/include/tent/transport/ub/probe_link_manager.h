@@ -356,15 +356,15 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
     struct PortRuntime {
         ProbePortSupply supply;
         uint64_t generation{0};
-        // The slot only describes the current generation. A lane retirement
-        // leaves it occupied (no resend); an interface-7 replacement resets it
-        // and moves old in-flight records to the orphan table.
-        uint64_t slot_token{0};
-        uint64_t slot_generation{0};
+        // Probe WRs currently outstanding on this port, mapped to the Jetty
+        // generation they were posted under. Bounded by
+        // ProbeParams::max_inflight_per_port. Only entries of the current
+        // generation are validated on release; an orphaned record keeps its
+        // token (no resend may overlap it) until a lane rebuild resets the map.
+        std::unordered_map<uint64_t, uint64_t> slots;
         bool handle_valid{true};
         uint64_t broken_since_ns{0};
         size_t rr_cursor{0};
-        uint32_t inflight{0};
         // Deterministic round-robin order for this port.
         std::vector<PathVersion> paths;
     };

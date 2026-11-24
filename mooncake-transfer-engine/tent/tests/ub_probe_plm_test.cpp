@@ -708,6 +708,64 @@ TEST(UbProbeLinkManagerTest, PeerBudgetGatesCrossPortScheduling) {
     EXPECT_EQ(healthOf(plm, first).health, LinkHealth::kIsolated);
 }
 
+TEST(UbProbeLinkManagerTest, MaxInflightPerPortBoundsConcurrentProbes) {
+    TestClock clock;
+    auto params = defaultParams();
+    params.max_inflight_per_port = 2;
+    ProbeLinkManager plm(params, clock.clock());
+    auto graph = makeGraph({makePortSupply(0, 1)},
+                           {makeEdgeSupply(0, 10, 0), makeEdgeSupply(0, 11, 0),
+                            makeEdgeSupply(0, 12, 0)});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+    const PathVersion third{ProbePathKey{0, 12, 0}, 1, 1};
+    for (uint64_t peer : {10U, 11U, 12U}) {
+        plm.onBusinessPathError(makeEvidence(0, peer, 0),
+                                BusinessErrorKind::kPathFault, clock.now());
+    }
+
+    // The explicit per-port cap, not the single W1 slot, bounds the batch.
+    auto actions = plm.pendingActions(clock.now());
+    ASSERT_EQ(actions.size(), 2U);
+    uint64_t token_seq = 0;
+    auto probe_a = plm.beginPost(actions[0], makeProbeToken(++token_seq),
+                                 clock.now());
+    auto probe_b = plm.beginPost(actions[1], makeProbeToken(++token_seq),
+                                 clock.now());
+    ASSERT_NE(probe_a, nullptr);
+    ASSERT_NE(probe_b, nullptr);
+    EXPECT_NE(probe_a->key.version, probe_b->key.version);
+    EXPECT_EQ(plm.inflightCount(), 2U);
+    EXPECT_EQ(plm.stats().probe_inflight_per_port, 2U);
+
+    // At the cap the third due path is skipped and counted, not posted.
+    EXPECT_TRUE(plm.pendingActions(clock.now()).empty());
+    EXPECT_GE(plm.stats().probe_skipped_port_limit, 1U);
+
+    // One completion frees exactly one slot; the remaining due path is admitted
+    // without raising the observed high-water mark above the configured cap.
+    plm.onPostResult(probe_a, ProbePostOutcome::kAccepted, clock.now());
+    ASSERT_TRUE(
+        plm.onProbeCompletion(makeCompletion(probe_a->core.token), clock.now()));
+    EXPECT_EQ(plm.inflightCount(), 1U);
+    auto refill = plm.pendingActions(clock.now());
+    ASSERT_EQ(refill.size(), 1U);
+    auto probe_c =
+        plm.beginPost(refill.front(), makeProbeToken(++token_seq), clock.now());
+    ASSERT_NE(probe_c, nullptr);
+    EXPECT_EQ(plm.inflightCount(), 2U);
+    EXPECT_EQ(plm.stats().probe_inflight_per_port, 2U);
+    EXPECT_EQ(healthOf(plm, third).health, LinkHealth::kIsolated);
+
+    plm.onPostResult(probe_b, ProbePostOutcome::kAccepted, clock.now());
+    plm.onPostResult(probe_c, ProbePostOutcome::kAccepted, clock.now());
+    ASSERT_TRUE(
+        plm.onProbeCompletion(makeCompletion(probe_b->core.token), clock.now()));
+    ASSERT_TRUE(
+        plm.onProbeCompletion(makeCompletion(probe_c->core.token), clock.now()));
+    EXPECT_EQ(plm.inflightCount(), 0U);
+    EXPECT_EQ(plm.stats().probe_slot_anomaly, 0U);
+}
+
 TEST(UbProbeLinkManagerTest, LocalAccessErrorIsolatesAndRetiresLaneOnce) {
     TestClock clock;
     ProbeLinkManager plm(defaultParams(), clock.clock());
