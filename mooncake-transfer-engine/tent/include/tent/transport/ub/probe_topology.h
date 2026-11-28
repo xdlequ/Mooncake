@@ -41,7 +41,7 @@ namespace ub {
 class ProbePeerRegistry;
 
 // Provider-neutral reachability scope of one EID. The default derives it from
-// the canonical EID subnet prefix (the first four groups); config declarations
+// the canonical EID subnet prefix (the first three groups); config declarations
 // can disable the check when a deployment really routes across subnets.
 struct EidScope {
     std::string key;

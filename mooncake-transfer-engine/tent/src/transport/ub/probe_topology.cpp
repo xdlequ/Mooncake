@@ -72,10 +72,10 @@ EidScope eidScopeForEid(std::string_view eid) {
     EidScope scope;
     if (!isCanonicalEid(eid)) return scope;
     // Eight groups of four hex digits. Reachability is scoped to the subnet,
-    // i.e. the first four groups (19 characters including separators); the
+    // i.e. the first three groups (14 characters including separators); the
     // remaining groups identify the device/interface inside that subnet. The
     // key is lowered so the comparison is case-insensitive.
-    scope.key = lowerAscii(eid.substr(0, 19));
+    scope.key = lowerAscii(eid.substr(0, 14));
     scope.trusted = true;
     return scope;
 }
@@ -273,7 +273,7 @@ Status ProbeTopology::resolve(const ProbeParams& params,
 
     // INV-4: declared edges must be reachable at install time. The default
     // EID subnet-prefix scope rejects an edge whose local and remote EIDs are
-    // in different subnets (the first four groups differ) instead of letting
+    // in different subnets (the first three groups differ) instead of letting
     // it fail later as a business MEMORY_ERROR.
     bool scope_mismatch = false;
     std::string first_scope_error;

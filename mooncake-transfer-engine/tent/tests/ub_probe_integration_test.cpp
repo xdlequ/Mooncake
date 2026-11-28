@@ -88,7 +88,7 @@ enum class RemoteScopeScenario {
 };
 
 // Second local/remote device EID used by the scope tests. Its subnet prefix
-// (first four groups) differs from fakeDevice()'s "0001:..." prefix.
+// (first three groups) differs from fakeDevice()'s "0001:..." prefix.
 constexpr const char* kOtherScopeEid =
     "0002:0000:0000:0000:0000:0000:0000:4500";
 

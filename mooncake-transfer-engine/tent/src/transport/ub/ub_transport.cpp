@@ -725,7 +725,7 @@ struct UbTransport::Impl {
                 const auto scope =
                     ub::eidScopeForEid(context->deviceInfo().eid);
                 if (!scope.trusted) continue;
-                // The scope key is the subnet prefix (the first four groups)
+                // The scope key is the subnet prefix (the first three groups)
                 // and is short enough to log verbatim; truncating it would
                 // alias distinct subnets under the same label.
                 const std::string& short_scope = scope.key;

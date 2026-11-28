@@ -243,17 +243,17 @@ TEST(UbProbeTopologyTest, ApplyUbNicKindsPublishesTrustedKind) {
 }
 
 TEST(UbProbeTopologyTest, EidScopeUsesTheSubnetPrefix) {
-    // The scope key is the first four groups; the trailing groups identify the
+    // The scope key is the first three groups; the trailing groups identify the
     // device/interface inside the subnet and do not affect the scope.
     const auto same = eidScopeForEid("0000:0000:0004:0200:0010:0000:df00:4500");
     const auto same_peer =
-        eidScopeForEid("0000:0000:0004:0200:0010:0000:df04:c500");
+        eidScopeForEid("0000:0000:0004:0201:0010:0000:df04:c500");
     const auto other =
-        eidScopeForEid("0000:0000:0004:0201:0010:0000:df00:c500");
+        eidScopeForEid("0000:0000:0005:0200:0010:0000:df00:c500");
     ASSERT_TRUE(same.trusted);
     ASSERT_TRUE(same_peer.trusted);
     ASSERT_TRUE(other.trusted);
-    EXPECT_EQ(same.key, "0000:0000:0004:0200");
+    EXPECT_EQ(same.key, "0000:0000:0004");
     EXPECT_EQ(same.key, same_peer.key);
     EXPECT_NE(same.key, other.key);
     EXPECT_FALSE(eidScopeForEid("bad-eid").trusted);
@@ -262,14 +262,14 @@ TEST(UbProbeTopologyTest, EidScopeUsesTheSubnetPrefix) {
 TEST(UbProbeTopologyTest, SameEidScopeComparesTheSubnetPrefix) {
     constexpr const char* kSubnetA = "0000:0000:0004:0200:0010:0000:df00:4500";
     constexpr const char* kSubnetAPeer =
-        "0000:0000:0004:0200:0010:0000:df04:c500";
-    constexpr const char* kSubnetB = "0000:0000:0004:0201:0010:0000:df00:c500";
+        "0000:0000:0004:0201:0010:0000:df04:c500";
+    constexpr const char* kSubnetB = "0000:0000:0005:0200:0010:0000:df00:c500";
 
     EXPECT_TRUE(sameEidScope(kSubnetA, kSubnetAPeer));
     EXPECT_FALSE(sameEidScope(kSubnetA, kSubnetB));
     // Case-insensitive: the scope key is normalized to lower case.
-    EXPECT_TRUE(sameEidScope("0000:0000:0004:02A0:0010:0000:df00:4500",
-                             "0000:0000:0004:02a0:0010:0000:df04:c500"));
+    EXPECT_TRUE(sameEidScope("0000:0000:000A:0200:0010:0000:df00:4500",
+                             "0000:0000:000a:0201:0010:0000:df04:c500"));
     // An EID that cannot be parsed must not refuse the pair (compatibility with
     // peers that do not publish it).
     EXPECT_TRUE(sameEidScope("bad-eid", kSubnetB));
@@ -281,10 +281,10 @@ TEST(UbProbeTopologyTest, SameEidScopeComparesTheSubnetPrefix) {
 TEST(UbProbeTopologyTest, SameEidScopeKeepsOnlyDiagonalPairs) {
     const std::vector<std::string> locals{
         "0000:0000:0004:0200:0010:0000:df00:4500",
-        "0000:0000:0004:0201:0010:0000:df04:4500"};
+        "0000:0000:0005:0201:0010:0000:df04:4500"};
     const std::vector<std::string> remotes{
         "0000:0000:0004:0200:0010:0000:df04:c500",
-        "0000:0000:0004:0201:0010:0000:df00:c500"};
+        "0000:0000:0005:0200:0010:0000:df00:c500"};
     size_t allowed = 0;
     size_t denied = 0;
     for (const auto& local : locals) {
@@ -306,7 +306,8 @@ TEST(UbProbeTopologyTest, CrossScopeEdgeFailsInstallUnlessDisabled) {
         makeDevice("local0", "0000:0000:0004:0200:0010:0000:df00:4500", 0);
     addUbNic(local, device);
 
-    auto load = [&](bool require_same_scope, ProbeParams& params) {
+    auto load = [&](bool require_same_scope, const std::string& remote_eid,
+                    ProbeParams& params) {
         Config config;
         const std::string policy = require_same_scope ? "true" : "false";
         EXPECT_TRUE(config
@@ -317,7 +318,7 @@ TEST(UbProbeTopologyTest, CrossScopeEdgeFailsInstallUnlessDisabled) {
                     "enabled": true, "provider": "standalone",
                     "local_ports": [{"id": "P0", "bind": "ub:local0:eid0"}],
                     "peers": {"node-b": {"ports": [
-                        {"id": "R0", "eid": "0000:0000:0004:0201:0010:0000:df04:c500"}
+                        {"id": "R0", "eid": ")" + remote_eid + R"("}
                     ]}},
                     "adjacency": {"node-b": {"P0": ["R0"]}},
                     "adjacency_policy": {"require_same_eid_scope": )" +
@@ -331,15 +332,20 @@ TEST(UbProbeTopologyTest, CrossScopeEdgeFailsInstallUnlessDisabled) {
         params = ub_params.probe;
     };
 
-    ProbeParams strict;
-    load(true, strict);
+    ProbeParams same_scope;
+    load(true, "0000:0000:0004:0201:0010:0000:df04:c500", same_scope);
     ProbeTopology topology;
+    EXPECT_TRUE(
+        ProbeTopology::resolve(same_scope, {device}, local, topology).ok());
+
+    ProbeParams strict;
+    load(true, "0000:0000:0005:0201:0010:0000:df04:c500", strict);
     auto status = ProbeTopology::resolve(strict, {device}, local, topology);
     EXPECT_TRUE(status.IsInvalidArgument());
     EXPECT_NE(status.ToString().find("crosses EID scope"), std::string::npos);
 
     ProbeParams relaxed;
-    load(false, relaxed);
+    load(false, "0000:0000:0005:0201:0010:0000:df04:c500", relaxed);
     EXPECT_TRUE(
         ProbeTopology::resolve(relaxed, {device}, local, topology).ok());
 }

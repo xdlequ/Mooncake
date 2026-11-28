@@ -1107,7 +1107,7 @@ probe_refresh_hint
 | --- | --- | --- |
 | G-1 | `Topology::applyUbDeviceKinds` 在 install 时用可信 `DeviceInfo.kind/source` 回写 `ub.device_kind` / `ub.device_kind_source`；发布路径不再输出 `unknown` | `tent_ub_probe_topology_test`、`tent_ub_probe_integration_test` |
 | G-2 | 声明模式下业务 Context 只按 `local_ports` 绑定创建；业务候选收敛为 `AdjacencyView` 的 local×adjacency 允许对，不再枚举未声明设备 | 声明模式集成用例 |
-| G-3 | 安装期新增 EID scope 校验；默认 scope 取 canonical EID 的前 4 组（subnet prefix），跨 scope 边 fail-closed；`probe/adjacency_policy/require_same_eid_scope=false` 可关闭并 WARNING | `tent_ub_probe_topology_test` |
+| G-3 | 安装期新增 EID scope 校验；默认 scope 取 canonical EID 的前 3 组（subnet prefix），跨 scope 边 fail-closed；`probe/adjacency_policy/require_same_eid_scope=false` 可关闭并 WARNING | `tent_ub_probe_topology_test` |
 | P1-6 | `probe/adjacency_policy/param_error_invalidate_threshold`（默认 3）连续 `kParamError` 后边失效，选路拒绝；成功/其它错误清零连续计数 | `tent_ub_edge_invalid_tracker_test` |
 | 观测 | `declared_candidates_total/denied`、`business_param_error_invalid_edge`、`probe_publication_identity_fail` | 业务摘要/transport getter |
 
