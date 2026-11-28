@@ -1940,6 +1940,22 @@ DeviceInfo rmCapableSecondaryDevice() {
     return device;
 }
 
+TEST(UbRmPoolTest, SingleSharedJfcFitsOneJfcDevice) {
+    auto device = rmCapableDevice();
+    device.capabilities.max_jfc = 1;
+    auto adapter = std::make_shared<FakeUrmaAdapter>(device);
+    ASSERT_TRUE(adapter->initialize().ok());
+    auto legacy_context = std::make_shared<UbContext>(0, device, adapter);
+    JfcOptions options;
+    options.transport_mode = JettyTransportMode::kRm;
+    EXPECT_TRUE(legacy_context->initialize(1, options).IsInvalidArgument());
+    auto context = std::make_shared<UbContext>(0, device, adapter);
+    ASSERT_TRUE(context->initialize(1, options, /*pooled_rm=*/true).ok());
+    EXPECT_EQ(context->jfcs().size(), 1U);
+    EXPECT_TRUE(context->shutdown().ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
 UbExpectedPeerIdentity expectedForRmPeer(const UbBootstrapDesc& desc) {
     UbExpectedPeerIdentity expected;
     expected.segment_name = desc.segment_name;
@@ -3260,9 +3276,6 @@ TEST(UbRmPoolTest, PooledSendPublishesAndChargesPathVersion) {
     config->set("transports/ub/runtime_profile", "rm_pool");
     config->set("transports/ub/trans_mode", "rm");
     config->set("transports/ub/worker_count", 1);
-    config->set("transports/ub/poller_count", 1);
-    config->set("transports/ub/jfc_per_context", 1);
-    config->set("transports/ub/jetty_per_endpoint", 1);
     config->set("transports/ub/max_endpoints", 16);
     config->set("transports/ub/slice_size", 64);
     config->set("transports/ub/max_slices_per_task", 8);
@@ -3270,9 +3283,17 @@ TEST(UbRmPoolTest, PooledSendPublishesAndChargesPathVersion) {
     config->set("transports/ub/slice_timeout_ms", 1000);
     config->set("transports/ub/endpoint_cooldown_ms", 100);
     config->set("transports/ub/jetty_pool/enable", true);
-    config->set("transports/ub/jetty_pool/business_desired_serving", 1);
     config->set("transports/ub/send_pool/background_refill", false);
     setPhysicalOnlyIdentity(*config, device);
+
+    // Keep the default six send Jettys: the shared receive target must still
+    // appear exactly once in the bootstrap, or self-resolution fails with
+    // "duplicate target identity" before any WR can be posted.
+    UbParams parsed;
+    ASSERT_TRUE(UbParams::FromConfig(*config, parsed).ok());
+    EXPECT_EQ(parsed.jetty_per_endpoint, 6U);
+    EXPECT_EQ(parsed.jfc_per_context, 1U);
+    EXPECT_EQ(parsed.poller_count, 1U);
 
     UbTransport transport(adapter);
     std::string mutable_segment_name = segment_name;

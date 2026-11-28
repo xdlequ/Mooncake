@@ -528,6 +528,19 @@ struct UbParams {
                 "transports/ub/runtime_profile must be rc_legacy, rm_legacy or "
                 "rm_pool");
         }
+        // RM pool shares one JFC per Context across all send and receive
+        // Jettys, and one poller can service every Context's JFC. Keep the
+        // RC/RM legacy defaults and allow explicit scaling overrides.
+        if (parsed.runtime_profile == UbRuntimeProfile::kRmPool) {
+            if (config.get<json>("transports/ub/jfc_per_context", json())
+                    .is_null()) {
+                parsed.jfc_per_context = 1;
+            }
+            if (config.get<json>("transports/ub/poller_count", json())
+                    .is_null()) {
+                parsed.poller_count = 1;
+            }
+        }
         std::string trans_mode;
         CHECK_STATUS(readStringEnum(config, "transports/ub/trans_mode", "rc",
                                     {"rc", "rm"}, trans_mode));

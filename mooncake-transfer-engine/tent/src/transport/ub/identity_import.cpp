@@ -5,7 +5,6 @@
 
 #include <climits>
 #include <string>
-#include <map>
 
 #include "tent/common/types.h"
 #include "tent/common/utils/string_builder.h"
@@ -168,12 +167,8 @@ Status decodeUbDeviceMetadata(const std::string& attrs_json, DeviceInfo& out) {
 Status collectLocalDeviceIdentities(const std::vector<DeviceInfo>& discovered,
                                     std::vector<DeviceIdentity>& out) {
     out.clear();
-    // Discovery enumerates per-context instance (one entry per
-    // device/eid pair) so the same native device appears many times
-    // auto-import publishes one identity per native device - parity
-    // with generate rm_legacy_config.py and manual tent-perf configs
-    // keeping the lowest eid index;
-    std::map<std::string, const DeviceInfo*> selected;
+    // Discovery enumerates one entry per device/EID pair. Preserve every
+    // complete physical identity so selection can consider each EID.
     for (const auto& device : discovered) {
         // A device without a complete identity cannot be imported
         // automatically; skip it instead of publishing a partial record.
@@ -191,26 +186,16 @@ Status collectLocalDeviceIdentities(const std::vector<DeviceInfo>& discovered,
             device.kind != DeviceKind::PHYSICAL) {
             continue;
         }
-        auto it = selected.find(device.native_device_path);
-        if (it == selected.end()) {
-            selected.emplace(device.native_device_path, &device);
-        } else if (device.eid_index < it->second->eid_index) {
-            it->second = &device;
-        }
-    }
-    for (const auto& entry : selected) {
-        const auto* device = entry.second;
         DeviceIdentity identity;
-        identity.native_device_name = device->native_device_name;
-        identity.native_device_path = device->native_device_path;
-        identity.eid = device->eid;
-        identity.eid_index = device->eid_index;
-        identity.transport_modes = device->capabilities.transport_modes;
-        // Parity with generate_rm_legacy_config.py: every provider-visible
-        // native device is recorded as physical. The RM capability gate at
-        // install time still verifies each selected device before any
-        // native resource is created, and device_filter remains available
-        // for explicit exclusions.
+        identity.native_device_name = device.native_device_name;
+        identity.native_device_path = device.native_device_path;
+        identity.eid = device.eid;
+        identity.eid_index = device.eid_index;
+        identity.transport_modes = device.capabilities.transport_modes;
+        // Every provider-visible physical device/EID pair keeps its own
+        // identity. The RM capability gate still verifies each selected
+        // device before native allocation, and device_filter remains
+        // available for explicit exclusions.
         identity.kind = DeviceKind::PHYSICAL;
         CHECK_STATUS(validateDeviceIdentityRecord(identity));
         out.push_back(std::move(identity));

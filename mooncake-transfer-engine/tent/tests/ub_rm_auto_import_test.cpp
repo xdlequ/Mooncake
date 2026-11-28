@@ -497,6 +497,31 @@ TEST(UbAutoImportTest, CollectLocalDeviceIdentitiesCoversManualFields) {
     EXPECT_EQ(identity.kind, DeviceKind::PHYSICAL);
 }
 
+TEST(UbAutoImportTest, CollectKeepsEveryEidOnTheSameNativeDevice) {
+    auto higher = rmCapableDevice();
+    higher.topology_name = "ub:fake0:eid3";
+    higher.eid_index = 3;
+    higher.eid = "0001:0000:0000:0003:0000:0000:0000:0000";
+    auto lower = rmCapableDevice();
+    lower.topology_name = "ub:fake0:eid1";
+    lower.eid_index = 1;
+    lower.eid = "0001:0000:0000:0001:0000:0000:0000:0000";
+    std::vector<DeviceInfo> discovered{higher, lower};
+    std::vector<DeviceIdentity> identities;
+    ASSERT_TRUE(collectLocalDeviceIdentities(discovered, identities).ok());
+    ASSERT_EQ(identities.size(), 2U);
+    EXPECT_EQ(identities[0].eid_index, 3U);
+    EXPECT_EQ(identities[1].eid_index, 1U);
+    EXPECT_EQ(identities[0].eid, higher.eid);
+    EXPECT_EQ(identities[1].eid, lower.eid);
+
+    ASSERT_TRUE(resolveDeviceKindIdentities(identities, discovered).ok());
+    const auto candidates = physicalDevices(discovered);
+    ASSERT_EQ(candidates.size(), 2U);
+    EXPECT_EQ(candidates[0].topology_name, higher.topology_name);
+    EXPECT_EQ(candidates[1].topology_name, lower.topology_name);
+}
+
 TEST(UbAutoImportTest, CollectSkipsIncompleteAndFailsClosedWhenNone) {
     auto incomplete = rmCapableDevice();
     incomplete.eid.clear();

@@ -41,7 +41,10 @@ class UbContext final : public std::enable_shared_from_this<UbContext> {
     UbContext(const UbContext&) = delete;
     UbContext& operator=(const UbContext&) = delete;
 
-    Status initialize(uint32_t jfc_count, const JfcOptions& options);
+    // pooled_rm accounts for the native send/receive JFC sharing used by the
+    // pooled profile. Other profiles retain their existing capacity check.
+    Status initialize(uint32_t jfc_count, const JfcOptions& options,
+                      bool pooled_rm = false);
     Status shutdown();
     // Returns true only for the Active -> Failed transition. Every subsequent
     // poll error advances the failure epoch so stale successes from another

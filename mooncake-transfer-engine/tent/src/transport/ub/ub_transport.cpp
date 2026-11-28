@@ -363,7 +363,9 @@ struct UbTransport::Impl {
         }
         auto context =
             std::make_shared<ub::UbContext>(local_nic, device, adapter);
-        auto status = context->initialize(params.jfc_per_context, jfc_options);
+        auto status =
+            context->initialize(params.jfc_per_context, jfc_options,
+                                runtime_mode == ub::UbRuntimeMode::kPooledRm);
         created = context;
         if (!status.ok()) return status;
         context_by_topology_id.emplace(local_nic, context);

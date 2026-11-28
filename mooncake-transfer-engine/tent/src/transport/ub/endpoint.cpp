@@ -329,7 +329,6 @@ Status UbEndpoint::prepare() {
         }
         local_target_registry_ = std::move(registry);
         local_target_ref_ = std::move(reference);
-        published_target_count_ = jetty_count_;
         lifecycle_status_ = Status::OK();
         state_.store(State::kPrepared, std::memory_order_release);
         return Status::OK();

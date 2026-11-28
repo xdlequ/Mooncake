@@ -92,6 +92,24 @@ TEST(UbParamsTest, RuntimeDefaultsSelectRcLegacyWithPoolAndProbeOff) {
     EXPECT_EQ(mode, UbRuntimeMode::kRcLegacy);
 }
 
+TEST(UbParamsTest, RmPoolDefaultsToOneSharedJfcAndPoller) {
+    Config config;
+    config.set("transports/ub/runtime_profile", "rm_pool");
+    config.set("transports/ub/trans_mode", "rm");
+    config.set("transports/ub/jetty_pool/enable", true);
+    UbParams params;
+    ASSERT_TRUE(UbParams::FromConfig(config, params).ok());
+    EXPECT_EQ(params.jfc_per_context, 1U);
+    EXPECT_EQ(params.poller_count, 1U);
+    EXPECT_EQ(params.jetty_per_endpoint, 6U);
+
+    config.set("transports/ub/jfc_per_context", 2);
+    config.set("transports/ub/poller_count", 2);
+    ASSERT_TRUE(UbParams::FromConfig(config, params).ok());
+    EXPECT_EQ(params.jfc_per_context, 2U);
+    EXPECT_EQ(params.poller_count, 2U);
+}
+
 TEST(UbParamsTest, ParsesDormantPoolAndProbeKeysWithoutStartingResources) {
     Config config;
     config.set("transports/ub/runtime_profile", "rm_pool");

@@ -63,7 +63,8 @@ UbContext::UbContext(Topology::NicID topology_id, DeviceInfo device,
 
 UbContext::~UbContext() { (void)shutdown(); }
 
-Status UbContext::initialize(uint32_t jfc_count, const JfcOptions& options) {
+Status UbContext::initialize(uint32_t jfc_count, const JfcOptions& options,
+                             bool pooled_rm) {
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);
     if (state_.load(std::memory_order_relaxed) != State::kUninitialized) {
         return Status::InvalidArgument(
@@ -73,9 +74,12 @@ Status UbContext::initialize(uint32_t jfc_count, const JfcOptions& options) {
         return Status::InvalidArgument(
             "Invalid UB context device or JFC count" LOC_MARK);
     }
-    // Each UbJfc owns one send JFC and one receive JFC/JFR.
+    // The pooled RM profile shares one native JFC between send and receive.
+    // Preserve the legacy capacity gate for all other profiles.
+    const uint64_t native_jfcs_per_slot =
+        pooled_rm && isReliableMessage(options) ? 1U : 2U;
     if (device_.capabilities.max_jfc != 0 &&
-        (static_cast<uint64_t>(jfc_count) * 2U) >
+        (static_cast<uint64_t>(jfc_count) * native_jfcs_per_slot) >
             device_.capabilities.max_jfc) {
         return Status::InvalidArgument(
             "Requested UB JFC count exceeds device capability" LOC_MARK);

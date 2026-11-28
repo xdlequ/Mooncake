@@ -206,12 +206,11 @@ class UbEndpoint final : public std::enable_shared_from_this<UbEndpoint> {
     // waits for a later retire) and true on the retire path (the retry that
     // drains the registry quarantine).
     Status unimportTargetsLocked(bool retry_retained);
-    // Number of receive targets this incarnation advertises to peers. Pooled
-    // endpoints publish their shared port target `jetty_count_` times, legacy
-    // endpoints publish one per locally owned Jetty.
+    // Number of distinct receive targets this incarnation advertises. Pooled
+    // endpoints publish their one shared port target once; legacy endpoints
+    // publish one per locally owned Jetty.
     [[nodiscard]] size_t publishedTargetCountLocked() const noexcept {
-        return local_target_ref_.valid() ? published_target_count_
-                                         : jetties_.size();
+        return local_target_ref_.valid() ? 1 : jetties_.size();
     }
     static void rememberFirstError(const Status& candidate, Status& first);
 
@@ -235,10 +234,9 @@ class UbEndpoint final : public std::enable_shared_from_this<UbEndpoint> {
     std::vector<RemoteTargetPtr> imported_targets_;
     // Pooled rm_pool receive side (C04 / C05.1): one shared target per port,
     // owned by the Context registry. When valid, jetties_ stays empty and the
-    // descriptor advertises the shared target `published_target_count_` times.
+    // descriptor advertises the shared target once.
     std::shared_ptr<UbLocalPortTargetRegistry> local_target_registry_;
     UbLocalPortTargetRef local_target_ref_;
-    uint32_t published_target_count_{0};
     // Pooled rm_pool send side (C04 / v3): shared imports owned by the Context
     // registry. Positional with the peer descriptor; empty on the legacy path.
     std::shared_ptr<UbImportedTargetRegistry> imported_target_registry_;
